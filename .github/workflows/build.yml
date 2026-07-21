@@ -1,0 +1,36 @@
+name: Build AirChatPlus.dylib
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Show SDK path
+        run: xcrun --show-sdk-path --sdk iphoneos
+
+      - name: Build dylib
+        run: |
+          cd AirChatPlus
+          make
+
+      - name: Verify output
+        run: |
+          ls -la AirChatPlus/AirChatPlus.dylib
+          file AirChatPlus/AirChatPlus.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirChatPlus-dylib
+          path: AirChatPlus/AirChatPlus.dylib
