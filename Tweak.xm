@@ -676,6 +676,10 @@
 @end
 
 // 当“关于飞机”所在页面的视图布局完成时，自动在“关于飞机”正下方一行挂载“转发助手”
+@interface UIViewController (ACForwardInjectDecl)
+- (void)ac_tryInjectBelowAboutRow;
+@end
+
 %hook UIViewController
 
 - (void)viewDidAppear:(BOOL)animated {
