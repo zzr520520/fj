@@ -20,13 +20,9 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 @property (nonatomic, assign) ACContactSourceType sourceType;
 @property (nonatomic, assign) BOOL chatAllowed;
 @property (nonatomic, assign) BOOL isSelected;
-@property (nonatomic, readonly) BOOL isGroup; // 是否群聊（sourceType == ACContactSourceGroupChat）
 @end
 
 @implementation ACContactItem
-- (BOOL)isGroup {
-    return self.sourceType == ACContactSourceGroupChat;
-}
 @end
 
 @interface ACForwardHelperManager : NSObject
@@ -744,13 +740,7 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 
 @end
 
-#pragma mark - 4. 聊天页面长按图片/菜单劫持 +「设置」页右上角挂载
-
-// 下面两个方法在 %hook 内用 %new 实现，调用点在前，必须先声明
-@interface UIViewController (ACSettingsEntryDecl)
-- (BOOL)ac_shouldMountSettingsEntry;
-- (void)ac_openFromSettings;
-@end
+#pragma mark - 4. 聊天页面长按图片/菜单劫持 +「关于飞机」右上角挂载
 
 %hook UIResponder
 
@@ -799,25 +789,18 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 %hook UIViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    if (![self ac_shouldMountSettingsEntry]) return;
-    if (!self.navigationItem) return;
-    if ([self.navigationItem.rightBarButtonItem.title isEqualToString:@"🚀 转发助手"]) return;
-    UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"🚀 转发助手" style:UIBarButtonItemStyleDone target:self action:@selector(ac_openFromSettings)];
-    btn.tintColor = [UIColor systemBlueColor];
-    self.navigationItem.rightBarButtonItem = btn;
-}
-
-// 只在「设置」页面挂载入口：类名含 setting，或页面标题为「设置」
-%new
-- (BOOL)ac_shouldMountSettingsEntry {
     NSString *clsName = NSStringFromClass([self class]);
-    if ([[clsName lowercaseString] containsString:@"setting"]) return YES;
-    if ([self.title isEqualToString:@"设置"]) return YES;
-    return NO;
+    if ([clsName containsString:@"HelpAboutViewController"]) {
+        if (self.navigationItem) {
+            UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"🚀 转发助手" style:UIBarButtonItemStyleDone target:self action:@selector(ac_openFromAbout)];
+            btn.tintColor = [UIColor systemBlueColor];
+            self.navigationItem.rightBarButtonItem = btn;
+        }
+    }
 }
 
 %new
-- (void)ac_openFromSettings {
+- (void)ac_openFromAbout {
     [ACForwardHelperManager shared].sharedImage = nil; // 设置页打开时清空图片，纯文本群发
     ACForwardAssistantVC *vc = [[ACForwardAssistantVC alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
