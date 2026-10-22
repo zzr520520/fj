@@ -4,12 +4,12 @@
 #import <objc/message.h>
 #import <sqlite3.h>
 
-#pragma mark - 1. 数据模型与群成员/好友全量引擎
+#pragma mark - 1. 数据模型与全量联系人引擎
 
 typedef NS_ENUM(NSInteger, ACContactSourceType) {
-    ACContactSourceFriend = 0,      // 我的好友 / 已建立会话
-    ACContactSourceGroupMember = 1, // 群内提取的联系人 (群成员)
-    ACContactSourceGroupChat = 2    // 群聊本身
+    ACContactSourceFriend = 0,
+    ACContactSourceGroupMember = 1,
+    ACContactSourceGroupChat = 2
 };
 
 @interface ACContactItem : NSObject
@@ -20,13 +20,9 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 @property (nonatomic, assign) ACContactSourceType sourceType;
 @property (nonatomic, assign) BOOL chatAllowed;
 @property (nonatomic, assign) BOOL isSelected;
-@property (nonatomic, readonly) BOOL isGroup; // 是否群聊（sourceType == ACContactSourceGroupChat）
 @end
 
 @implementation ACContactItem
-- (BOOL)isGroup {
-    return self.sourceType == ACContactSourceGroupChat;
-}
 @end
 
 @interface ACForwardHelperManager : NSObject
@@ -39,8 +35,8 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMap;
 @property (nonatomic, copy) NSString *selfUserId;
 
-@property (nonatomic, strong) UIImage *sharedImage; // 捕获的聊天图片
-@property (nonatomic, copy) NSString *sharedText;   // 转发文本
+@property (nonatomic, strong) UIImage *sharedImage; // 长按捕获的图片
+@property (nonatomic, copy) NSString *sharedText;   // 长按捕获的文本
 
 + (instancetype)shared;
 - (void)parseJSONWithContext:(id)jsonObj;
@@ -80,8 +76,6 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
         if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId] && ([existing.name isEqualToString:cleanId] || [existing.name hasPrefix:@"用户_"])) {
             existing.name = cleanName;
         }
-        if (tag && tag.length > 0) existing.roleDesc = tag;
-        if (chatAllowed) existing.chatAllowed = YES;
         return;
     }
 
@@ -94,11 +88,8 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
     item.isSelected = NO;
 
     self.friendMap[cleanId] = item;
-    if (chatAllowed) {
-        [self.friendList insertObject:item atIndex:0];
-    } else {
-        [self.friendList addObject:item];
-    }
+    if (chatAllowed) [self.friendList insertObject:item atIndex:0];
+    else [self.friendList addObject:item];
 }
 
 - (void)addGroupMemberWithId:(NSString *)uid name:(NSString *)name groupId:(NSString *)gid role:(NSString *)role chatAllowed:(BOOL)chatAllowed {
@@ -108,14 +99,9 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
     if ([cleanId isEqualToString:self.selfUserId] || [cleanId hasPrefix:@"@TGS#"]) return;
 
     NSString *cleanName = (name && ![name isKindOfClass:[NSNull class]]) ? [NSString stringWithFormat:@"%@", name] : @"";
-
     ACContactItem *existing = self.groupMemberMap[cleanId];
     if (existing) {
-        if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId] && ([existing.name isEqualToString:cleanId] || [existing.name hasPrefix:@"群友_"])) {
-            existing.name = cleanName;
-        }
-        if (gid && gid.length > 0) existing.fromGroupId = gid;
-        if (role && role.length > 0) existing.roleDesc = role;
+        if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId]) existing.name = cleanName;
         return;
     }
 
@@ -139,12 +125,9 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
     if (![cleanId hasPrefix:@"@TGS#"] && cleanId.length > 15) return;
 
     NSString *cleanName = (name && ![name isKindOfClass:[NSNull class]]) ? [NSString stringWithFormat:@"%@", name] : @"";
-
     ACContactItem *existing = self.groupMap[cleanId];
     if (existing) {
-        if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId] && [existing.name hasPrefix:@"群聊"]) {
-            existing.name = cleanName;
-        }
+        if (cleanName.length > 0 && [existing.name hasPrefix:@"群聊"]) existing.name = cleanName;
         return;
     }
 
@@ -168,9 +151,6 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
         NSString *directId = [NSString stringWithFormat:@"%@", dict[@"id"] ?: @""];
         if ([directId hasPrefix:@"@TGS#"] && dict[@"name"]) {
             [self addGroupWithId:directId name:[NSString stringWithFormat:@"%@", dict[@"name"]]];
-            if (dict[@"owner"]) {
-                [self addGroupMemberWithId:[NSString stringWithFormat:@"%@", dict[@"owner"]] name:@"群主" groupId:directId role:@"群主" chatAllowed:YES];
-            }
         }
 
         NSString *groupId = [NSString stringWithFormat:@"%@", dict[@"groupId"] ?: @""];
@@ -180,9 +160,8 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
                 NSDictionary *uInfo = dict[@"userInfo"];
                 NSString *uid = [NSString stringWithFormat:@"%@", dict[@"userId"]];
                 NSString *nick = uInfo[@"clientUserNickName"] ?: dict[@"customName"];
-                NSString *role = dict[@"customName"] ?: dict[@"role"] ?: @"群成员";
                 BOOL allow = [[NSString stringWithFormat:@"%@", uInfo[@"chatMeType"] ?: @"0"] isEqualToString:@"0"];
-                [self addGroupMemberWithId:uid name:nick groupId:groupId role:role chatAllowed:allow];
+                [self addGroupMemberWithId:uid name:nick groupId:groupId role:@"群成员" chatAllowed:allow];
             }
         }
 
@@ -193,23 +172,17 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
             NSDictionary *appU = [dict[@"appUserInfo"] isKindOfClass:[NSDictionary class]] ? dict[@"appUserInfo"] : nil;
             if ((!nick || [nick isKindOfClass:[NSNull class]]) && appU) nick = appU[@"clientUserNickName"];
             BOOL allow = YES;
-            if (appU && appU[@"chatMeType"] && ![appU[@"chatMeType"] isKindOfClass:[NSNull class]]) {
-                allow = [[NSString stringWithFormat:@"%@", appU[@"chatMeType"]] isEqualToString:@"0"];
-            }
-            NSString *finalName = (remark && ![remark isKindOfClass:[NSNull class]] && [remark description].length > 0) ? [NSString stringWithFormat:@"%@ (%@)", remark, nick ?: @""] : nick;
-            [self addFriendWithId:[NSString stringWithFormat:@"%@", friendId] name:finalName tag:@"通讯录好友" chatAllowed:allow];
+            if (appU && appU[@"chatMeType"]) allow = [[NSString stringWithFormat:@"%@", appU[@"chatMeType"]] isEqualToString:@"0"];
+            NSString *finalName = (remark && [remark description].length > 0) ? [NSString stringWithFormat:@"%@ (%@)", remark, nick ?: @""] : nick;
+            [self addFriendWithId:[NSString stringWithFormat:@"%@", friendId] name:finalName tag:@"好友" chatAllowed:allow];
         }
 
         for (id key in dict) {
             id val = dict[key];
-            if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
-                [self parseJSONWithContext:val];
-            }
+            if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) [self parseJSONWithContext:val];
         }
     } else if ([jsonObj isKindOfClass:[NSArray class]]) {
-        for (id sub in (NSArray *)jsonObj) {
-            [self parseJSONWithContext:sub];
-        }
+        for (id sub in (NSArray *)jsonObj) [self parseJSONWithContext:sub];
     }
 }
 
@@ -218,39 +191,28 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
     if (!v2Cls || ![v2Cls respondsToSelector:@selector(sharedInstance)]) return;
     id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
 
-    NSArray<ACContactItem *> *currentGroups = [self.groupList copy];
-    for (ACContactItem *grp in currentGroups) {
+    for (ACContactItem *grp in [self.groupList copy]) {
         NSString *gid = grp.targetId;
         if (![gid hasPrefix:@"@TGS#"]) continue;
-
         SEL getMemSel = NSSelectorFromString(@"getGroupMemberList:filter:nextSeq:succ:fail:");
         if ([mgr respondsToSelector:getMemSel]) {
             dispatch_group_enter(group);
             void (^succBlock)(uint64_t, NSArray *) = ^(uint64_t nextSeq, NSArray *memberList) {
                 for (id mem in memberList) {
                     @try {
-                        NSString *uid = [mem valueForKey:@"userID"];
-                        NSString *nick = [mem valueForKey:@"nickName"] ?: [mem valueForKey:@"nameCard"] ?: [mem valueForKey:@"friendRemark"];
-                        [self addGroupMemberWithId:uid name:nick groupId:gid role:@"群成员" chatAllowed:YES];
+                        [self addGroupMemberWithId:[mem valueForKey:@"userID"] name:[mem valueForKey:@"nickName"] ?: [mem valueForKey:@"nameCard"] groupId:gid role:@"群成员" chatAllowed:YES];
                     } @catch (NSException *e) {}
                 }
                 dispatch_group_leave(group);
             };
-            void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) {
-                dispatch_group_leave(group);
-            };
+            void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) { dispatch_group_leave(group); };
 
             NSMethodSignature *sig = [mgr methodSignatureForSelector:getMemSel];
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            [inv setTarget:mgr];
-            [inv setSelector:getMemSel];
-            uint32_t filter = 0;
-            uint64_t nextSeq = 0;
-            [inv setArgument:&gid atIndex:2];
-            [inv setArgument:&filter atIndex:3];
-            [inv setArgument:&nextSeq atIndex:4];
-            [inv setArgument:&succBlock atIndex:5];
-            [inv setArgument:&failBlock atIndex:6];
+            [inv setTarget:mgr]; [inv setSelector:getMemSel];
+            uint32_t filter = 0; uint64_t seq = 0;
+            [inv setArgument:&gid atIndex:2]; [inv setArgument:&filter atIndex:3]; [inv setArgument:&seq atIndex:4];
+            [inv setArgument:&succBlock atIndex:5]; [inv setArgument:&failBlock atIndex:6];
             [inv invoke];
         }
     }
@@ -267,34 +229,30 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
         if ([lower hasSuffix:@".db"] || [lower hasSuffix:@".sqlite"] || [lower hasSuffix:@".sqlite3"]) {
             sqlite3 *db = NULL;
             if (sqlite3_open_v2([fullPath UTF8String], &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-                sqlite3_stmt *tableStmt = NULL;
-                if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table';", -1, &tableStmt, NULL) == SQLITE_OK) {
-                    NSMutableArray<NSString *> *tables = [NSMutableArray array];
-                    while (sqlite3_step(tableStmt) == SQLITE_ROW) {
-                        const char *tName = (const char *)sqlite3_column_text(tableStmt, 0);
-                        if (tName) [tables addObject:[NSString stringWithUTF8String:tName]];
-                    }
-                    sqlite3_finalize(tableStmt);
-                    for (NSString *t in tables) {
-                        NSString *sql = [NSString stringWithFormat:@"SELECT * FROM \"%@\" LIMIT 500;", t];
-                        sqlite3_stmt *rowStmt = NULL;
-                        if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &rowStmt, NULL) == SQLITE_OK) {
-                            int colCount = sqlite3_column_count(rowStmt);
-                            while (sqlite3_step(rowStmt) == SQLITE_ROW) {
-                                for (int c = 0; c < colCount; c++) {
-                                    const char *colText = (const char *)sqlite3_column_text(rowStmt, c);
-                                    if (!colText) continue;
-                                    NSString *v = [NSString stringWithUTF8String:colText];
+                sqlite3_stmt *tStmt = NULL;
+                if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table';", -1, &tStmt, NULL) == SQLITE_OK) {
+                    while (sqlite3_step(tStmt) == SQLITE_ROW) {
+                        const char *tName = (const char *)sqlite3_column_text(tStmt, 0);
+                        if (!tName) continue;
+                        NSString *sql = [NSString stringWithFormat:@"SELECT * FROM \"%@\" LIMIT 300;", [NSString stringWithUTF8String:tName]];
+                        sqlite3_stmt *rStmt = NULL;
+                        if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &rStmt, NULL) == SQLITE_OK) {
+                            int cols = sqlite3_column_count(rStmt);
+                            while (sqlite3_step(rStmt) == SQLITE_ROW) {
+                                for (int c = 0; c < cols; c++) {
+                                    const char *txt = (const char *)sqlite3_column_text(rStmt, c);
+                                    if (!txt) continue;
+                                    NSString *v = [NSString stringWithUTF8String:txt];
                                     if ([v hasPrefix:@"{"] || [v hasPrefix:@"["]) {
-                                        NSData *d = [v dataUsingEncoding:NSUTF8StringEncoding];
-                                        id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                                        id j = [NSJSONSerialization JSONObjectWithData:[v dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
                                         if (j) [self parseJSONWithContext:j];
                                     }
                                 }
                             }
-                            sqlite3_finalize(rowStmt);
+                            sqlite3_finalize(rStmt);
                         }
                     }
+                    sqlite3_finalize(tStmt);
                 }
                 sqlite3_close(db);
             }
@@ -310,39 +268,12 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
     if (v2Cls && [v2Cls respondsToSelector:@selector(sharedInstance)]) {
         id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
 
-        SEL getConvSel = NSSelectorFromString(@"getConversationList:count:succ:fail:");
-        if ([mgr respondsToSelector:getConvSel]) {
-            dispatch_group_enter(group);
-            void (^succBlock)(NSArray *, uint64_t, BOOL) = ^(NSArray *list, uint64_t nextSeq, BOOL isFinished) {
-                for (id conv in list) {
-                    @try {
-                        NSString *showName = [conv valueForKey:@"showName"];
-                        NSString *uid = [conv valueForKey:@"userID"];
-                        NSString *gid = [conv valueForKey:@"groupID"];
-                        if (gid && gid.length > 0) [self addGroupWithId:gid name:showName];
-                        else if (uid && uid.length > 0) [self addFriendWithId:uid name:showName tag:@"会话" chatAllowed:YES];
-                    } @catch (NSException *e) {}
-                }
-                dispatch_group_leave(group);
-            };
-            void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) { dispatch_group_leave(group); };
-            NSMethodSignature *sig = [mgr methodSignatureForSelector:getConvSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            [inv setTarget:mgr]; [inv setSelector:getConvSel];
-            uint64_t seq = 0; int cnt = 300;
-            [inv setArgument:&seq atIndex:2]; [inv setArgument:&cnt atIndex:3];
-            [inv setArgument:&succBlock atIndex:4]; [inv setArgument:&failBlock atIndex:5];
-            [inv invoke];
-        }
-
         SEL getGroupsSel = NSSelectorFromString(@"getJoinedGroupList:fail:");
         if ([mgr respondsToSelector:getGroupsSel]) {
             dispatch_group_enter(group);
             void (^succBlock)(NSArray *) = ^(NSArray *groupInfos) {
                 for (id gInfo in groupInfos) {
-                    @try {
-                        [self addGroupWithId:[gInfo valueForKey:@"groupID"] name:[gInfo valueForKey:@"groupName"]];
-                    } @catch (NSException *e) {}
+                    @try { [self addGroupWithId:[gInfo valueForKey:@"groupID"] name:[gInfo valueForKey:@"groupName"]]; } @catch (NSException *e) {}
                 }
                 [self fetchGroupMembersFromIMSDKWithGroup:group];
                 dispatch_group_leave(group);
@@ -354,7 +285,7 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dispatch_group_notify(group, dispatch_get_main_queue(), ^{
-            NSString *msg = [NSString stringWithFormat:@"已就绪：%lu 好友 | %lu 群成员 | %lu 群聊",
+            NSString *msg = [NSString stringWithFormat:@"已就绪：%lu 好友 | %lu 群友 | %lu 群聊",
                              (unsigned long)self.friendList.count,
                              (unsigned long)self.groupMemberList.count,
                              (unsigned long)self.groupList.count];
@@ -363,8 +294,7 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
     });
 }
 
-// 自动破盾：遇到 120001 先自动加 IM 好友再重试发送
-- (void)autoAddIMFriend:(NSString * )userId completion:(void(^)(void))completion {
+- (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
     Class v2MgrCls = NSClassFromString(@"V2TIMManager");
     Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
     if (v2MgrCls && reqCls) {
@@ -373,24 +303,21 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
         if ([manager respondsToSelector:addFriendSel]) {
             id req = [[reqCls alloc] init];
             @try { [req setValue:userId forKey:@"userID"]; [req setValue:@(1) forKey:@"addType"]; } @catch (NSException *e) {}
-            void (^succ)(id) = ^(id res) { if (completion) completion(); };
-            void (^fail)(int, NSString *) = ^(int code, NSString *desc) { if (completion) completion(); };
-            ((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, addFriendSel, req, succ, fail);
+            ((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, addFriendSel, req, ^(id r){ if(completion)completion(); }, ^(int c, NSString*d){ if(completion)completion(); });
             return;
         }
     }
     if (completion) completion();
 }
 
-- (void)rawSendContent:(NSString *)text toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
+- (void)rawSendContentToItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
     Class v2MgrCls = NSClassFromString(@"V2TIMManager");
     if (!v2MgrCls) { if (completion) completion(NO, -1, @"IM不可用"); return; }
     id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
 
-    // 如果带有图片，优先发图片
     if (self.sharedImage) {
-        NSData *imgData = UIImageJPEGRepresentation(self.sharedImage, 0.8);
-        NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"forward_share.jpg"];
+        NSData *imgData = UIImageJPEGRepresentation(self.sharedImage, 0.85);
+        NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"forward_share_img.jpg"];
         [imgData writeToFile:tmpPath atomically:YES];
         SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
         SEL sendMsgSel = NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:");
@@ -413,8 +340,7 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
         }
     }
 
-    // 默认发文本
-    NSString *txt = text.length > 0 ? text : @"[转发分享]";
+    NSString *txt = self.sharedText.length > 0 ? self.sharedText : @"[转发消息]";
     SEL createTxtSel = NSSelectorFromString(@"createTextMessage:");
     SEL sendMsgSel = NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:");
     if ([manager respondsToSelector:createTxtSel] && [manager respondsToSelector:sendMsgSel]) {
@@ -434,12 +360,12 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
         [inv invoke];
         return;
     }
-
     if (completion) completion(NO, -2, @"发送失败");
 }
 
 - (void)sendContentWithBypass:(NSString *)text toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, NSString *detail))completion {
-    [self rawSendContent:text toItem:item completion:^(BOOL ok, int code, NSString *desc) {
+    if (text.length > 0) self.sharedText = text;
+    [self rawSendContentToItem:item completion:^(BOOL ok, int code, NSString *desc) {
         if (ok) {
             if (completion) completion(YES, @"成功");
             return;
@@ -447,7 +373,7 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
         if (item.sourceType != ACContactSourceGroupChat) {
             [self autoAddIMFriend:item.targetId completion:^{
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [self rawSendContent:text toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
+                    [self rawSendContentToItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
                         if (ok2) {
                             if (completion) completion(YES, @"破盾成功");
                         } else {
@@ -518,7 +444,6 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
     self.headerContainer.backgroundColor = [UIColor systemGroupedBackgroundColor];
     [self.view addSubview:self.headerContainer];
 
-    CGFloat textY = 14;
     if (hasImg) {
         self.previewImageView = [[UIImageView alloc] initWithFrame:CGRectMake(16, 12, 48, 48)];
         self.previewImageView.image = [ACForwardHelperManager shared].sharedImage;
@@ -528,7 +453,6 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
         [self.headerContainer addSubview:self.previewImageView];
 
         self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(74, 12, width - 90, 68)];
-        textY = 88;
     } else {
         self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 14, width - 32, 82)];
     }
@@ -538,10 +462,10 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
     self.contentTextView.layer.cornerRadius = 10;
     self.contentTextView.layer.borderColor = [UIColor separatorColor].CGColor;
     self.contentTextView.layer.borderWidth = 0.5;
-    self.contentTextView.text = @"您好，这是一条转发消息！";
+    self.contentTextView.text = [ACForwardHelperManager shared].sharedText.length > 0 ? [ACForwardHelperManager shared].sharedText : @"您好，这是一条转发消息！";
     [self.headerContainer addSubview:self.contentTextView];
 
-    CGFloat segY = hasImg ? 164 : 108;
+    CGFloat segY = hasImg ? 92 : 108;
     self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友 (0)", @"群成员 (0)", @"群聊 (0)"]];
     self.tabControl.frame = CGRectMake(16, segY, width - 32, 34);
     self.tabControl.selectedSegmentIndex = 0;
@@ -581,7 +505,6 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
     self.tableView.contentInset = UIEdgeInsetsMake(0, 0, 100, 0);
     [self.view addSubview:self.tableView];
 
-    // 右下角悬浮发送球
     self.floatingSendBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatingSendBtn.backgroundColor = [UIColor systemBlueColor];
     [self.floatingSendBtn setTitle:@"🚀 发送 (0)" forState:UIControlStateNormal];
@@ -726,7 +649,6 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
         }
         ACContactItem *target = targets[idx];
         self.statusLabel.text = [NSString stringWithFormat:@"⏳ 发送中 (%ld/%ld): %@", (long)(idx + 1), (long)total, target.name];
-        mgr.sharedText = text;
         [mgr sendContentWithBypass:text toItem:target completion:^(BOOL success, NSString *detail) {
             if (success) ok++; else fail++;
             idx++;
@@ -744,29 +666,57 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 
 @end
 
-#pragma mark - 4. 聊天页面长按图片/菜单劫持 +「关于飞机」右上角挂载
+#pragma mark - 5. 劫持 AirChat 自定义聊天气泡长按菜单（在“回复”上方无缝添加转发助手）
 
+%hook UIMenuController
+
+// 强行向 AirChat 的气泡菜单动态注入“转发助手”
+- (void)setMenuItems:(NSArray<UIMenuItem *> *)menuItems {
+    NSMutableArray *arr = menuItems ? [menuItems mutableCopy] : [NSMutableArray array];
+    BOOL hasCustom = NO;
+    for (UIMenuItem *i in arr) {
+        if ([i.title isEqualToString:@"🚀 转发助手"]) { hasCustom = YES; break; }
+    }
+    if (!hasCustom) {
+        // 直接插在最顶部（即“回复”上方）
+        UIMenuItem *item = [[UIMenuItem alloc] initWithTitle:@"🚀 转发助手" action:@selector(ac_handleCustomForwardAction:)];
+        [arr insertObject:item atIndex:0];
+    }
+    %orig(arr);
+}
+
+%end
+
+// 针对 AirChat 自定义长按菜单事件的响应绑定
 %hook UIResponder
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(ac_handleForwardMenuAction:)) return YES;
+    if (action == @selector(ac_handleCustomForwardAction:)) return YES;
     return %orig;
 }
 
 %new
-- (void)ac_handleForwardMenuAction:(id)sender {
-    UIImage *img = nil;
+- (void)ac_handleCustomForwardAction:(id)sender {
+    UIImage *capturedImg = nil;
+    NSString *capturedTxt = nil;
+
+    // 尝试在当前长按的消息气泡视图中自动提取图片或文本
     if ([self isKindOfClass:[UIImageView class]]) {
-        img = ((UIImageView *)self).image;
+        capturedImg = ((UIImageView *)self).image;
+    } else if ([self isKindOfClass:[UILabel class]]) {
+        capturedTxt = ((UILabel *)self).text;
     } else if ([self isKindOfClass:[UIView class]]) {
         for (UIView *sub in ((UIView *)self).subviews) {
             if ([sub isKindOfClass:[UIImageView class]] && ((UIImageView *)sub).image) {
-                img = ((UIImageView *)sub).image;
-                break;
+                capturedImg = ((UIImageView *)sub).image;
+            } else if ([sub isKindOfClass:[UILabel class]] && ((UILabel *)sub).text) {
+                capturedTxt = ((UILabel *)sub).text;
             }
         }
     }
-    [ACForwardHelperManager shared].sharedImage = img;
+
+    [ACForwardHelperManager shared].sharedImage = capturedImg;
+    [ACForwardHelperManager shared].sharedText = capturedTxt;
 
     UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
     UIViewController *rootVC = keyWin.rootViewController;
@@ -778,17 +728,7 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 
 %end
 
-%hook UIMenuController
-- (void)setMenuItems:(NSArray<UIMenuItem *> *)menuItems {
-    NSMutableArray *arr = menuItems ? [menuItems mutableCopy] : [NSMutableArray array];
-    BOOL has = NO;
-    for (UIMenuItem *i in arr) { if ([i.title isEqualToString:@"🚀 转发助手"]) { has = YES; break; } }
-    if (!has) {
-        [arr addObject:[[UIMenuItem alloc] initWithTitle:@"🚀 转发助手" action:@selector(ac_handleForwardMenuAction:)]];
-    }
-    %orig(arr);
-}
-%end
+#pragma mark - 6. 设置页「关于飞机」右上角挂载入口
 
 %hook UIViewController
 - (void)viewDidAppear:(BOOL)animated {
@@ -805,7 +745,8 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 
 %new
 - (void)ac_openFromAbout {
-    [ACForwardHelperManager shared].sharedImage = nil; // 设置页打开时清空图片，纯文本群发
+    [ACForwardHelperManager shared].sharedImage = nil;
+    [ACForwardHelperManager shared].sharedText = nil;
     ACForwardAssistantVC *vc = [[ACForwardAssistantVC alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
