@@ -153,7 +153,6 @@
     }
 }
 
-// 扫描沙盒 SQLite 数据库与 Realm
 - (void)scanLocalDatabases {
     NSString *home = NSHomeDirectory();
     NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:home];
@@ -214,7 +213,6 @@
     if (v2Cls && [v2Cls respondsToSelector:@selector(sharedInstance)]) {
         id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
 
-        // 获取 IM 会话列表
         SEL getConvSel = NSSelectorFromString(@"getConversationList:count:succ:fail:");
         if ([mgr respondsToSelector:getConvSel]) {
             dispatch_group_enter(group);
@@ -249,7 +247,6 @@
             [inv invoke];
         }
 
-        // 获取已加入群列表
         SEL getGroupsSel = NSSelectorFromString(@"getJoinedGroupList:fail:");
         if ([mgr respondsToSelector:getGroupsSel]) {
             dispatch_group_enter(group);
@@ -374,13 +371,45 @@
 
 - (void)setupUI {
     CGFloat width = self.view.bounds.size.width;
+    CGFloat height = self.view.bounds.size.height;
 
-    UILabel *tipLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 60, width - 32, 22)];
+    CGFloat bottomH = 110.0;
+    UIView *bottomBar = [[UIView alloc] initWithFrame:CGRectMake(0, height - bottomH, width, bottomH)];
+    bottomBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    bottomBar.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
+
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, width - 24, 18)];
+    self.statusLabel.font = [UIFont systemFontOfSize:12];
+    self.statusLabel.textColor = [UIColor secondaryLabelColor];
+    self.statusLabel.textAlignment = NSTextAlignmentCenter;
+    self.statusLabel.text = @"正在读取好友与群聊...";
+    [bottomBar addSubview:self.statusLabel];
+
+    self.sendButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.sendButton.frame = CGRectMake(16, 34, width - 32, 50);
+    self.sendButton.backgroundColor = [UIColor systemBlueColor];
+    [self.sendButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.sendButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    self.sendButton.layer.cornerRadius = 10;
+    [self.sendButton setTitle:@"🚀 一键转发 / 群发 (已选 0)" forState:UIControlStateNormal];
+    [self.sendButton addTarget:self action:@selector(startBatchSend) forControlEvents:UIControlEventTouchUpInside];
+    [bottomBar addSubview:self.sendButton];
+    [self.view addSubview:bottomBar];
+
+    CGFloat tableTop = 270.0;
+    CGFloat tableH = height - tableTop - bottomH;
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, tableTop, width, tableH) style:UITableViewStylePlain];
+    self.tableView.delegate = self;
+    self.tableView.dataSource = self;
+    self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:self.tableView];
+
+    UILabel *tipLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 64, width - 32, 20)];
     tipLabel.text = @"📝 编辑群发/转发内容：";
     tipLabel.font = [UIFont boldSystemFontOfSize:14];
     [self.view addSubview:tipLabel];
 
-    self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 86, width - 32, 95)];
+    self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 88, width - 32, 85)];
     self.contentTextView.font = [UIFont systemFontOfSize:15];
     self.contentTextView.layer.cornerRadius = 8;
     self.contentTextView.layer.borderColor = [UIColor separatorColor].CGColor;
@@ -388,14 +417,14 @@
     self.contentTextView.text = @"您好，这是一条群发消息！";
     [self.view addSubview:self.contentTextView];
 
-    UIView *actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 190, width - 32, 34)];
+    UIView *actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 181, width - 32, 32)];
     NSArray *btnTitles = @[@"全选好友", @"全选群聊", @"全选所有", @"取消全选"];
     CGFloat btnW = (width - 32 - 18) / 4.0;
     for (int i = 0; i < 4; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(i * (btnW + 6), 0, btnW, 32);
+        btn.frame = CGRectMake(i * (btnW + 6), 0, btnW, 30);
         [btn setTitle:btnTitles[i] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+        btn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
         btn.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
         btn.layer.cornerRadius = 6;
         btn.tag = 400 + i;
@@ -405,39 +434,10 @@
     [self.view addSubview:actionBar];
 
     self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友 (0)", @"群聊 (0)"]];
-    self.tabControl.frame = CGRectMake(16, 234, width - 32, 32);
+    self.tabControl.frame = CGRectMake(16, 225, width - 32, 32);
     self.tabControl.selectedSegmentIndex = 0;
     [self.tabControl addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.tabControl];
-
-    CGFloat tableTop = 274;
-    CGFloat bottomH = 100;
-    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, tableTop, width, self.view.bounds.size.height - tableTop - bottomH) style:UITableViewStylePlain];
-    self.tableView.delegate = self;
-    self.tableView.dataSource = self;
-    [self.view addSubview:self.tableView];
-
-    UIView *bottomBar = [[UIView alloc] initWithFrame:CGRectMake(0, self.view.bounds.size.height - bottomH, width, bottomH)];
-    bottomBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, width - 24, 20)];
-    self.statusLabel.font = [UIFont systemFontOfSize:12];
-    self.statusLabel.textColor = [UIColor secondaryLabelColor];
-    self.statusLabel.textAlignment = NSTextAlignmentCenter;
-    self.statusLabel.text = @"正在读取好友与群聊...";
-    [bottomBar addSubview:self.statusLabel];
-
-    self.sendButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.sendButton.frame = CGRectMake(16, 32, width - 32, 46);
-    self.sendButton.backgroundColor = [UIColor systemBlueColor];
-    [self.sendButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.sendButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    self.sendButton.layer.cornerRadius = 10;
-    [self.sendButton setTitle:@"🚀 一键转发 / 群发 (已选 0)" forState:UIControlStateNormal];
-    [self.sendButton addTarget:self action:@selector(startBatchSend) forControlEvents:UIControlEventTouchUpInside];
-    [bottomBar addSubview:self.sendButton];
-
-    [self.view addSubview:bottomBar];
 }
 
 - (void)refreshData {
@@ -562,14 +562,13 @@
 
 @end
 
-#pragma mark - 5. 精准放置在「关于飞机」页面的右上角
+#pragma mark - 5. 挂载到「关于飞机」页面的右上角
 
 %hook UIViewController
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     NSString *clsName = NSStringFromClass([self class]);
-    // 只在“关于飞机”子页面 (HelpAboutViewController) 的右上角挂载入口按钮
     if ([clsName containsString:@"HelpAboutViewController"]) {
         if (self.navigationItem) {
             UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"🚀 转发助手"
