@@ -4,7 +4,7 @@
 #import <objc/message.h>
 #import <sqlite3.h>
 
-#pragma mark - 1. 联系人模型与全量数据引擎
+#pragma mark - 1. 联系人与群组数据管理引擎
 
 @interface ACContactItem : NSObject
 @property (nonatomic, copy) NSString *targetId;
@@ -42,7 +42,7 @@
         instance.groupList = [NSMutableArray array];
         instance.friendIdSet = [NSMutableSet set];
         instance.groupIdSet = [NSMutableSet set];
-        instance.selfUserId = @"1958179249315647489"; // 默认排除自己，也会从请求头动态更新
+        instance.selfUserId = @"1958179249315647489";
     });
     return instance;
 }
@@ -105,13 +105,10 @@
     [self.groupList addObject:item];
 }
 
-// 递归提取任何 JSON 字典/数组中的好友与群聊数据
 - (void)parseAnyJSON:(id)jsonObj {
     if (!jsonObj) return;
     if ([jsonObj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)jsonObj;
-
-        // 1. 匹配 /client/biz/userfriends/page 结构 (friendId + nickname / appUserInfo)
         id friendId = dict[@"friendId"];
         if (friendId && ![friendId isKindOfClass:[NSNull class]]) {
             NSString *remark = dict[@"remark"];
@@ -123,21 +120,17 @@
             [self addFriendWithId:[NSString stringWithFormat:@"%@", friendId] name:finalName];
         }
 
-        // 2. 匹配 userInfo / appUserInfo 结构
         id clientNick = dict[@"clientUserNickName"];
         id uid = dict[@"id"] ?: dict[@"userId"] ?: dict[@"clientUserId"];
         if (clientNick && ![clientNick isKindOfClass:[NSNull class]] && uid && ![uid isKindOfClass:[NSNull class]]) {
             [self addFriendWithId:[NSString stringWithFormat:@"%@", uid] name:[NSString stringWithFormat:@"%@", clientNick]];
         }
 
-        // 3. 匹配 /client/biz/group/myJoinGroupPage 或群结构
         id groupId = dict[@"groupId"] ?: dict[@"groupNo"] ?: dict[@"imGroupId"];
         id groupName = dict[@"groupName"] ?: dict[@"groupTitle"];
         if (groupId && ![groupId isKindOfClass:[NSNull class]]) {
             NSString *gName = (groupName && ![groupName isKindOfClass:[NSNull class]]) ? [NSString stringWithFormat:@"%@", groupName] : [NSString stringWithFormat:@"%@", dict[@"name"] ?: @"群聊"];
             [self addGroupWithId:[NSString stringWithFormat:@"%@", groupId] name:gName];
-        } else if (groupName && ![groupName isKindOfClass:[NSNull class]] && dict[@"id"]) {
-            [self addGroupWithId:[NSString stringWithFormat:@"%@", dict[@"id"]] name:[NSString stringWithFormat:@"%@", groupName]];
         }
 
         for (id key in dict) {
@@ -160,7 +153,7 @@
     }
 }
 
-// 扫描沙盒内全部 SQLite (.db / .sqlite) + Realm (contact_friends.realm)
+// 扫描沙盒 SQLite 数据库与 Realm
 - (void)scanLocalDatabases {
     NSString *home = NSHomeDirectory();
     NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:home];
@@ -169,7 +162,6 @@
         NSString *lower = relPath.lowercaseString;
         NSString *fullPath = [home stringByAppendingPathComponent:relPath];
 
-        // A. 扫描所有 SQLite 数据库文件 (不限后缀，检测 SQLite 魔数或 .db/.sqlite)
         if ([lower hasSuffix:@".db"] || [lower hasSuffix:@".sqlite"] || [lower hasSuffix:@".sqlite3"] || [lower containsString:@"cache"] || [lower containsString:@"imsdk"]) {
             sqlite3 *db = NULL;
             if (sqlite3_open_v2([fullPath UTF8String], &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
@@ -196,7 +188,6 @@
                                     NSString *k = [NSString stringWithUTF8String:colName];
                                     NSString *v = [NSString stringWithUTF8String:colText];
                                     rowDict[k] = v;
-                                    // 如果单元格本身是 JSON 字符串 (例如 MyFriendTable.dataStr / MyGroupTable.dataStr)
                                     if ([v hasPrefix:@"{"] || [v hasPrefix:@"["]) {
                                         NSData *d = [v dataUsingEncoding:NSUTF8StringEncoding];
                                         id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
@@ -212,83 +203,18 @@
                 sqlite3_close(db);
             }
         }
-
-        // B. 扫描 contact_friends.realm (通过 RLMRealm 动态读取或直接提取里面的明文 UTF-8 块)
-        if ([lower hasSuffix:@".realm"] && [lower containsString:@"friend"]) {
-            Class rlmCls = NSClassFromString(@"RLMRealm");
-            SEL realmWithURLSel = NSSelectorFromString(@"realmWithURL:error:");
-            if (rlmCls && [rlmCls respondsToSelector:realmWithURLSel]) {
-                @try {
-                    NSURL *url = [NSURL fileURLWithPath:fullPath];
-                    id realm = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(rlmCls, realmWithURLSel, url, NULL);
-                    id schema = [realm valueForKey:@"schema"];
-                    NSArray *objSchemas = [schema valueForKey:@"objectSchema"];
-                    for (id os in objSchemas) {
-                        NSString *className = [os valueForKey:@"className"];
-                        SEL allObjSel = NSSelectorFromString(@"allObjectsInRealm:");
-                        Class modelCls = NSClassFromString(className);
-                        if (modelCls && [modelCls respondsToSelector:allObjSel]) {
-                            id results = ((id (*)(id, SEL, id))objc_msgSend)(modelCls, allObjSel, realm);
-                            NSUInteger count = [[results valueForKey:@"count"] unsignedIntegerValue];
-                            for (NSUInteger i = 0; i < count; i++) {
-                                id obj = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(results, @selector(objectAtIndex:), i);
-                                NSArray *props = [os valueForKey:@"properties"];
-                                NSMutableDictionary *md = [NSMutableDictionary dictionary];
-                                for (id p in props) {
-                                    NSString *pName = [p valueForKey:@"name"];
-                                    id pVal = [obj valueForKey:pName];
-                                    if (pName && pVal) md[pName] = pVal;
-                                }
-                                [self parseAnyJSON:md];
-                            }
-                        }
-                    }
-                } @catch (NSException *e) {}
-            }
-        }
-    }
-}
-
-// 自动触发 TabBar 中“联系人”页面的加载（如果用户还没点过“联系人”Tab，让 App 自动去请求一次好友与群列表）
-- (void)triggerAppContactTabLoadIfNeeded {
-    UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
-    if (!keyWin) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.isKeyWindow) { keyWin = w; break; }
-        }
-    }
-    UIViewController *rootVC = keyWin.rootViewController;
-    if ([rootVC isKindOfClass:[UITabBarController class]]) {
-        UITabBarController *tabVC = (UITabBarController *)rootVC;
-        for (UIViewController *child in tabVC.viewControllers) {
-            if ([child isKindOfClass:[UINavigationController class]]) {
-                UINavigationController *nav = (UINavigationController *)child;
-                UIViewController *top = nav.viewControllers.firstObject;
-                if (top) {
-                    // 触发 view 加载，让联系人 VC 自动发出 userfriends/page 和 group/myJoinGroupPage 请求
-                    (void)top.view;
-                }
-            } else {
-                (void)child.view;
-            }
-        }
     }
 }
 
 - (void)reloadAllDataWithCompletion:(void(^)(NSString *statusMsg))completion {
-    // 1. 触发联系人 Tab 预加载
-    [self triggerAppContactTabLoadIfNeeded];
-
-    // 2. 扫描本地 SQLite + Realm
     [self scanLocalDatabases];
 
-    // 3. 读取腾讯云 V2TIMManager 会话列表与群列表
     dispatch_group_t group = dispatch_group_create();
     Class v2Cls = NSClassFromString(@"V2TIMManager");
     if (v2Cls && [v2Cls respondsToSelector:@selector(sharedInstance)]) {
         id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
 
-        // 3.1 获取腾讯云 IM 会话列表 (单聊 + 群聊)
+        // 获取 IM 会话列表
         SEL getConvSel = NSSelectorFromString(@"getConversationList:count:succ:fail:");
         if ([mgr respondsToSelector:getConvSel]) {
             dispatch_group_enter(group);
@@ -323,7 +249,7 @@
             [inv invoke];
         }
 
-        // 3.2 获取腾讯云 IM 已加入群列表
+        // 获取已加入群列表
         SEL getGroupsSel = NSSelectorFromString(@"getJoinedGroupList:fail:");
         if ([mgr respondsToSelector:getGroupsSel]) {
             dispatch_group_enter(group);
@@ -344,19 +270,18 @@
         }
     }
 
-    // 延迟 0.6 秒等待异步网络/数据库汇总
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dispatch_group_notify(group, dispatch_get_main_queue(), ^{
             NSString *msg = [NSString stringWithFormat:@"已加载 %lu 位好友 | %lu 个群聊", (unsigned long)self.friendList.count, (unsigned long)self.groupList.count];
             if (self.friendList.count == 0 && self.groupList.count == 0) {
-                msg = @"提示：请先点一下底部【联系人】页面加载列表，再回来打开即可全量读取！";
+                msg = @"提示：请先在 App 内点一下【联系人】或任意聊天加载过数据，即可秒读！";
             }
             if (completion) completion(msg);
         });
     });
 }
 
-#pragma mark - 2. 腾讯 IM 发送消息实现
+#pragma mark - 2. 腾讯云 IM 发送消息
 
 - (void)sendText:(NSString *)text toItem:(ACContactItem *)item completion:(void(^)(BOOL ok))completion {
     if (text.length == 0 || item.targetId.length == 0) {
@@ -402,36 +327,12 @@
             return;
         }
     }
-
-    Class timMgrCls = NSClassFromString(@"TIMManager");
-    Class timMsgCls = NSClassFromString(@"TIMMessage");
-    Class timTextCls = NSClassFromString(@"TIMTextElem");
-    if (timMgrCls && timMsgCls && timTextCls) {
-        id manager = ((id (*)(id, SEL))objc_msgSend)(timMgrCls, @selector(sharedInstance));
-        SEL getConvSel = NSSelectorFromString(@"getConversation:receiver:");
-        if ([manager respondsToSelector:getConvSel]) {
-            NSInteger convType = item.isGroup ? 2 : 1;
-            id conv = ((id (*)(id, SEL, NSInteger, NSString *))objc_msgSend)(manager, getConvSel, convType, item.targetId);
-            id msg = [[timMsgCls alloc] init];
-            id elem = [[timTextCls alloc] init];
-            [elem setValue:text forKey:@"text"];
-            ((int (*)(id, SEL, id))objc_msgSend)(msg, NSSelectorFromString(@"addElem:"), elem);
-
-            SEL sendSel = NSSelectorFromString(@"sendMessage:succ:fail:");
-            if ([conv respondsToSelector:sendSel]) {
-                void (^succBlock)(void) = ^{ if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES); }); };
-                void (^failBlock)(int, NSString *) = ^(int code, NSString *desc){ if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); }); };
-                ((void (*)(id, SEL, id, id, id))objc_msgSend)(conv, sendSel, msg, succBlock, failBlock);
-                return;
-            }
-        }
-    }
     if (completion) completion(NO);
 }
 
 @end
 
-#pragma mark - 3. 全局拦截 JSON 解析 (App 任何地方收到的好友/群数据自动入库)
+#pragma mark - 3. 全局 JSON 拦截入库
 
 %hook NSJSONSerialization
 
@@ -497,7 +398,7 @@
         btn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
         btn.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
         btn.layer.cornerRadius = 6;
-        btn.tag = 300 + i;
+        btn.tag = 400 + i;
         [btn addTarget:self action:@selector(quickSelectAction:) forControlEvents:UIControlEventTouchUpInside];
         [actionBar addSubview:btn];
     }
@@ -523,7 +424,6 @@
     self.statusLabel.font = [UIFont systemFontOfSize:12];
     self.statusLabel.textColor = [UIColor secondaryLabelColor];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
-    self.statusLabel.adjustsFontSizeToFitWidth = YES;
     self.statusLabel.text = @"正在读取好友与群聊...";
     [bottomBar addSubview:self.statusLabel];
 
@@ -553,14 +453,14 @@
 - (void)quickSelectAction:(UIButton *)sender {
     [self.view endEditing:YES];
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-    if (sender.tag == 300) {
+    if (sender.tag == 400) {
         for (ACContactItem *i in mgr.friendList) i.isSelected = YES;
-    } else if (sender.tag == 301) {
+    } else if (sender.tag == 401) {
         for (ACContactItem *i in mgr.groupList) i.isSelected = YES;
-    } else if (sender.tag == 302) {
+    } else if (sender.tag == 402) {
         for (ACContactItem *i in mgr.friendList) i.isSelected = YES;
         for (ACContactItem *i in mgr.groupList) i.isSelected = YES;
-    } else if (sender.tag == 303) {
+    } else if (sender.tag == 403) {
         for (ACContactItem *i in mgr.friendList) i.isSelected = NO;
         for (ACContactItem *i in mgr.groupList) i.isSelected = NO;
     }
@@ -640,7 +540,7 @@
     __block void (^nextStep)(void) = ^{
         if (idx >= total) {
             weakSelf.sendButton.enabled = YES;
-            weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 群发完成！成功 %ld / 共 %ld", (long)okCount, (long)total];
+            weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 群发完毕！成功 %ld / 共 %ld", (long)okCount, (long)total];
             return;
         }
         ACContactItem *cur = targets[idx];
@@ -662,164 +562,28 @@
 
 @end
 
-#pragma mark - 5. 精准挂在「设置」页 ->「帮助与反馈」正上方
-
-@interface UIView (ACFindHelpFeedback)
-- (UILabel *)ac_findExactLabel:(NSString *)text;
-@end
-
-@implementation UIView (ACFindHelpFeedback)
-
-- (UILabel *)ac_findExactLabel:(NSString *)text {
-    if ([self isKindOfClass:[UILabel class]]) {
-        UILabel *lb = (UILabel *)self;
-        if (lb.text && [lb.text isEqualToString:text]) {
-            return lb;
-        }
-    }
-    for (UIView *sub in self.subviews) {
-        UILabel *found = [sub ac_findExactLabel:text];
-        if (found) return found;
-    }
-    return nil;
-}
-
-@end
-
-// 下面两个方法在 %hook 内用 %new 实现，调用点在前，必须先声明
-@interface UIViewController (ACForwardInjectDecl)
-- (void)ac_injectAboveHelpAndFeedback;
-- (void)ac_presentForwardAssistant;
-@end
+#pragma mark - 5. 精准放置在「关于飞机」页面的右上角
 
 %hook UIViewController
 
-- (void)viewDidLayoutSubviews {
-    %orig;
-    [self ac_injectAboveHelpAndFeedback];
-}
-
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    [self ac_injectAboveHelpAndFeedback];
-}
-
-%new
-- (void)ac_injectAboveHelpAndFeedback {
-    // 只在包含“帮助与反馈”精确文字的【设置】主页生效，彻底杜绝进到“关于飞机”子页面！
-    UILabel *helpLabel = [self.view ac_findExactLabel:@"帮助与反馈"];
-    if (!helpLabel) return;
-
-    // 向上寻找“帮助与反馈”所在的单行视图 (rowView) 以及外层的滚动容器/父容器
-    UIView *helpRowView = helpLabel;
-    while (helpRowView.superview && helpRowView.superview != self.view) {
-        CGFloat h = helpRowView.frame.size.height;
-        CGFloat w = helpRowView.frame.size.width;
-        if (h >= 42 && h <= 68 && w > self.view.bounds.size.width * 0.7) {
-            break;
+    NSString *clsName = NSStringFromClass([self class]);
+    // 只在“关于飞机”子页面 (HelpAboutViewController) 的右上角挂载入口按钮
+    if ([clsName containsString:@"HelpAboutViewController"]) {
+        if (self.navigationItem) {
+            UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"🚀 转发助手"
+                                                                    style:UIBarButtonItemStyleDone
+                                                                   target:self
+                                                                   action:@selector(ac_openFromAbout)];
+            btn.tintColor = [UIColor systemBlueColor];
+            self.navigationItem.rightBarButtonItem = btn;
         }
-        helpRowView = helpRowView.superview;
-    }
-
-    UIView *cardOrScrollContainer = helpRowView.superview;
-    if (!cardOrScrollContainer) return;
-
-    // 如果“帮助与反馈”装在一个白色圆角分组卡片容器里 (如图3底部的白底卡片，里面装着“帮助与反馈”和“关于飞机”两行)
-    // 我们直接在“帮助与反馈”正上方插入一行同款样式的【转发助手】
-    UIView *existingRow = [cardOrScrollContainer viewWithTag:996688];
-    CGRect helpRowFrame = helpRowView.frame;
-    CGFloat rowH = helpRowFrame.size.height > 40 ? helpRowFrame.size.height : 52.0;
-
-    if (!existingRow) {
-        // 创建与“帮助与反馈”完全同宽、同高的原生行视图
-        UIView *forwardRow = [[UIView alloc] initWithFrame:CGRectMake(helpRowFrame.origin.x,
-                                                                      helpRowFrame.origin.y - rowH,
-                                                                      helpRowFrame.size.width,
-                                                                      rowH)];
-        forwardRow.tag = 996688;
-        forwardRow.backgroundColor = [UIColor whiteColor];
-        forwardRow.layer.cornerRadius = 10.0;
-        forwardRow.clipsToBounds = YES;
-
-        // 1. 左侧圆角彩色图标（与图3中黄色“帮助与反馈”、蓝色“关于飞机”完全同尺寸对齐）
-        UIView *iconBg = [[UIView alloc] initWithFrame:CGRectMake(16, (rowH - 29) / 2.0, 29, 29)];
-        iconBg.backgroundColor = [UIColor colorWithRed:0.05 green:0.53 blue:1.0 alpha:1.0];
-        iconBg.layer.cornerRadius = 7.0;
-        iconBg.clipsToBounds = YES;
-
-        UILabel *iconSymbol = [[UILabel alloc] initWithFrame:iconBg.bounds];
-        iconSymbol.text = @"🚀";
-        iconSymbol.font = [UIFont systemFontOfSize:16];
-        iconSymbol.textAlignment = NSTextAlignmentCenter;
-        [iconBg addSubview:iconSymbol];
-        [forwardRow addSubview:iconBg];
-
-        // 2. 标题 “转发助手”（对齐“帮助与反馈”的 X 坐标与字体）
-        CGRect helpLabelInRow = [helpRowView convertRect:helpLabel.bounds fromView:helpLabel];
-        CGFloat titleX = (helpLabelInRow.origin.x > 40 && helpLabelInRow.origin.x < 90) ? helpLabelInRow.origin.x : 58.0;
-
-        UILabel *titleLb = [[UILabel alloc] initWithFrame:CGRectMake(titleX, 0, 180, rowH)];
-        titleLb.text = @"转发助手";
-        titleLb.font = helpLabel.font ?: [UIFont systemFontOfSize:16];
-        titleLb.textColor = helpLabel.textColor ?: [UIColor blackColor];
-        [forwardRow addSubview:titleLb];
-
-        // 3. 右侧灰色箭头 “>”
-        UILabel *arrowLb = [[UILabel alloc] initWithFrame:CGRectMake(helpRowFrame.size.width - 34, 0, 20, rowH)];
-        arrowLb.text = @"›";
-        arrowLb.font = [UIFont systemFontOfSize:22 weight:UIFontWeightLight];
-        arrowLb.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
-        arrowLb.textAlignment = NSTextAlignmentCenter;
-        arrowLb.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-        [forwardRow addSubview:arrowLb];
-
-        // 4. 底部分割线（与原生列表分割线一致）
-        UIView *sepLine = [[UIView alloc] initWithFrame:CGRectMake(titleX, rowH - 0.5, helpRowFrame.size.width - titleX, 0.5)];
-        sepLine.backgroundColor = [UIColor colorWithWhite:0.90 alpha:1.0];
-        [forwardRow addSubview:sepLine];
-
-        // 5. 整行点击事件
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.frame = forwardRow.bounds;
-        btn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [btn addTarget:self action:@selector(ac_presentForwardAssistant) forControlEvents:UIControlEventTouchUpInside];
-        [forwardRow addSubview:btn];
-
-        // 如果 cardOrScrollContainer 是白色卡片且 helpRowFrame.origin.y == 0（即帮助与反馈是卡片的第1行）
-        // 则把卡片内原有的“帮助与反馈”和“关于飞机”往下推 rowH 高度，把【转发助手】放在卡片第1行（帮助与反馈正上方）！
-        if (helpRowFrame.origin.y < 10) {
-            cardOrScrollContainer.clipsToBounds = NO;
-            forwardRow.frame = CGRectMake(helpRowFrame.origin.x, -rowH, helpRowFrame.size.width, rowH);
-            // 调整父级白色卡片的上边距，或者如果在 ScrollView 里，直接放到白色卡片正上方
-            if (cardOrScrollContainer.superview) {
-                CGRect cardFrameInSuper = cardOrScrollContainer.frame;
-                // 把“帮助与反馈 + 关于飞机”整个白色卡片往下挪 44pt，给“帮助与反馈”正上方腾出原生位置
-                if (cardOrScrollContainer.tag != 775533) {
-                    cardOrScrollContainer.tag = 775533;
-                    CGRect newCardFrame = cardFrameInSuper;
-                    newCardFrame.origin.y += (rowH - 8);
-                    cardOrScrollContainer.frame = newCardFrame;
-
-                    // 如果外层是 UIScrollView，同步增加 contentSize
-                    if ([cardOrScrollContainer.superview isKindOfClass:[UIScrollView class]]) {
-                        UIScrollView *sc = (UIScrollView *)cardOrScrollContainer.superview;
-                        CGSize cs = sc.contentSize;
-                        cs.height += rowH;
-                        sc.contentSize = cs;
-                    }
-                }
-                forwardRow.frame = CGRectMake(cardFrameInSuper.origin.x, cardFrameInSuper.origin.y, cardFrameInSuper.size.width, rowH);
-                [cardOrScrollContainer.superview addSubview:forwardRow];
-                return;
-            }
-        }
-
-        [cardOrScrollContainer addSubview:forwardRow];
     }
 }
 
 %new
-- (void)ac_presentForwardAssistant {
+- (void)ac_openFromAbout {
     ACForwardAssistantVC *vc = [[ACForwardAssistantVC alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
