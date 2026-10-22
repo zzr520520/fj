@@ -267,16 +267,24 @@ static UIImage *__gCapturedForwardImage = nil;
                         NSInvocation *inv2 = [NSInvocation invocationWithMethodSignature:sig2];
                         [inv2 setTarget:manager];
                         [inv2 setSelector:sendMsgSel];
-                        [inv2 setArgument:&v2Msg atIndex:2];
-                        [inv2 setArgument:&receiver atIndex:3];
-                        [inv2 setArgument:&groupID atIndex:4];
-                        NSInteger pri = 1; BOOL online = NO; id nilObj = nil;
+                        // ARC 下 block 捕获的 __strong 变量取地址会得到 const __strong *，
+                        // 无法作为 void * 传给 setArgument:，这里用 __unsafe_unretained 局部变量中转
+                        __unsafe_unretained id aMsg = v2Msg;
+                        __unsafe_unretained NSString *aRcv = receiver;
+                        __unsafe_unretained NSString *aGrp = groupID;
+                        __unsafe_unretained id aNil = nil;
+                        __unsafe_unretained id aSucc = succBlock;
+                        __unsafe_unretained id aFail = failBlock;
+                        NSInteger pri = 1; BOOL online = NO;
+                        [inv2 setArgument:&aMsg atIndex:2];
+                        [inv2 setArgument:&aRcv atIndex:3];
+                        [inv2 setArgument:&aGrp atIndex:4];
                         [inv2 setArgument:&pri atIndex:5];
                         [inv2 setArgument:&online atIndex:6];
-                        [inv2 setArgument:&nilObj atIndex:7];
-                        [inv2 setArgument:&nilObj atIndex:8];
-                        [inv2 setArgument:&succBlock atIndex:9];
-                        [inv2 setArgument:&failBlock atIndex:10];
+                        [inv2 setArgument:&aNil atIndex:7];
+                        [inv2 setArgument:&aNil atIndex:8];
+                        [inv2 setArgument:&aSucc atIndex:9];
+                        [inv2 setArgument:&aFail atIndex:10];
                         [inv2 invoke];
                     }, ^(int c2, NSString *d2){
                         if (completion) completion(NO, @"(120001)对方开启隐私保护");
