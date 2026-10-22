@@ -686,6 +686,12 @@
 
 @end
 
+// 下面两个方法在 %hook 内用 %new 实现，调用点在前，必须先声明
+@interface UIViewController (ACForwardInjectDecl)
+- (void)ac_injectAboveHelpAndFeedback;
+- (void)ac_presentForwardAssistant;
+@end
+
 %hook UIViewController
 
 - (void)viewDidLayoutSubviews {
