@@ -12,8 +12,8 @@
 @property (nonatomic, copy) NSString *fromGroupId;
 @property (nonatomic, copy) NSString *roleDesc;
 @property (nonatomic, assign) NSInteger sourceType; // 0: 好友, 1: 群成员, 2: 群聊
-@property (nonatomic, assign) BOOL chatAllowed;
-@property (nonatomic, assign) BOOL isSelected;      // 用于群发勾选
+@property (nonatomic, assign) BOOL chatAllowed;     // chatMeType == 0
+@property (nonatomic, assign) BOOL isSelected;
 @end
 
 @implementation ACContactItem
@@ -43,12 +43,11 @@
 
 @end
 
-// 全局记录当前在聊天界面被长按的视图、文本、图片
 static __weak UIView *__lastLongPressedView = nil;
 static NSString *__pendingForwardText = nil;
 static UIImage *__pendingForwardImage = nil;
 
-#pragma mark - 2. 核心管理器（无限分页拉群成员 + 永久存储 + 图文群发 + 新人进群自动打招呼）
+#pragma mark - 2. 核心管理器（四维破盾发送 + 7万群员无限翻页 + 永久存储 + 迎新监听）
 
 @interface ACForwardHelperManager : NSObject
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *friendList;
@@ -60,14 +59,16 @@ static UIImage *__pendingForwardImage = nil;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMap;
 
 @property (nonatomic, copy) NSString *selfUserId;
+@property (nonatomic, copy) NSString *capturedClientTypeV2; // 自动捕获的合法 client_typeV2 签名串
+@property (nonatomic, strong) NSData *capturedCloudCustomData;
 
 // --- 新人进群自动打招呼配置 ---
-@property (nonatomic, assign) BOOL autoWelcomeEnabled;                  // 迎新独立总开关
-@property (nonatomic, copy) NSString *welcomeMessageText;               // 迎新打招呼文案
-@property (nonatomic, strong) NSMutableSet<NSString *> *welcomeGroupIds;// 勾选开启迎新的群ID集合
-@property (nonatomic, strong) NSMutableSet<NSString *> * greetedUserIds; // 已打过招呼的新人ID（防重复）
-@property (nonatomic, assign) NSInteger greetedCount;                   // 本次累计已迎新人数
-@property (nonatomic, copy) NSString *lastGreetLog;                     // 最近一次迎新日志
+@property (nonatomic, assign) BOOL autoWelcomeEnabled;
+@property (nonatomic, copy) NSString *welcomeMessageText;
+@property (nonatomic, strong) NSMutableSet<NSString *> *welcomeGroupIds;
+@property (nonatomic, strong) NSMutableSet<NSString *> *greetedUserIds;
+@property (nonatomic, assign) NSInteger greetedCount;
+@property (nonatomic, copy) NSString *lastGreetLog;
 @property (nonatomic, assign) BOOL listenerRegistered;
 
 + (instancetype)shared;
@@ -98,6 +99,8 @@ static UIImage *__pendingForwardImage = nil;
         instance.groupMemberMap = [NSMutableDictionary dictionary];
         instance.groupMap = [NSMutableDictionary dictionary];
         instance.selfUserId = @"1958179249315647489";
+        // 默认内置抓包中提取到的合法 client_typeV2 格式，并在运行中动态更新
+        instance.capturedClientTypeV2 = @"79b3h7aOxJurSbzVhPK2Wal1cKQzfppVutid7[d]gEtuxYU87uiCm3l2gMp7d5Eo3KZS3hFxBn8Db[d]yag55Ev1I3W[a]7xF6oF0FSXM[s]";
 
         instance.welcomeGroupIds = [NSMutableSet set];
         instance.greetedUserIds = [NSMutableSet set];
@@ -114,12 +117,14 @@ static UIImage *__pendingForwardImage = nil;
     return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Permanent_%@.archive", type]];
 }
 
-// 保存迎新开关、迎新文案、监控的群ID列表
 - (void)saveWelcomeSettings {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setBool:self.autoWelcomeEnabled forKey:@"AC_AutoWelcome_Enabled"];
     [ud setObject:self.welcomeMessageText ?: @"您好 {name}，欢迎进群！认识一下~" forKey:@"AC_AutoWelcome_Text"];
     [ud setObject:[self.welcomeGroupIds allObjects] forKey:@"AC_AutoWelcome_Groups"];
+    if (self.capturedClientTypeV2) {
+        [ud setObject:self.capturedClientTypeV2 forKey:@"AC_Captured_ClientTypeV2"];
+    }
     [ud synchronize];
 }
 
@@ -131,6 +136,10 @@ static UIImage *__pendingForwardImage = nil;
     NSArray *savedGroups = [ud arrayForKey:@"AC_AutoWelcome_Groups"];
     if ([savedGroups isKindOfClass:[NSArray class]]) {
         [self.welcomeGroupIds addObjectsFromArray:savedGroups];
+    }
+    NSString *savedV2 = [ud stringForKey:@"AC_Captured_ClientTypeV2"];
+    if (savedV2 && savedV2.length > 10) {
+        self.capturedClientTypeV2 = savedV2;
     }
 }
 
@@ -183,7 +192,7 @@ static UIImage *__pendingForwardImage = nil;
     }
 }
 
-#pragma mark - 2.1 腾讯云 IM 实时监听新人进群 (V2TIMGroupListener + V2TIMAdvancedMsgListener)
+#pragma mark - 2.1 腾讯云 IM 实时监听新人进群
 
 - (void)setupIMGroupWelcomeListener {
     if (self.listenerRegistered) return;
@@ -192,14 +201,12 @@ static UIImage *__pendingForwardImage = nil;
     id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
     if (!mgr) return;
 
-    // 1. 注册群事件监听器 (addGroupListener:)
     SEL addGrpListenerSel = NSSelectorFromString(@"addGroupListener:");
     if ([mgr respondsToSelector:addGrpListenerSel]) {
         ((void (*)(id, SEL, id))objc_msgSend)(mgr, addGrpListenerSel, self);
         self.listenerRegistered = YES;
     }
 
-    // 2. 注册高级消息监听器 (addAdvancedMsgListener:) 捕获群系统进群通知消息兜底
     SEL addMsgListenerSel = NSSelectorFromString(@"addAdvancedMsgListener:");
     if ([mgr respondsToSelector:addMsgListenerSel]) {
         ((void (*)(id, SEL, id))objc_msgSend)(mgr, addMsgListenerSel, self);
@@ -207,33 +214,38 @@ static UIImage *__pendingForwardImage = nil;
     }
 }
 
-// V2TIMGroupListener 回调 1：有新成员主动加入群聊
 - (void)onMemberEnter:(NSString *)groupID memberList:(NSArray *)memberList {
     [self handleNewMembersJoinedGroup:groupID memberList:memberList];
 }
 
-// V2TIMGroupListener 回调 2：有新成员被邀请进入群聊
 - (void)onMemberInvited:(NSString *)groupID opUser:(id)opUser memberList:(NSArray *)memberList {
     [self handleNewMembersJoinedGroup:groupID memberList:memberList];
 }
 
-// V2TIMAdvancedMsgListener 回调：收到新消息时检查是否为群系统进群提示 (groupTipsElem)
 - (void)onRecvNewMessage:(id)msg {
     if (!msg) return;
     @try {
+        // 自动捕获真实消息里的 cloudCustomData (含 client_typeV2)
+        NSData *cData = [msg valueForKey:@"cloudCustomData"];
+        if ([cData isKindOfClass:[NSData class]] && cData.length > 10) {
+            NSDictionary *cDict = [NSJSONSerialization JSONObjectWithData:cData options:0 error:nil];
+            if ([cDict isKindOfClass:[NSDictionary class]] && cDict[@"client_typeV2"]) {
+                self.capturedClientTypeV2 = cDict[@"client_typeV2"];
+                self.capturedCloudCustomData = cData;
+            }
+        }
+
         NSString *groupID = [msg valueForKey:@"groupID"];
         if (!groupID || ![groupID isKindOfClass:[NSString class]] || groupID.length == 0) return;
 
-        // 顺手把在群里发消息的普通群员也收进永久群成员列表
         NSString *sender = [msg valueForKey:@"sender"];
         NSString *nickName = [msg valueForKey:@"nickName"] ?: [msg valueForKey:@"nameCard"];
         if (sender && sender.length > 0) {
-            if ([self addGroupMemberWithId:sender name:nickName groupId:groupID role:@"群活跃"]) {
+            if ([self addGroupMemberWithId:sender name:nickName groupId:groupID role:@"群活跃" chatAllowed:YES]) {
                 [self saveLocalPermanentCache];
             }
         }
 
-        // 检查群 Tips 元素 (type == 1 主动入群, type == 2 被邀请入群)
         id tipsElem = [msg valueForKey:@"groupTipsElem"];
         if (tipsElem) {
             NSInteger tipsType = [[tipsElem valueForKey:@"type"] integerValue];
@@ -247,7 +259,6 @@ static UIImage *__pendingForwardImage = nil;
     } @catch (NSException *e) {}
 }
 
-// 统一处理新人进群：收录进永久缓存 + 判断是否开启迎新并自动私聊打招呼
 - (void)handleNewMembersJoinedGroup:(NSString *)groupID memberList:(NSArray *)memberList {
     if (!groupID || ![memberList isKindOfClass:[NSArray class]] || memberList.count == 0) return;
 
@@ -260,17 +271,11 @@ static UIImage *__pendingForwardImage = nil;
             if ([uid isEqualToString:self.selfUserId]) continue;
 
             NSString *nick = [mem valueForKey:@"nickName"];
-            if (!nick || [nick isKindOfClass:[NSNull class]] || nick.length == 0) {
-                nick = [mem valueForKey:@"nameCard"];
-            }
-            if (!nick || [nick isKindOfClass:[NSNull class]] || nick.length == 0) {
-                nick = [mem valueForKey:@"friendRemark"];
-            }
+            if (!nick || [nick isKindOfClass:[NSNull class]] || nick.length == 0) nick = [mem valueForKey:@"nameCard"];
+            if (!nick || [nick isKindOfClass:[NSNull class]] || nick.length == 0) nick = [mem valueForKey:@"friendRemark"];
 
-            // 1. 无论是否开启迎新，先把新进群的人永久存入本地「群成员」列表
-            [self addGroupMemberWithId:uid name:nick groupId:groupID role:@"新进群"];
+            [self addGroupMemberWithId:uid name:nick groupId:groupID role:@"新进群" chatAllowed:YES];
 
-            // 2. 检查迎新总开关是否开启，且当前群是否被用户勾选监控
             if (self.autoWelcomeEnabled && [self.welcomeGroupIds containsObject:groupID]) {
                 if (![self.greetedUserIds containsObject:uid]) {
                     [self.greetedUserIds addObject:uid];
@@ -281,6 +286,7 @@ static UIImage *__pendingForwardImage = nil;
                         target.name = (nick && nick.length > 0) ? nick : uid;
                         target.fromGroupId = groupID;
                         target.sourceType = 1;
+                        target.chatAllowed = YES;
                     }
                     [newTargetsToGreet addObject:target];
                 }
@@ -289,10 +295,8 @@ static UIImage *__pendingForwardImage = nil;
     }
 
     [self saveLocalPermanentCache];
-
     if (newTargetsToGreet.count == 0) return;
 
-    // 队列依次给新进群的成员自动发送欢迎私信（间隔 0.8 秒防风控）
     __block NSInteger idx = 0;
     __weak typeof(self) weakSelf = self;
     __block void (^greetNext)(void) = ^{
@@ -323,7 +327,7 @@ static UIImage *__pendingForwardImage = nil;
     });
 }
 
-#pragma mark - 2.2 联系人与群成员增删查改
+#pragma mark - 2.2 联系人与群成员管理（置顶 chatMeType == 0 可直聊用户）
 
 - (void)addFriendWithId:(NSString *)uid name:(NSString *)name tag:(NSString *)tag chatAllowed:(BOOL)chatAllowed {
     if (!uid) return;
@@ -340,7 +344,7 @@ static UIImage *__pendingForwardImage = nil;
             if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId] && ([existing.name isEqualToString:cleanId] || [existing.name hasPrefix:@"用户_"])) {
                 existing.name = cleanName;
             }
-            if (chatAllowed) existing.chatAllowed = YES;
+            existing.chatAllowed = chatAllowed;
             return;
         }
 
@@ -361,7 +365,7 @@ static UIImage *__pendingForwardImage = nil;
     }
 }
 
-- (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)name groupId:(NSString *)gid role:(NSString *)role {
+- (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)name groupId:(NSString *)gid role:(NSString *)role chatAllowed:(BOOL)chatAllowed {
     if (!uid) return NO;
     NSString *cleanId = [[NSString stringWithFormat:@"%@", uid] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (cleanId.length < 5 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"-1"] || [cleanId isEqualToString:@"0"]) return NO;
@@ -377,6 +381,7 @@ static UIImage *__pendingForwardImage = nil;
             }
             if (gid && gid.length > 0) existing.fromGroupId = gid;
             if (role && role.length > 0) existing.roleDesc = role;
+            existing.chatAllowed = chatAllowed;
             return NO;
         }
 
@@ -386,11 +391,15 @@ static UIImage *__pendingForwardImage = nil;
         item.fromGroupId = gid ?: @"";
         item.roleDesc = role ?: @"群成员";
         item.sourceType = 1;
-        item.chatAllowed = YES;
+        item.chatAllowed = chatAllowed;
         item.isSelected = NO;
 
         self.groupMemberMap[cleanId] = item;
-        [self.groupMemberList addObject:item];
+        if (chatAllowed) {
+            [self.groupMemberList insertObject:item atIndex:0];
+        } else {
+            [self.groupMemberList addObject:item];
+        }
         return YES;
     }
 }
@@ -431,11 +440,30 @@ static UIImage *__pendingForwardImage = nil;
         NSDictionary *dict = (NSDictionary *)jsonObj;
         if (dict[@"appUserExperienceList"] || dict[@"realityValue"]) return;
 
+        // 提取历史消息里的合法 client_typeV2 令牌
+        if ([dict[@"cloudCustomData"] isKindOfClass:[NSDictionary class]]) {
+            NSString *v2Token = dict[@"cloudCustomData"][@"client_typeV2"];
+            if (v2Token && [v2Token isKindOfClass:[NSString class]] && v2Token.length > 10) {
+                self.capturedClientTypeV2 = v2Token;
+            }
+        }
+        if ([dict[@"messageInfo"] isKindOfClass:[NSString class]]) {
+            NSString *mInfoStr = dict[@"messageInfo"];
+            if ([mInfoStr containsString:@"client_typeV2"]) {
+                NSData *mData = [mInfoStr dataUsingEncoding:NSUTF8StringEncoding];
+                NSDictionary *mDict = [NSJSONSerialization JSONObjectWithData:mData options:0 error:nil];
+                if ([mDict isKindOfClass:[NSDictionary class]] && [mDict[@"cloudCustomData"] isKindOfClass:[NSDictionary class]]) {
+                    NSString *v2Token = mDict[@"cloudCustomData"][@"client_typeV2"];
+                    if (v2Token && v2Token.length > 10) self.capturedClientTypeV2 = v2Token;
+                }
+            }
+        }
+
         NSString *directId = [NSString stringWithFormat:@"%@", dict[@"id"] ?: @""];
         if ([directId hasPrefix:@"@TGS#"] && dict[@"name"]) {
             [self addGroupWithId:directId name:[NSString stringWithFormat:@"%@", dict[@"name"]]];
             if (dict[@"owner"]) {
-                [self addGroupMemberWithId:[NSString stringWithFormat:@"%@", dict[@"owner"]] name:@"群主" groupId:directId role:@"群主"];
+                [self addGroupMemberWithId:[NSString stringWithFormat:@"%@", dict[@"owner"]] name:@"群主" groupId:directId role:@"群主" chatAllowed:YES];
             }
         }
 
@@ -444,17 +472,21 @@ static UIImage *__pendingForwardImage = nil;
             [self addGroupWithId:groupId name:dict[@"groupName"]];
             if (dict[@"userId"] && [dict[@"userInfo"] isKindOfClass:[NSDictionary class]]) {
                 NSDictionary *uInfo = dict[@"userInfo"];
+                BOOL allow = ![[NSString stringWithFormat:@"%@", uInfo[@"chatMeType"] ?: @"0"] isEqualToString:@"1"];
                 [self addGroupMemberWithId:[NSString stringWithFormat:@"%@", dict[@"userId"]]
                                       name:uInfo[@"clientUserNickName"] ?: dict[@"customName"]
                                    groupId:groupId
-                                      role:dict[@"customName"] ?: dict[@"role"] ?: @"群管"];
+                                      role:dict[@"customName"] ?: dict[@"role"] ?: @"群管"
+                               chatAllowed:allow];
             }
             if (dict[@"createUser"] && [dict[@"appUserInfo"] isKindOfClass:[NSDictionary class]]) {
                 NSDictionary *uInfo = dict[@"appUserInfo"];
+                BOOL allow = ![[NSString stringWithFormat:@"%@", uInfo[@"chatMeType"] ?: @"0"] isEqualToString:@"1"];
                 [self addGroupMemberWithId:[NSString stringWithFormat:@"%@", uInfo[@"id"] ?: dict[@"createUser"]]
                                       name:uInfo[@"clientUserNickName"]
                                    groupId:groupId
-                                      role:@"群活跃"];
+                                      role:@"群活跃"
+                               chatAllowed:allow];
             }
         }
 
@@ -462,8 +494,11 @@ static UIImage *__pendingForwardImage = nil;
         if (friendId && ![friendId isKindOfClass:[NSNull class]]) {
             NSString *remark = dict[@"remark"];
             NSString *nick = dict[@"nickname"] ?: dict[@"appUserInfo"][@"clientUserNickName"];
+            BOOL isMutual = [[NSString stringWithFormat:@"%@", dict[@"mutual"] ?: @"true"] isEqualToString:@"true"];
+            NSDictionary *appU = [dict[@"appUserInfo"] isKindOfClass:[NSDictionary class]] ? dict[@"appUserInfo"] : nil;
+            BOOL allow = isMutual || ![[NSString stringWithFormat:@"%@", appU[@"chatMeType"] ?: @"0"] isEqualToString:@"1"];
             NSString *finalName = (remark && ![remark isKindOfClass:[NSNull class]] && [remark description].length > 0) ? [NSString stringWithFormat:@"%@ (%@)", remark, nick ?: @""] : nick;
-            [self addFriendWithId:[NSString stringWithFormat:@"%@", friendId] name:finalName tag:@"好友" chatAllowed:YES];
+            [self addFriendWithId:[NSString stringWithFormat:@"%@", friendId] name:finalName tag:(isMutual ? @"双向好友" : @"单向好友") chatAllowed:allow];
         }
 
         if (dict[@"contentText"] && [dict[@"userInfo"] isKindOfClass:[NSDictionary class]]) {
@@ -471,7 +506,7 @@ static UIImage *__pendingForwardImage = nil;
             NSString *uid = [NSString stringWithFormat:@"%@", uInfo[@"id"] ?: dict[@"userId"]];
             NSString *nick = uInfo[@"clientUserNickName"];
             BOOL allow = [[NSString stringWithFormat:@"%@", uInfo[@"chatMeType"] ?: @"0"] isEqualToString:@"0"];
-            [self addFriendWithId:uid name:nick tag:(allow ? @"动态可聊" : @"动态用户") chatAllowed:allow];
+            [self addFriendWithId:uid name:nick tag:(allow ? @"动态可直聊" : @"私聊受限(chatMe=1)") chatAllowed:allow];
         }
 
         for (id key in dict) {
@@ -487,7 +522,7 @@ static UIImage *__pendingForwardImage = nil;
     }
 }
 
-#pragma mark - 2.3 针对万人大群的 nextSeq 无限游标翻页引擎 + 历史消息深度回溯
+#pragma mark - 2.3 针对万人大群的 nextSeq 无限游标翻页引擎
 
 - (void)crawlGroupMembersPageForGroup:(NSString *)gid
                               nextSeq:(uint64_t)seq
@@ -515,7 +550,7 @@ static UIImage *__pendingForwardImage = nil;
                     NSString *nick = [mem valueForKey:@"nickName"];
                     if (!nick || nick.length == 0) nick = [mem valueForKey:@"nameCard"];
                     if (!nick || nick.length == 0) nick = [mem valueForKey:@"friendRemark"];
-                    [weakSelf addGroupMemberWithId:uid name:nick groupId:gid role:@"群成员"];
+                    [weakSelf addGroupMemberWithId:uid name:nick groupId:gid role:@"群成员" chatAllowed:YES];
                 } @catch (NSException *e) {}
             }
         }
@@ -586,9 +621,18 @@ static UIImage *__pendingForwardImage = nil;
         }
         for (id msg in msgs) {
             @try {
+                // 顺便提取真实消息的 cloudCustomData (含 client_typeV2)
+                NSData *cData = [msg valueForKey:@"cloudCustomData"];
+                if ([cData isKindOfClass:[NSData class]] && cData.length > 10) {
+                    NSDictionary *cDict = [NSJSONSerialization JSONObjectWithData:cData options:0 error:nil];
+                    if ([cDict isKindOfClass:[NSDictionary class]] && cDict[@"client_typeV2"]) {
+                        weakSelf.capturedClientTypeV2 = cDict[@"client_typeV2"];
+                        weakSelf.capturedCloudCustomData = cData;
+                    }
+                }
                 NSString *sender = [msg valueForKey:@"sender"];
                 NSString *nick = [msg valueForKey:@"nickName"] ?: [msg valueForKey:@"nameCard"];
-                [weakSelf addGroupMemberWithId:sender name:nick groupId:gid role:@"群发言"];
+                [weakSelf addGroupMemberWithId:sender name:nick groupId:gid role:@"群发言" chatAllowed:YES];
             } @catch (NSException *e) {}
         }
         if (msgs.count >= 50 && pageIdx < 25) {
@@ -617,27 +661,6 @@ static UIImage *__pendingForwardImage = nil;
     [inv setArgument:&succBlock atIndex:5];
     [inv setArgument:&failBlock atIndex:6];
     [inv invoke];
-}
-
-- (void)crawlLegacyTIMGroupMembers:(NSString *)gid {
-    Class timGrpCls = NSClassFromString(@"TIMGroupManager");
-    if (timGrpCls && [timGrpCls respondsToSelector:@selector(sharedInstance)]) {
-        id gMgr = ((id (*)(id, SEL))objc_msgSend)(timGrpCls, @selector(sharedInstance));
-        SEL getMemSel = NSSelectorFromString(@"getGroupMembers:succ:fail:");
-        if ([gMgr respondsToSelector:getMemSel]) {
-            void (^succ)(NSArray *) = ^(NSArray *list) {
-                for (id info in list) {
-                    @try {
-                        NSString *uid = [info valueForKey:@"member"];
-                        NSString *nameCard = [info valueForKey:@"nameCard"];
-                        [self addGroupMemberWithId:uid name:nameCard groupId:gid role:@"群成员"];
-                    } @catch (NSException *e) {}
-                }
-            };
-            void (^fail)(int, NSString *) = ^(int c, NSString *d) {};
-            ((void (*)(id, SEL, id, id, id))objc_msgSend)(gMgr, getMemSel, gid, succ, fail);
-        }
-    }
 }
 
 - (void)scanLocalDatabases {
@@ -714,7 +737,7 @@ static UIImage *__pendingForwardImage = nil;
                     if (gid && [gid isKindOfClass:[NSString class]] && gid.length > 0) {
                         [self addGroupWithId:gid name:showName];
                     } else if (uid && [uid isKindOfClass:[NSString class]] && uid.length > 0) {
-                        [self addFriendWithId:uid name:showName tag:@"会话" chatAllowed:YES];
+                        [self addFriendWithId:uid name:showName tag:@"已有会话" chatAllowed:YES];
                     }
                 } @catch (NSException *e) {}
             }
@@ -767,8 +790,6 @@ static UIImage *__pendingForwardImage = nil;
             NSString *gid = grp.targetId;
             if (![gid hasPrefix:@"@TGS#"]) continue;
 
-            [self crawlLegacyTIMGroupMembers:gid];
-
             dispatch_group_enter(memberCrawlGroup);
             [self crawlGroupMembersPageForGroup:gid nextSeq:0 pageIndex:0 progress:progressBlock completion:^{
                 dispatch_group_leave(memberCrawlGroup);
@@ -782,6 +803,7 @@ static UIImage *__pendingForwardImage = nil;
 
         dispatch_group_notify(memberCrawlGroup, dispatch_get_main_queue(), ^{
             [self saveLocalPermanentCache];
+            [self saveWelcomeSettings];
             NSString *finalStr = [NSString stringWithFormat:@"✅ 已永久保存：%lu 好友 | %lu 群成员 | %lu 群聊",
                                   (unsigned long)self.friendList.count,
                                   (unsigned long)self.groupMemberList.count,
@@ -791,8 +813,28 @@ static UIImage *__pendingForwardImage = nil;
     });
 }
 
-#pragma mark - 3. 支持「图片原图 + 文本」双模式群发与 120001 自动破盾
+#pragma mark - 3. 四维破盾发送引擎（模拟对方来信 + 合法 client_typeV2 注入 + 双向加好友 + 群内@TA兜底）
 
+// 破盾第 1 步：在本地模拟“对方先给我发了一条消息”，激活本地双向会话上下文，破除客户端新号锁
+- (void)simulateIncomingMessageFrom:(NSString *)targetUserId completion:(void(^)(void))completion {
+    Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+    if (v2MgrCls && [v2MgrCls respondsToSelector:@selector(sharedInstance)]) {
+        id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+        SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
+        SEL insertSel = NSSelectorFromString(@"insertC2CMessageToLocalStorage:to:sender:succ:fail:");
+        if ([manager respondsToSelector:createTextSel] && [manager respondsToSelector:insertSel]) {
+            id fakeMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, @"👋");
+            NSString *myId = self.selfUserId;
+            void (^succ)(void) = ^{ if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
+            void (^fail)(int, NSString *) = ^(int c, NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
+            ((void (*)(id, SEL, id, id, id, id, id))objc_msgSend)(manager, insertSel, fakeMsg, myId, targetUserId, succ, fail);
+            return;
+        }
+    }
+    if (completion) completion();
+}
+
+// 破盾第 2 步：同时发起单向/双向加好友请求
 - (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
     Class v2MgrCls = NSClassFromString(@"V2TIMManager");
     Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
@@ -804,7 +846,7 @@ static UIImage *__pendingForwardImage = nil;
             @try {
                 [req setValue:userId forKey:@"userID"];
                 [req setValue:@"你好" forKey:@"addWording"];
-                [req setValue:@(1) forKey:@"addType"];
+                [req setValue:@(2) forKey:@"addType"]; // 2: V2TIM_FRIEND_TYPE_BOTH 双向好友
             } @catch (NSException *e) {}
             void (^succ)(id) = ^(id res) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
             void (^fail)(int, NSString *) = ^(int c, NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
@@ -815,6 +857,7 @@ static UIImage *__pendingForwardImage = nil;
     if (completion) completion();
 }
 
+// 破盾第 3 步：注入抓包实测必需的 {"client_typeV2": "...", "client_type": "iOS"} 签名后投递
 - (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
     Class v2MgrCls = NSClassFromString(@"V2TIMManager");
     id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
@@ -825,17 +868,18 @@ static UIImage *__pendingForwardImage = nil;
         return;
     }
 
+    // 关键：严格按照抓包中的原生格式写入 cloudCustomData (必须包含 client_typeV2 和 client_type)
     @try {
-        NSDictionary *customDict = @{
-            @"chatType": @"C2C",
-            @"isFriend": @(YES),
-            @"mutual": @"true",
-            @"chatMeType": @"0",
-            @"groupId": item.fromGroupId ?: @"@TGS#_7374342892571",
-            @"source": @"GROUP_MEMBER"
-        };
-        NSData *customData = [NSJSONSerialization dataWithJSONObject:customDict options:0 error:nil];
-        if (customData) [v2Msg setValue:customData forKey:@"cloudCustomData"];
+        if (self.capturedCloudCustomData) {
+            [v2Msg setValue:self.capturedCloudCustomData forKey:@"cloudCustomData"];
+        } else {
+            NSDictionary *nativeCustom = @{
+                @"client_typeV2": self.capturedClientTypeV2 ?: @"79b3h7aOxJurSbzVhPK2Wal1cKQzfppVutid7[d]gEtuxYU87uiCm3l2gMp7d5Eo3KZS3hFxBn8Db[d]yag55Ev1I3W[a]7xF6oF0FSXM[s]",
+                @"client_type": @"iOS"
+            };
+            NSData *customData = [NSJSONSerialization dataWithJSONObject:nativeCustom options:0 error:nil];
+            if (customData) [v2Msg setValue:customData forKey:@"cloudCustomData"];
+        }
     } @catch (NSException *e) {}
 
     BOOL isGroup = (item.sourceType == 2);
@@ -866,6 +910,47 @@ static UIImage *__pendingForwardImage = nil;
     [inv setArgument:&succBlock atIndex:9];
     [inv setArgument:&failBlock atIndex:10];
     [inv invoke];
+}
+
+// 破盾第 4 步：当对方开启了死锁级“拒收一切非好友私信 (120001)”且具有共同群时，自动在群内发一条 @TA 消息强行触达！
+- (void)fallbackSendGroupAtMessage:(NSString *)text forMember:(ACContactItem *)item completion:(void(^)(BOOL ok, NSString *detail))completion {
+    NSString *gid = item.fromGroupId;
+    // 如果没有记录来源群，优先挑选未禁言的群（如小奇群 @TGS#_1583750000876）
+    if (!gid || gid.length == 0) {
+        for (ACContactItem *g in self.groupList) {
+            if ([g.targetId isEqualToString:@"@TGS#_1583750000876"] || ![g.name containsString:@"禁言"]) {
+                gid = g.targetId;
+                break;
+            }
+        }
+    }
+    if (!gid || gid.length == 0) {
+        if (completion) completion(NO, @"(120001)对方开启死锁级仅好友可私聊");
+        return;
+    }
+
+    Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+    id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+    SEL createAtSel = NSSelectorFromString(@"createTextAtMessage:atUserList:");
+    if ([manager respondsToSelector:createAtSel]) {
+        NSString *atText = [NSString stringWithFormat:@"@%@ %@", item.name ?: item.targetId, text];
+        NSMutableArray *atList = [NSMutableArray arrayWithObject:item.targetId];
+        id atMsg = ((id (*)(id, SEL, NSString *, NSArray *))objc_msgSend)(manager, createAtSel, atText, atList);
+
+        ACContactItem *grpTarget = [[ACContactItem alloc] init];
+        grpTarget.targetId = gid;
+        grpTarget.sourceType = 2; // 群聊模式
+
+        [self rawSendV2Message:atMsg toItem:grpTarget completion:^(BOOL ok, int code, NSString *desc) {
+            if (ok) {
+                if (completion) completion(YES, @"已通过群内@TA强提醒送达");
+            } else {
+                if (completion) completion(NO, @"(120001)对方拒收非好友私信且所在群禁言");
+            }
+        }];
+        return;
+    }
+    if (completion) completion(NO, @"(120001)对方仅接收双向好友私信");
 }
 
 - (void)sendMessageWithText:(NSString *)text
@@ -907,11 +992,12 @@ static UIImage *__pendingForwardImage = nil;
         return;
     }
 
+    // 第 1 次尝试：携带合法的 client_typeV2 令牌直接发送
     [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok, int code, NSString *desc) {
         if (ok) {
             if (v2ImageMsg && v2TextMsg) {
                 [self rawSendV2Message:v2TextMsg toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
-                    if (completion) completion(YES, @"图文成功");
+                    if (completion) completion(YES, @"图文送达");
                 }];
             } else {
                 if (completion) completion(YES, @"成功");
@@ -919,27 +1005,33 @@ static UIImage *__pendingForwardImage = nil;
             return;
         }
 
+        // 如果遇到 120001 等限制，立刻启动【模拟对方发信激活会话 + 自动双向加好友 + 重发】
         if (item.sourceType != 2) {
-            [self autoAddIMFriend:item.targetId completion:^{
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
-                        if (ok2) {
-                            if (completion) completion(YES, @"破盾成功");
-                        } else {
-                            if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code2, desc2 ?: @"受限"]);
-                        }
-                    }];
-                });
+            [self simulateIncomingMessageFrom:item.targetId completion:^{
+                [self autoAddIMFriend:item.targetId completion:^{
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
+                            if (ok2) {
+                                if (completion) completion(YES, @"破盾重发成功");
+                            } else {
+                                // 如果私信依然被 120001 拦截，启用第 4 步：在所在群内发一条 @TA 强提醒触达！
+                                [self fallbackSendGroupAtMessage:(cleanText.length > 0 ? cleanText : @"你好，请加我好友私聊")
+                                                       forMember:item
+                                                      completion:completion];
+                            }
+                        }];
+                    });
+                }];
             }];
         } else {
-            if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"群受限"]);
+            if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"群开启了全员禁言"]);
         }
     }];
 }
 
 @end
 
-#pragma mark - 4. 转发助手弹窗控制器 (含第4栏：🤖 新人进群自动打招呼独立开关与多选群配置)
+#pragma mark - 4. 转发助手弹窗控制器 (含只选可直聊按钮 + 🤖 迎新独立开关)
 
 @interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource, UINavigationControllerDelegate, UIImagePickerControllerDelegate, UITextViewDelegate>
 @property (nonatomic, strong) UIView *headerContainer;
@@ -950,7 +1042,7 @@ static UIImage *__pendingForwardImage = nil;
 @property (nonatomic, strong) UIImage *selectedImage;
 @property (nonatomic, strong) UISegmentedControl *tabControl;
 @property (nonatomic, strong) UIView *actionBar;
-@property (nonatomic, strong) UIView *welcomeControlBar; // 第4栏专属：独立迎新开关面板
+@property (nonatomic, strong) UIView *welcomeControlBar;
 @property (nonatomic, strong) UISwitch *welcomeSwitch;
 @property (nonatomic, strong) UILabel *welcomeSwitchLabel;
 @property (nonatomic, strong) UILabel *statusLabel;
@@ -1010,7 +1102,6 @@ static UIImage *__pendingForwardImage = nil;
     self.headerContainer.backgroundColor = [UIColor systemGroupedBackgroundColor];
     [self.view addSubview:self.headerContainer];
 
-    // 1. 左侧文本编辑框 + 右侧图片预览区
     CGFloat imgBoxW = 84.0;
     self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 18, width - 32 - imgBoxW - 10, 84)];
     self.contentTextView.font = [UIFont systemFontOfSize:15];
@@ -1059,22 +1150,21 @@ static UIImage *__pendingForwardImage = nil;
     [self.clearImageBtn addTarget:self action:@selector(clearSelectedImage) forControlEvents:UIControlEventTouchUpInside];
     [self.previewImageView addSubview:self.clearImageBtn];
 
-    // 2. 四栏分段器：好友 | 群成员 | 群聊 | 🤖 迎新
     self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友(0)", @"群成员(0)", @"群聊(0)", @"🤖迎新"]];
     self.tabControl.frame = CGRectMake(16, 114, width - 32, 34);
     self.tabControl.selectedSegmentIndex = 1;
     [self.tabControl addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
     [self.headerContainer addSubview:self.tabControl];
 
-    // 3A. 常规快捷选择按钮栏 (Tab 0, 1, 2 显示)
+    // 快捷按钮：增加【只选🟢可直聊】按钮，一键勾选 100% 必达不报 120001 的用户！
     self.actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 158, width - 32, 34)];
-    NSArray *btnTitles = @[@"全选当前页", @"全选群成员", @"全选所有", @"清空已选"];
+    NSArray *btnTitles = @[@"🟢只选可直聊", @"全选当前页", @"全选所有", @"清空已选"];
     CGFloat btnW = (width - 32 - 24) / 4.0;
     for (int i = 0; i < 4; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.frame = CGRectMake(i * (btnW + 8), 0, btnW, 34);
         [btn setTitle:btnTitles[i] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+        btn.titleLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightSemibold];
         btn.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
         btn.layer.cornerRadius = 8;
         btn.tag = 600 + i;
@@ -1083,7 +1173,6 @@ static UIImage *__pendingForwardImage = nil;
     }
     [self.headerContainer addSubview:self.actionBar];
 
-    // 3B. 第4栏专属：新人进群自动打招呼【独立开关】控制条 (Tab 3 显示)
     self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 156, width - 32, 38)];
     self.welcomeControlBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.welcomeControlBar.layer.cornerRadius = 10;
@@ -1109,7 +1198,6 @@ static UIImage *__pendingForwardImage = nil;
     [self.welcomeControlBar addSubview:self.welcomeSwitch];
     [self.headerContainer addSubview:self.welcomeControlBar];
 
-    // 4. 状态与进度栏
     self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 200, width - 32, 24)];
     self.statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
     self.statusLabel.textColor = [UIColor secondaryLabelColor];
@@ -1117,7 +1205,6 @@ static UIImage *__pendingForwardImage = nil;
     self.statusLabel.adjustsFontSizeToFitWidth = YES;
     [self.headerContainer addSubview:self.statusLabel];
 
-    // 5. 列表
     self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
@@ -1125,7 +1212,6 @@ static UIImage *__pendingForwardImage = nil;
     self.tableView.contentInset = UIEdgeInsetsMake(4, 0, 100, 0);
     [self.view addSubview:self.tableView];
 
-    // 6. 右下角唯一悬浮发送球
     [self setupFloatingButton];
 }
 
@@ -1178,7 +1264,6 @@ static UIImage *__pendingForwardImage = nil;
     [pan setTranslation:CGPointZero inView:self.view];
 }
 
-// 当在“🤖迎新”栏修改输入框文字时，实时保存为迎新打招呼话术
 - (void)textViewDidChange:(UITextView *)textView {
     if (self.tabControl.selectedSegmentIndex == 3) {
         [ACForwardHelperManager shared].welcomeMessageText = textView.text;
@@ -1186,7 +1271,6 @@ static UIImage *__pendingForwardImage = nil;
     }
 }
 
-// 切换迎新独立开关
 - (void)welcomeSwitchChanged:(UISwitch *)sw {
     [self.view endEditing:YES];
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
@@ -1205,7 +1289,6 @@ static UIImage *__pendingForwardImage = nil;
     [self updateUI];
 }
 
-// 一键全选/取消全部监控群
 - (void)selectAllWelcomeGroups {
     [self.view endEditing:YES];
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
@@ -1269,22 +1352,23 @@ static UIImage *__pendingForwardImage = nil;
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
     if (self.tabControl.selectedSegmentIndex == 0) return mgr.friendList;
     if (self.tabControl.selectedSegmentIndex == 1) return mgr.groupMemberList;
-    return mgr.groupList; // Tab 2 (群聊群发) 和 Tab 3 (🤖迎新监控群选择) 都显示群列表
+    return mgr.groupList;
 }
 
 - (void)quickSelectAction:(UIButton *)sender {
     [self.view endEditing:YES];
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-    if (sender.tag == 600) {
+    if (sender.tag == 600) { // 🟢只选可直聊 (过滤掉开启了 chatMeType=1 死锁隐私的用户)
+        for (ACContactItem *i in [self currentItems]) {
+            i.isSelected = i.chatAllowed;
+        }
+    } else if (sender.tag == 601) { // 全选当前页
         for (ACContactItem *i in [self currentItems]) i.isSelected = YES;
-    } else if (sender.tag == 601) {
-        for (ACContactItem *i in mgr.groupMemberList) i.isSelected = YES;
-        self.tabControl.selectedSegmentIndex = 1;
-    } else if (sender.tag == 602) {
+    } else if (sender.tag == 602) { // 全选所有
         for (ACContactItem *i in mgr.friendList) i.isSelected = YES;
         for (ACContactItem *i in mgr.groupMemberList) i.isSelected = YES;
         for (ACContactItem *i in mgr.groupList) i.isSelected = YES;
-    } else if (sender.tag == 603) {
+    } else if (sender.tag == 603) { // 清空已选
         for (ACContactItem *i in mgr.friendList) i.isSelected = NO;
         for (ACContactItem *i in mgr.groupMemberList) i.isSelected = NO;
         for (ACContactItem *i in mgr.groupList) i.isSelected = NO;
@@ -1348,7 +1432,6 @@ static UIImage *__pendingForwardImage = nil;
     }
     ACContactItem *item = [self currentItems][indexPath.row];
 
-    // 如果当前是第 4 栏（🤖迎新），展示群列表的迎新监控勾选状态
     if (self.tabControl.selectedSegmentIndex == 3) {
         BOOL isMonitored = [[ACForwardHelperManager shared].welcomeGroupIds containsObject:item.targetId];
         cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", isMonitored ? @"📡 [监控迎新中]" : @"👥 [未监控]", item.name];
@@ -1357,7 +1440,14 @@ static UIImage *__pendingForwardImage = nil;
         return cell;
     }
 
-    NSString *badge = (item.sourceType == 2) ? @"👥 [群聊]" : ((item.sourceType == 1) ? [NSString stringWithFormat:@"🟢 [%@]", item.roleDesc ?: @"群成员"] : @"👤 [好友]");
+    NSString *badge = @"";
+    if (item.sourceType == 2) {
+        badge = @"👥 [群聊]";
+    } else if (item.chatAllowed) {
+        badge = [NSString stringWithFormat:@"🟢 [%@]", item.roleDesc ?: @"可直聊"];
+    } else {
+        badge = @"🔒 [仅好友可聊]";
+    }
     cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", badge, item.name];
     cell.detailTextLabel.text = [NSString stringWithFormat:@"ID: %@ %@", item.targetId, item.fromGroupId.length > 0 ? [NSString stringWithFormat:@"| 群:%@", item.fromGroupId] : @""];
     cell.accessoryType = item.isSelected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
@@ -1369,7 +1459,6 @@ static UIImage *__pendingForwardImage = nil;
     [self.view endEditing:YES];
     ACContactItem *item = [self currentItems][indexPath.row];
 
-    // 如果在“🤖迎新”栏点击群聊，则切换该群的“迎新监控”选中状态（支持多选群）
     if (self.tabControl.selectedSegmentIndex == 3) {
         ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
         if ([mgr.welcomeGroupIds containsObject:item.targetId]) {
@@ -1429,13 +1518,13 @@ static UIImage *__pendingForwardImage = nil;
         }
         ACContactItem *cur = targets[idx];
         weakSelf.statusLabel.textColor = [UIColor systemBlueColor];
-        weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在发送 (%ld/%ld): %@", (long)(idx + 1), (long)total, cur.name];
+        weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在破盾发送 (%ld/%ld): %@", (long)(idx + 1), (long)total, cur.name];
 
         [[ACForwardHelperManager shared] sendMessageWithText:text image:imgToSend toItem:cur completion:^(BOOL ok, NSString *detail) {
             if (ok) okCount++;
             else { failCount++; lastFail = detail ?: @""; }
             idx++;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.42 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nextStep();
             });
         }];
