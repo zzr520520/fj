@@ -28,7 +28,7 @@
 - (void)addGroupWithId:(NSString *)gid name:(NSString *)name;
 - (void)parseAnyJSON:(id)jsonObj;
 - (void)reloadAllDataWithCompletion:(void(^)(NSString *statusMsg))completion;
-- (void)sendText:(NSString *)text toItem:(ACContactItem *)item completion:(void(^)(BOOL ok))completion;
+- (void)sendText:(NSString *)text toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, NSString *errInfo))completion;
 @end
 
 @implementation ACForwardHelperManager
@@ -59,7 +59,7 @@
     if ([self.friendIdSet containsObject:cleanId]) {
         if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId]) {
             for (ACContactItem *item in self.friendList) {
-                if ([item.targetId isEqualToString:cleanId] && [item.name isEqualToString:cleanId]) {
+                if ([item.targetId isEqualToString:cleanId] && ([item.name isEqualToString:cleanId] || [item.name hasPrefix:@"好友_"])) {
                     item.name = cleanName;
                     break;
                 }
@@ -109,6 +109,14 @@
     if (!jsonObj) return;
     if ([jsonObj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)jsonObj;
+
+        // 提取埋点里的会话对象 (如 "objectId": "会话：2112860989417381890")
+        id objId = dict[@"objectId"];
+        if ([objId isKindOfClass:[NSString class]] && [objId hasPrefix:@"会话："]) {
+            NSString * extractedId = [objId substringFromIndex:3];
+            [self addFriendWithId:extractedId name:nil];
+        }
+
         id friendId = dict[@"friendId"];
         if (friendId && ![friendId isKindOfClass:[NSNull class]]) {
             NSString *remark = dict[@"remark"];
@@ -209,6 +217,32 @@
     [self scanLocalDatabases];
 
     dispatch_group_t group = dispatch_group_create();
+
+    // 1. 读取 TIMManager 会话列表 (逆向报告明确存在的符号)
+    Class timCls = NSClassFromString(@"TIMManager");
+    if (timCls && [timCls respondsToSelector:@selector(sharedInstance)]) {
+        id timMgr = ((id (*)(id, SEL))objc_msgSend)(timCls, @selector(sharedInstance));
+        SEL getConvsSel = NSSelectorFromString(@"getConversationList");
+        if ([timMgr respondsToSelector:getConvsSel]) {
+            NSArray *convs = ((id (*)(id, SEL))objc_msgSend)(timMgr, getConvsSel);
+            if ([convs isKindOfClass:[NSArray class]]) {
+                for (id conv in convs) {
+                    @try {
+                        SEL rcvSel = NSSelectorFromString(@"getReceiver");
+                        SEL typeSel = NSSelectorFromString(@"getType");
+                        if ([conv respondsToSelector:rcvSel] && [conv respondsToSelector:typeSel]) {
+                            NSString *rcv = ((id (*)(id, SEL))objc_msgSend)(conv, rcvSel);
+                            NSInteger type = ((NSInteger (*)(id, SEL))objc_msgSend)(conv, typeSel);
+                            if (type == 2) [self addGroupWithId:rcv name:nil];
+                            else if (type == 1) [self addFriendWithId:rcv name:nil];
+                        }
+                    } @catch (NSException *e) {}
+                }
+            }
+        }
+    }
+
+    // 2. 读取 V2TIMManager 会话与群聊
     Class v2Cls = NSClassFromString(@"V2TIMManager");
     if (v2Cls && [v2Cls respondsToSelector:@selector(sharedInstance)]) {
         id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
@@ -267,25 +301,64 @@
         }
     }
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dispatch_group_notify(group, dispatch_get_main_queue(), ^{
-            NSString *msg = [NSString stringWithFormat:@"已加载 %lu 位好友 | %lu 个群聊", (unsigned long)self.friendList.count, (unsigned long)self.groupList.count];
+            NSString *msg = [NSString stringWithFormat:@"已就绪：%lu 位好友 | %lu 个群聊", (unsigned long)self.friendList.count, (unsigned long)self.groupList.count];
             if (self.friendList.count == 0 && self.groupList.count == 0) {
-                msg = @"提示：请在 App 切换至【联系人】或会话加载后重试";
+                msg = @"请先在 App 点一下【联系人】页加载数据后再刷新";
             }
             if (completion) completion(msg);
         });
     });
 }
 
-#pragma mark - 2. 腾讯云 IM 发送实现
+#pragma mark - 2. 双引擎底层直发（绕过 UI 限制 + 返回精准错误码）
 
-- (void)sendText:(NSString *)text toItem:(ACContactItem *)item completion:(void(^)(BOOL ok))completion {
+- (void)sendText:(NSString *)text toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, NSString *errInfo))completion {
     if (text.length == 0 || item.targetId.length == 0) {
-        if (completion) completion(NO);
+        if (completion) completion(NO, @"参数为空");
         return;
     }
 
+    // 引擎 1：优先使用逆向报告实测存在的 TIMManager / TIMConversation / TIMMessage / TIMTextElem
+    Class timMgrCls = NSClassFromString(@"TIMManager");
+    Class timMsgCls = NSClassFromString(@"TIMMessage");
+    Class timTextCls = NSClassFromString(@"TIMTextElem");
+    if (timMgrCls && timMsgCls && timTextCls) {
+        id manager = ((id (*)(id, SEL))objc_msgSend)(timMgrCls, @selector(sharedInstance));
+        SEL getConvSel = NSSelectorFromString(@"getConversation:receiver:");
+        if (manager && [manager respondsToSelector:getConvSel]) {
+            NSInteger convType = item.isGroup ? 2 : 1; // 1: C2C单聊, 2: Group群聊
+            id conv = ((id (*)(id, SEL, NSInteger, NSString *))objc_msgSend)(manager, getConvSel, convType, item.targetId);
+            if (conv) {
+                id msg = [[timMsgCls alloc] init];
+                id elem = [[timTextCls alloc] init];
+                @try {
+                    [elem setValue:text forKey:@"text"];
+                } @catch (NSException *e) {}
+
+                SEL addElemSel = NSSelectorFromString(@"addElem:");
+                if ([msg respondsToSelector:addElemSel]) {
+                    ((int (*)(id, SEL, id))objc_msgSend)(msg, addElemSel, elem);
+                }
+
+                SEL sendSel = NSSelectorFromString(@"sendMessage:succ:fail:");
+                if ([conv respondsToSelector:sendSel]) {
+                    void (^succBlock)(void) = ^{
+                        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, nil); });
+                    };
+                    void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) {
+                        NSString *err = [NSString stringWithFormat:@"TIM错误(%d): %@", code, desc ?: @"发送受限"];
+                        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, err); });
+                    };
+                    ((void (*)(id, SEL, id, id, id))objc_msgSend)(conv, sendSel, msg, succBlock, failBlock);
+                    return;
+                }
+            }
+        }
+    }
+
+    // 引擎 2：V2TIMManager 发送通道
     Class v2MgrCls = NSClassFromString(@"V2TIMManager");
     if (v2MgrCls && [v2MgrCls respondsToSelector:@selector(sharedInstance)]) {
         id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
@@ -298,10 +371,11 @@
             NSString *groupID = item.isGroup ? item.targetId : nil;
 
             void (^succBlock)(void) = ^{
-                if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES); });
+                if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, nil); });
             };
             void (^failBlock)(int, NSString *) = ^(int code, NSString *desc){
-                if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
+                NSString *err = [NSString stringWithFormat:@"V2错误(%d): %@", code, desc ?: @"发送被拒"];
+                if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, err); });
             };
 
             NSMethodSignature *sig = [manager methodSignatureForSelector:sendMsgSel];
@@ -324,7 +398,8 @@
             return;
         }
     }
-    if (completion) completion(NO);
+
+    if (completion) completion(NO, @"未找到IM发送实例");
 }
 
 @end
@@ -345,7 +420,7 @@
 
 %end
 
-#pragma mark - 4. 转发助手视图控制器（右下角悬浮按钮 + 顶部导航双重绑定）
+#pragma mark - 4. 转发助手清爽版界面（仅保留右下角悬浮发送球）
 
 @interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UITextView *contentTextView;
@@ -362,85 +437,83 @@
     self.title = @"转发助手";
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
 
-    // 左侧关闭
+    // 顶部仅保留左“关闭”、右“刷新”，删除固定的发送按钮
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(dismissSelf)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"刷新" style:UIBarButtonItemStylePlain target:self action:@selector(refreshData)];
 
-    // 顶部右侧提供「发送」与「刷新」双按键保险
-    UIBarButtonItem *sendItem = [[UIBarButtonItem alloc] initWithTitle:@"发送" style:UIBarButtonItemStyleDone target:self action:@selector(startBatchSend)];
-    sendItem.tintColor = [UIColor systemBlueColor];
-    UIBarButtonItem *refreshItem = [[UIBarButtonItem alloc] initWithTitle:@"刷新" style:UIBarButtonItemStylePlain target:self action:@selector(refreshData)];
-    self.navigationItem.rightBarButtonItems = @[sendItem, refreshItem];
-
-    [self setupUI];
+    [self setupSpaciousUI];
     [self refreshData];
 }
 
-- (void)setupUI {
+- (void)setupSpaciousUI {
     CGFloat width = self.view.bounds.size.width;
 
-    // 1. 顶部编辑区
-    UILabel *tipLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, width - 32, 20)];
-    tipLabel.text = @"📝 编辑转发/群发内容：";
-    tipLabel.font = [UIFont boldSystemFontOfSize:14];
-    [self.view addSubview:tipLabel];
-
-    self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 36, width - 32, 75)];
-    self.contentTextView.font = [UIFont systemFontOfSize:14];
-    self.contentTextView.layer.cornerRadius = 8;
-    self.contentTextView.layer.borderColor = [UIColor separatorColor].CGColor;
-    self.contentTextView.layer.borderWidth = 1.0;
+    // 1. 宽敞清爽的内容编辑框（带内边距）
+    self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 16, width - 32, 96)];
+    self.contentTextView.font = [UIFont systemFontOfSize:15];
+    self.contentTextView.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
+    self.contentTextView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    self.contentTextView.layer.cornerRadius = 12;
     self.contentTextView.text = @"您好，这是一条群发消息！";
     [self.view addSubview:self.contentTextView];
 
-    // 2. 快捷全选栏
-    UIView *actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 118, width - 32, 30)];
-    NSArray *btnTitles = @[@"全选好友", @"全选群聊", @"全选所有", @"取消全选"];
-    CGFloat btnW = (width - 32 - 18) / 4.0;
+    // 2. 好友 / 群聊 切换分段器（拉大上下呼吸间距）
+    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友列表 (0)", @"群聊列表 (0)"]];
+    self.tabControl.frame = CGRectMake(16, 126, width - 32, 34);
+    self.tabControl.selectedSegmentIndex = 0;
+    [self.tabControl addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:self.tabControl];
+
+    // 3. 快捷选择按钮栏
+    UIView *actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 172, width - 32, 34)];
+    NSArray *btnTitles = @[@"全选好友", @"全选群聊", @"全选所有", @"清空已选"];
+    CGFloat btnW = (width - 32 - 24) / 4.0;
     for (int i = 0; i < 4; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(i * (btnW + 6), 0, btnW, 28);
+        btn.frame = CGRectMake(i * (btnW + 8), 0, btnW, 34);
         [btn setTitle:btnTitles[i] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+        btn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
         btn.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-        btn.layer.cornerRadius = 5;
+        btn.layer.cornerRadius = 8;
         btn.tag = 500 + i;
         [btn addTarget:self action:@selector(quickSelectAction:) forControlEvents:UIControlEventTouchUpInside];
         [actionBar addSubview:btn];
     }
     [self.view addSubview:actionBar];
 
-    // 3. 标签切换器
-    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友 (0)", @"群聊 (0)"]];
-    self.tabControl.frame = CGRectMake(16, 154, width - 32, 30);
-    self.tabControl.selectedSegmentIndex = 0;
-    [self.tabControl addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
-    [self.view addSubview:self.tabControl];
-
-    // 4. 状态提示条
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 188, width - 32, 16)];
-    self.statusLabel.font = [UIFont systemFontOfSize:11];
+    // 4. 状态与错误诊断栏
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 214, width - 32, 20)];
+    self.statusLabel.font = [UIFont systemFontOfSize:12];
     self.statusLabel.textColor = [UIColor secondaryLabelColor];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
+    self.statusLabel.adjustsFontSizeToFitWidth = YES;
     self.statusLabel.text = @"正在读取数据...";
     [self.view addSubview:self.statusLabel];
 
-    // 5. 列表（占满剩余空间）
-    CGFloat tableTop = 208.0;
-    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, tableTop, width, self.view.bounds.size.height - tableTop) style:UITableViewStylePlain];
+    // 5. 列表（行高设为 56pt，告别拥挤）
+    CGFloat tableTop = 240.0;
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, tableTop, width, self.view.bounds.size.height - tableTop) style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
+    self.tableView.rowHeight = 56.0;
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.tableView.contentInset = UIEdgeInsetsMake(0, 0, 90, 0); // 留出底部边距，防止被右下角按钮挡住最后几项
+    self.tableView.contentInset = UIEdgeInsetsMake(0, 0, 100, 0);
     [self.view addSubview:self.tableView];
 
-    // 6. 右下角强力固定悬浮按键
+    // 6. 右下角唯一悬浮发送球
     [self setupFloatingButton];
 }
 
-// 布局完成时确保右下角悬浮按钮在最前且坐标精准
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    [self updateFloatingButtonPosition];
+    if (self.floatingSendBtn && self.floatingSendBtn.tag != 999) {
+        CGFloat btnW = 132.0;
+        CGFloat btnH = 50.0;
+        CGFloat x = self.view.bounds.size.width - btnW - 20.0;
+        CGFloat y = self.view.bounds.size.height - btnH - 36.0;
+        self.floatingSendBtn.frame = CGRectMake(x, y, btnW, btnH);
+    }
+    [self.view bringSubviewToFront:self.floatingSendBtn];
 }
 
 - (void)setupFloatingButton {
@@ -448,41 +521,25 @@
     self.floatingSendBtn.backgroundColor = [UIColor systemBlueColor];
     [self.floatingSendBtn setTitle:@"🚀 发送 (0)" forState:UIControlStateNormal];
     [self.floatingSendBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.floatingSendBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    self.floatingSendBtn.layer.cornerRadius = 24.0;
+    self.floatingSendBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    self.floatingSendBtn.layer.cornerRadius = 25.0;
 
-    // 强阴影效果，确保在任何底色上清晰可见
     self.floatingSendBtn.layer.shadowColor = [UIColor blackColor].CGColor;
     self.floatingSendBtn.layer.shadowOffset = CGSizeMake(0, 4);
-    self.floatingSendBtn.layer.shadowOpacity = 0.35;
-    self.floatingSendBtn.layer.shadowRadius = 6.0;
+    self.floatingSendBtn.layer.shadowOpacity = 0.3;
+    self.floatingSendBtn.layer.shadowRadius = 8.0;
 
     [self.floatingSendBtn addTarget:self action:@selector(startBatchSend) forControlEvents:UIControlEventTouchUpInside];
 
-    // 支持拖拽调整位置
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
     [self.floatingSendBtn addGestureRecognizer:pan];
 
     [self.view addSubview:self.floatingSendBtn];
-    [self.view bringSubviewToFront:self.floatingSendBtn];
-}
-
-- (void)updateFloatingButtonPosition {
-    CGFloat btnW = 120.0;
-    CGFloat btnH = 48.0;
-    CGFloat marginX = 20.0;
-    CGFloat marginY = 40.0; // 距底部可视区高度
-    CGFloat x = self.view.bounds.size.width - btnW - marginX;
-    CGFloat y = self.view.bounds.size.height - btnH - marginY;
-
-    if (self.floatingSendBtn) {
-        self.floatingSendBtn.frame = CGRectMake(x, y, btnW, btnH);
-        [self.view bringSubviewToFront:self.floatingSendBtn];
-    }
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     UIView *btn = pan.view;
+    btn.tag = 999; // 标记用户已手动拖拽位置
     CGPoint translation = [pan translationInView:self.view];
     btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
     [pan setTranslation:CGPointZero inView:self.view];
@@ -490,7 +547,7 @@
 
 - (void)refreshData {
     [self.view endEditing:YES];
-    self.statusLabel.text = @"正在同步账号好友与群聊数据...";
+    self.statusLabel.text = @"正在同步好友与群聊数据...";
     [[ACForwardHelperManager shared] reloadAllDataWithCompletion:^(NSString *statusMsg) {
         self.statusLabel.text = statusMsg;
         [self updateUI];
@@ -523,20 +580,14 @@
 
 - (void)updateUI {
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-    [self.tabControl setTitle:[NSString stringWithFormat:@"好友 (%lu)", (unsigned long)mgr.friendList.count] forSegmentAtIndex:0];
-    [self.tabControl setTitle:[NSString stringWithFormat:@"群聊 (%lu)", (unsigned long)mgr.groupList.count] forSegmentAtIndex:1];
+    [self.tabControl setTitle:[NSString stringWithFormat:@"好友列表 (%lu)", (unsigned long)mgr.friendList.count] forSegmentAtIndex:0];
+    [self.tabControl setTitle:[NSString stringWithFormat:@"群聊列表 (%lu)", (unsigned long)mgr.groupList.count] forSegmentAtIndex:1];
 
     NSInteger selCount = 0;
     for (ACContactItem *i in mgr.friendList) if (i.isSelected) selCount++;
     for (ACContactItem *i in mgr.groupList) if (i.isSelected) selCount++;
 
-    NSString *btnTitle = [NSString stringWithFormat:@"🚀 发送 (%ld)", (long)selCount];
-    [self.floatingSendBtn setTitle:btnTitle forState:UIControlStateNormal];
-
-    UIBarButtonItem *topSend = self.navigationItem.rightBarButtonItems.firstObject;
-    if (topSend) {
-        topSend.title = (selCount > 0) ? [NSString stringWithFormat:@"发送(%ld)", (long)selCount] : @"发送";
-    }
+    [self.floatingSendBtn setTitle:[NSString stringWithFormat:@"🚀 发送 (%ld)", (long)selCount] forState:UIControlStateNormal];
 }
 
 - (NSArray<ACContactItem *> *)currentItems {
@@ -552,9 +603,12 @@
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cid];
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
+        cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
+        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     }
     ACContactItem *item = [self currentItems][indexPath.row];
-    cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", item.isGroup ? @"👥" : @"👤", item.name];
+    cell.textLabel.text = [NSString stringWithFormat:@"%@  %@", item.isGroup ? @"👥" : @"👤", item.name];
     cell.detailTextLabel.text = [NSString stringWithFormat:@"ID: %@", item.targetId];
     cell.accessoryType = item.isSelected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
     return cell;
@@ -589,21 +643,30 @@
     self.floatingSendBtn.enabled = NO;
     __block NSInteger okCount = 0;
     __block NSInteger idx = 0;
+    __block NSString *lastErr = nil;
     NSInteger total = targets.count;
     __weak typeof(self) weakSelf = self;
 
     __block void (^nextStep)(void) = ^{
         if (idx >= total) {
             weakSelf.floatingSendBtn.enabled = YES;
-            weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 群发完毕！成功 %ld / 共 %ld", (long)okCount, (long)total];
+            if (okCount == 0 && lastErr) {
+                weakSelf.statusLabel.text = [NSString stringWithFormat:@"❌ 失败: %@", lastErr];
+            } else {
+                weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 发送完毕！成功 %ld / 共 %ld %@", (long)okCount, (long)total, lastErr ? [NSString stringWithFormat:@"(%@)", lastErr] : @""];
+            }
             return;
         }
         ACContactItem *cur = targets[idx];
         weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在发送 (%ld/%ld): %@", (long)(idx + 1), (long)total, cur.name];
-        [[ACForwardHelperManager shared] sendText:text toItem:cur completion:^(BOOL ok) {
-            if (ok) okCount++;
+        [[ACForwardHelperManager shared] sendText:text toItem:cur completion:^(BOOL ok, NSString *errInfo) {
+            if (ok) {
+                okCount++;
+            } else if (errInfo) {
+                lastErr = errInfo;
+            }
             idx++;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nextStep();
             });
         }];
