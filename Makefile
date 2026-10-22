@@ -1,3 +1,4 @@
+GO_EASY_ON_ME = 1
 ARCHS = arm64 arm64e
 TARGET = iphone:clang:latest:14.0
 INSTALL_TARGET_PROCESSES = SpringBoard
