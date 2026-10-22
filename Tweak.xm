@@ -267,18 +267,18 @@
         }
     }
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dispatch_group_notify(group, dispatch_get_main_queue(), ^{
             NSString *msg = [NSString stringWithFormat:@"已加载 %lu 位好友 | %lu 个群聊", (unsigned long)self.friendList.count, (unsigned long)self.groupList.count];
             if (self.friendList.count == 0 && self.groupList.count == 0) {
-                msg = @"提示：请先在 App 内点一下【联系人】或任意聊天加载过数据，即可秒读！";
+                msg = @"提示：请在 App 切换至【联系人】或会话加载后重试";
             }
             if (completion) completion(msg);
         });
     });
 }
 
-#pragma mark - 2. 腾讯云 IM 发送消息
+#pragma mark - 2. 腾讯云 IM 发送实现
 
 - (void)sendText:(NSString *)text toItem:(ACContactItem *)item completion:(void(^)(BOOL ok))completion {
     if (text.length == 0 || item.targetId.length == 0) {
@@ -345,14 +345,14 @@
 
 %end
 
-#pragma mark - 4. 转发助手弹窗控制器 (ACForwardAssistantVC)
+#pragma mark - 4. 转发助手视图控制器（右下角悬浮按钮 + 顶部导航双重绑定）
 
 @interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UITextView *contentTextView;
 @property (nonatomic, strong) UISegmentedControl *tabControl;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UIButton *sendButton;
+@property (nonatomic, strong) UIButton *floatingSendBtn;
 @end
 
 @implementation ACForwardAssistantVC
@@ -362,8 +362,14 @@
     self.title = @"转发助手";
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
 
+    // 左侧关闭
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(dismissSelf)];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"刷新列表" style:UIBarButtonItemStyleDone target:self action:@selector(refreshData)];
+
+    // 顶部右侧提供「发送」与「刷新」双按键保险
+    UIBarButtonItem *sendItem = [[UIBarButtonItem alloc] initWithTitle:@"发送" style:UIBarButtonItemStyleDone target:self action:@selector(startBatchSend)];
+    sendItem.tintColor = [UIColor systemBlueColor];
+    UIBarButtonItem *refreshItem = [[UIBarButtonItem alloc] initWithTitle:@"刷新" style:UIBarButtonItemStylePlain target:self action:@selector(refreshData)];
+    self.navigationItem.rightBarButtonItems = @[sendItem, refreshItem];
 
     [self setupUI];
     [self refreshData];
@@ -371,73 +377,115 @@
 
 - (void)setupUI {
     CGFloat width = self.view.bounds.size.width;
-    CGFloat height = self.view.bounds.size.height;
 
-    CGFloat bottomH = 110.0;
-    UIView *bottomBar = [[UIView alloc] initWithFrame:CGRectMake(0, height - bottomH, width, bottomH)];
-    bottomBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-    bottomBar.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
-
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, width - 24, 18)];
-    self.statusLabel.font = [UIFont systemFontOfSize:12];
-    self.statusLabel.textColor = [UIColor secondaryLabelColor];
-    self.statusLabel.textAlignment = NSTextAlignmentCenter;
-    self.statusLabel.text = @"正在读取好友与群聊...";
-    [bottomBar addSubview:self.statusLabel];
-
-    self.sendButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.sendButton.frame = CGRectMake(16, 34, width - 32, 50);
-    self.sendButton.backgroundColor = [UIColor systemBlueColor];
-    [self.sendButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.sendButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    self.sendButton.layer.cornerRadius = 10;
-    [self.sendButton setTitle:@"🚀 一键转发 / 群发 (已选 0)" forState:UIControlStateNormal];
-    [self.sendButton addTarget:self action:@selector(startBatchSend) forControlEvents:UIControlEventTouchUpInside];
-    [bottomBar addSubview:self.sendButton];
-    [self.view addSubview:bottomBar];
-
-    CGFloat tableTop = 270.0;
-    CGFloat tableH = height - tableTop - bottomH;
-    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, tableTop, width, tableH) style:UITableViewStylePlain];
-    self.tableView.delegate = self;
-    self.tableView.dataSource = self;
-    self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.view addSubview:self.tableView];
-
-    UILabel *tipLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 64, width - 32, 20)];
-    tipLabel.text = @"📝 编辑群发/转发内容：";
+    // 1. 顶部编辑区
+    UILabel *tipLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, width - 32, 20)];
+    tipLabel.text = @"📝 编辑转发/群发内容：";
     tipLabel.font = [UIFont boldSystemFontOfSize:14];
     [self.view addSubview:tipLabel];
 
-    self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 88, width - 32, 85)];
-    self.contentTextView.font = [UIFont systemFontOfSize:15];
+    self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 36, width - 32, 75)];
+    self.contentTextView.font = [UIFont systemFontOfSize:14];
     self.contentTextView.layer.cornerRadius = 8;
     self.contentTextView.layer.borderColor = [UIColor separatorColor].CGColor;
     self.contentTextView.layer.borderWidth = 1.0;
     self.contentTextView.text = @"您好，这是一条群发消息！";
     [self.view addSubview:self.contentTextView];
 
-    UIView *actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 181, width - 32, 32)];
+    // 2. 快捷全选栏
+    UIView *actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 118, width - 32, 30)];
     NSArray *btnTitles = @[@"全选好友", @"全选群聊", @"全选所有", @"取消全选"];
     CGFloat btnW = (width - 32 - 18) / 4.0;
     for (int i = 0; i < 4; i++) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(i * (btnW + 6), 0, btnW, 30);
+        btn.frame = CGRectMake(i * (btnW + 6), 0, btnW, 28);
         [btn setTitle:btnTitles[i] forState:UIControlStateNormal];
         btn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
         btn.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-        btn.layer.cornerRadius = 6;
-        btn.tag = 400 + i;
+        btn.layer.cornerRadius = 5;
+        btn.tag = 500 + i;
         [btn addTarget:self action:@selector(quickSelectAction:) forControlEvents:UIControlEventTouchUpInside];
         [actionBar addSubview:btn];
     }
     [self.view addSubview:actionBar];
 
+    // 3. 标签切换器
     self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友 (0)", @"群聊 (0)"]];
-    self.tabControl.frame = CGRectMake(16, 225, width - 32, 32);
+    self.tabControl.frame = CGRectMake(16, 154, width - 32, 30);
     self.tabControl.selectedSegmentIndex = 0;
     [self.tabControl addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.tabControl];
+
+    // 4. 状态提示条
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 188, width - 32, 16)];
+    self.statusLabel.font = [UIFont systemFontOfSize:11];
+    self.statusLabel.textColor = [UIColor secondaryLabelColor];
+    self.statusLabel.textAlignment = NSTextAlignmentCenter;
+    self.statusLabel.text = @"正在读取数据...";
+    [self.view addSubview:self.statusLabel];
+
+    // 5. 列表（占满剩余空间）
+    CGFloat tableTop = 208.0;
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, tableTop, width, self.view.bounds.size.height - tableTop) style:UITableViewStylePlain];
+    self.tableView.delegate = self;
+    self.tableView.dataSource = self;
+    self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.tableView.contentInset = UIEdgeInsetsMake(0, 0, 90, 0); // 留出底部边距，防止被右下角按钮挡住最后几项
+    [self.view addSubview:self.tableView];
+
+    // 6. 右下角强力固定悬浮按键
+    [self setupFloatingButton];
+}
+
+// 布局完成时确保右下角悬浮按钮在最前且坐标精准
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    [self updateFloatingButtonPosition];
+}
+
+- (void)setupFloatingButton {
+    self.floatingSendBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.floatingSendBtn.backgroundColor = [UIColor systemBlueColor];
+    [self.floatingSendBtn setTitle:@"🚀 发送 (0)" forState:UIControlStateNormal];
+    [self.floatingSendBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.floatingSendBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    self.floatingSendBtn.layer.cornerRadius = 24.0;
+
+    // 强阴影效果，确保在任何底色上清晰可见
+    self.floatingSendBtn.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.floatingSendBtn.layer.shadowOffset = CGSizeMake(0, 4);
+    self.floatingSendBtn.layer.shadowOpacity = 0.35;
+    self.floatingSendBtn.layer.shadowRadius = 6.0;
+
+    [self.floatingSendBtn addTarget:self action:@selector(startBatchSend) forControlEvents:UIControlEventTouchUpInside];
+
+    // 支持拖拽调整位置
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [self.floatingSendBtn addGestureRecognizer:pan];
+
+    [self.view addSubview:self.floatingSendBtn];
+    [self.view bringSubviewToFront:self.floatingSendBtn];
+}
+
+- (void)updateFloatingButtonPosition {
+    CGFloat btnW = 120.0;
+    CGFloat btnH = 48.0;
+    CGFloat marginX = 20.0;
+    CGFloat marginY = 40.0; // 距底部可视区高度
+    CGFloat x = self.view.bounds.size.width - btnW - marginX;
+    CGFloat y = self.view.bounds.size.height - btnH - marginY;
+
+    if (self.floatingSendBtn) {
+        self.floatingSendBtn.frame = CGRectMake(x, y, btnW, btnH);
+        [self.view bringSubviewToFront:self.floatingSendBtn];
+    }
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    UIView *btn = pan.view;
+    CGPoint translation = [pan translationInView:self.view];
+    btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
+    [pan setTranslation:CGPointZero inView:self.view];
 }
 
 - (void)refreshData {
@@ -453,14 +501,14 @@
 - (void)quickSelectAction:(UIButton *)sender {
     [self.view endEditing:YES];
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-    if (sender.tag == 400) {
+    if (sender.tag == 500) {
         for (ACContactItem *i in mgr.friendList) i.isSelected = YES;
-    } else if (sender.tag == 401) {
+    } else if (sender.tag == 501) {
         for (ACContactItem *i in mgr.groupList) i.isSelected = YES;
-    } else if (sender.tag == 402) {
+    } else if (sender.tag == 502) {
         for (ACContactItem *i in mgr.friendList) i.isSelected = YES;
         for (ACContactItem *i in mgr.groupList) i.isSelected = YES;
-    } else if (sender.tag == 403) {
+    } else if (sender.tag == 503) {
         for (ACContactItem *i in mgr.friendList) i.isSelected = NO;
         for (ACContactItem *i in mgr.groupList) i.isSelected = NO;
     }
@@ -481,7 +529,14 @@
     NSInteger selCount = 0;
     for (ACContactItem *i in mgr.friendList) if (i.isSelected) selCount++;
     for (ACContactItem *i in mgr.groupList) if (i.isSelected) selCount++;
-    [self.sendButton setTitle:[NSString stringWithFormat:@"🚀 一键转发 / 群发 (已选 %ld)", (long)selCount] forState:UIControlStateNormal];
+
+    NSString *btnTitle = [NSString stringWithFormat:@"🚀 发送 (%ld)", (long)selCount];
+    [self.floatingSendBtn setTitle:btnTitle forState:UIControlStateNormal];
+
+    UIBarButtonItem *topSend = self.navigationItem.rightBarButtonItems.firstObject;
+    if (topSend) {
+        topSend.title = (selCount > 0) ? [NSString stringWithFormat:@"发送(%ld)", (long)selCount] : @"发送";
+    }
 }
 
 - (NSArray<ACContactItem *> *)currentItems {
@@ -531,7 +586,7 @@
         return;
     }
 
-    self.sendButton.enabled = NO;
+    self.floatingSendBtn.enabled = NO;
     __block NSInteger okCount = 0;
     __block NSInteger idx = 0;
     NSInteger total = targets.count;
@@ -539,7 +594,7 @@
 
     __block void (^nextStep)(void) = ^{
         if (idx >= total) {
-            weakSelf.sendButton.enabled = YES;
+            weakSelf.floatingSendBtn.enabled = YES;
             weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 群发完毕！成功 %ld / 共 %ld", (long)okCount, (long)total];
             return;
         }
