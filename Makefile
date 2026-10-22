@@ -6,6 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = fj
 fj_FILES = Tweak.xm
+fj_CFLAGS = -fobjc-arc
 fj_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore
 fj_LDFLAGS = -undefined dynamic_lookup
 
