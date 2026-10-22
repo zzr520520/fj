@@ -20,9 +20,13 @@ typedef NS_ENUM(NSInteger, ACContactSourceType) {
 @property (nonatomic, assign) ACContactSourceType sourceType;
 @property (nonatomic, assign) BOOL chatAllowed;
 @property (nonatomic, assign) BOOL isSelected;
+@property (nonatomic, readonly) BOOL isGroup; // 是否群聊（sourceType == ACContactSourceGroupChat）
 @end
 
 @implementation ACContactItem
+- (BOOL)isGroup {
+    return self.sourceType == ACContactSourceGroupChat;
+}
 @end
 
 @interface ACForwardHelperManager : NSObject
