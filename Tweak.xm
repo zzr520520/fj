@@ -4,7 +4,7 @@
 #import <objc/message.h>
 #import <sqlite3.h>
 
-#pragma mark - 1. 数据模型（支持 NSCoding 永久本地序列化）
+#pragma mark - 1. 数据模型与永久本地缓存
 
 @interface ACContactItem : NSObject <NSCoding>
 @property (nonatomic, copy) NSString *targetId;
@@ -12,7 +12,8 @@
 @property (nonatomic, copy) NSString *fromGroupId;
 @property (nonatomic, copy) NSString *roleDesc;
 @property (nonatomic, assign) NSInteger sourceType; // 0: 好友, 1: 群成员, 2: 群聊
-@property (nonatomic, assign) NSInteger chatMeType; // 0: 允许任何人私聊(100%必达), 1: 仅双向好友可私聊
+@property (nonatomic, assign) NSInteger chatMeType; // 0: 开放私聊, 1: 仅双向好友
+@property (nonatomic, assign) BOOL isGroupBanned;   // 该群是否被禁言
 @property (nonatomic, assign) BOOL isSelected;
 @end
 
@@ -25,6 +26,7 @@
     [coder encodeObject:self.roleDesc ?: @"" forKey:@"roleDesc"];
     [coder encodeInteger:self.sourceType forKey:@"sourceType"];
     [coder encodeInteger:self.chatMeType forKey:@"chatMeType"];
+    [coder encodeBool:self.isGroupBanned forKey:@"isGroupBanned"];
 }
 
 - (instancetype)initWithCoder:(NSCoder *)coder {
@@ -36,6 +38,7 @@
         self.roleDesc = [coder decodeObjectForKey:@"roleDesc"];
         self.sourceType = [coder decodeIntegerForKey:@"sourceType"];
         self.chatMeType = [coder decodeIntegerForKey:@"chatMeType"];
+        self.isGroupBanned = [coder decodeBoolForKey:@"isGroupBanned"];
         self.isSelected = NO;
     }
     return self;
@@ -46,9 +49,9 @@
 static __weak UIView *__lastLongPressedView = nil;
 static NSString *__pendingForwardText = nil;
 static UIImage *__pendingForwardImage = nil;
-static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方 userId
+static NSString *__currentChatPeerId = nil;
 
-#pragma mark - 2. 核心管理器
+#pragma mark - 2. 核心管理器（防封混淆 + 禁言群智能过滤 + 破盾发送）
 
 @interface ACForwardHelperManager : NSObject
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *friendList;
@@ -58,13 +61,14 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *friendMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMemberMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMap;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupBanStatusMap; // 群禁言状态缓存
 
 @property (nonatomic, copy) NSString *selfUserId;
 @property (nonatomic, copy) NSString *capturedClientTypeV2;
 @property (nonatomic, strong) NSData *capturedCloudCustomData;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *latestHTTPHeaders;
 
-// --- 新人进群自动打招呼配置 ---
+// --- 迎新配置 ---
 @property (nonatomic, assign) BOOL autoWelcomeEnabled;
 @property (nonatomic, copy) NSString *welcomeMessageText;
 @property (nonatomic, strong) NSMutableSet<NSString *> *welcomeGroupIds;
@@ -100,6 +104,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
         instance.friendMap = [NSMutableDictionary dictionary];
         instance.groupMemberMap = [NSMutableDictionary dictionary];
         instance.groupMap = [NSMutableDictionary dictionary];
+        instance.groupBanStatusMap = [NSMutableDictionary dictionary];
         instance.latestHTTPHeaders = [NSMutableDictionary dictionary];
         instance.selfUserId = @"1958179249315647489";
         instance.capturedClientTypeV2 = @"79b3h7aOxJurSbzVhPK2Wal1cKQzfppVutid7[d]gEtuxYU87uiCm3l2gMp7d5Eo3KZS3hFxBn8Db[d]yag55Ev1I3W[a]7xF6oF0FSXM[s]";
@@ -328,7 +333,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     });
 }
 
-#pragma mark - 2.2 联系人与群成员管理（严格标记 chatMeType: 0=开放私聊, 1=锁死仅双向好友）
+#pragma mark - 2.2 联系人与群成员管理
 
 - (void)addFriendWithId:(NSString *)uid name:(NSString *)name tag:(NSString *)tag chatMeType:(NSInteger)chatMeType {
     if (!uid) return;
@@ -406,7 +411,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     }
 }
 
-- (void)addGroupWithId:(NSString *)gid name:(NSString *)name {
+- (void)addGroupWithId:(NSString *)gid name:(NSString *)name ban:(BOOL)ban {
     if (!gid) return;
     NSString *cleanId = [[NSString stringWithFormat:@"%@", gid] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (cleanId.length < 3 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"0"]) return;
@@ -415,6 +420,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     NSString *cleanName = (name && ![name isKindOfClass:[NSNull class]]) ? [NSString stringWithFormat:@"%@", name] : @"";
 
     @synchronized (self) {
+        self.groupBanStatusMap[cleanId] = @(ban);
         ACContactItem *existing = self.groupMap[cleanId];
         if (existing) {
             if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId] && [existing.name hasPrefix:@"群聊"]) {
@@ -427,7 +433,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
         item.targetId = cleanId;
         item.name = cleanName.length > 0 ? cleanName : [NSString stringWithFormat:@"群聊 (%@)", cleanId];
         item.sourceType = 2;
-        item.roleDesc = @"群组";
+        item.roleDesc = ban ? @"🔒 [禁言群]" : @"🟢 [开放群]";
         item.chatMeType = 0;
         item.isSelected = NO;
 
@@ -442,7 +448,6 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
         NSDictionary *dict = (NSDictionary *)jsonObj;
         if (dict[@"appUserExperienceList"] || dict[@"realityValue"]) return;
 
-        // 1. 提取当前单聊会话对象 ID (来自 /client/v2/userInfo/op 的 "objectId": "会话：2112712625367343105")
         if ([dict[@"objectId"] isKindOfClass:[NSString class]]) {
             NSString *objStr = dict[@"objectId"];
             if ([objStr hasPrefix:@"会话："]) {
@@ -450,28 +455,22 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
             }
         }
 
-        // 2. 提取 getUserInfo / getUserInfoV2 详情里的精确 chatMeType 状态
         if (dict[@"clientUserNickName"] && dict[@"id"] && dict[@"chatMeType"] && ![dict[@"chatMeType"] isKindOfClass:[NSNull class]]) {
             NSString *uid = [NSString stringWithFormat:@"%@", dict[@"id"]];
             NSString *nick = [NSString stringWithFormat:@"%@", dict[@"clientUserNickName"]];
             NSInteger cmType = [[NSString stringWithFormat:@"%@", dict[@"chatMeType"]] integerValue];
-            [self addFriendWithId:uid name:nick tag:(cmType == 0 ? @"开放私聊(必达)" : @"限制非好友(chatMe=1)") chatMeType:cmType];
+            [self addFriendWithId:uid name:nick tag:(cmType == 0 ? @"开放私聊" : @"受限(chatMe=1)") chatMeType:cmType];
             if (self.groupMemberMap[uid]) {
                 self.groupMemberMap[uid].chatMeType = cmType;
                 self.groupMemberMap[uid].name = nick;
             }
         }
 
-        if ([dict[@"cloudCustomData"] isKindOfClass:[NSDictionary class]]) {
-            NSString *v2Token = dict[@"cloudCustomData"][@"client_typeV2"];
-            if (v2Token && [v2Token isKindOfClass:[NSString class]] && v2Token.length > 10) {
-                self.capturedClientTypeV2 = v2Token;
-            }
-        }
-
+        // 提取群详情中的 ban 状态 (来自抓包: "ban": "true" 或 "false")
         NSString *directId = [NSString stringWithFormat:@"%@", dict[@"id"] ?: @""];
         if ([directId hasPrefix:@"@TGS#"] && dict[@"name"]) {
-            [self addGroupWithId:directId name:[NSString stringWithFormat:@"%@", dict[@"name"]]];
+            BOOL isBan = [[NSString stringWithFormat:@"%@", dict[@"ban"] ?: @"false"] isEqualToString:@"true"];
+            [self addGroupWithId:directId name:[NSString stringWithFormat:@"%@", dict[@"name"]] ban:isBan];
             if (dict[@"owner"]) {
                 [self addGroupMemberWithId:[NSString stringWithFormat:@"%@", dict[@"owner"]] name:@"群主" groupId:directId role:@"群主" chatMeType:0];
             }
@@ -479,7 +478,8 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
 
         NSString *groupId = [NSString stringWithFormat:@"%@", dict[@"groupId"] ?: @""];
         if ([groupId hasPrefix:@"@TGS#"]) {
-            [self addGroupWithId:groupId name:dict[@"groupName"]];
+            BOOL isBan = [[NSString stringWithFormat:@"%@", dict[@"ban"] ?: @"false"] isEqualToString:@"true"];
+            [self addGroupWithId:groupId name:dict[@"groupName"] ban:isBan];
             if (dict[@"userId"] && [dict[@"userInfo"] isKindOfClass:[NSDictionary class]]) {
                 NSDictionary *uInfo = dict[@"userInfo"];
                 NSInteger cmType = [[NSString stringWithFormat:@"%@", uInfo[@"chatMeType"] ?: @"0"] integerValue];
@@ -500,31 +500,6 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
             }
         }
 
-        id friendId = dict[@"friendId"];
-        if (friendId && ![friendId isKindOfClass:[NSNull class]]) {
-            NSString *remark = dict[@"remark"];
-            NSString *nick = dict[@"nickname"] ?: dict[@"appUserInfo"][@"clientUserNickName"];
-            BOOL isMutual = [[NSString stringWithFormat:@"%@", dict[@"mutual"] ?: @"false"] isEqualToString:@"true"];
-            NSDictionary *appU = [dict[@"appUserInfo"] isKindOfClass:[NSDictionary class]] ? dict[@"appUserInfo"] : nil;
-            NSInteger cmType = 0;
-            if (!isMutual && appU && appU[@"chatMeType"] && ![appU[@"chatMeType"] isKindOfClass:[NSNull class]]) {
-                cmType = [[NSString stringWithFormat:@"%@", appU[@"chatMeType"]] integerValue];
-            }
-            NSString *finalName = (remark && ![remark isKindOfClass:[NSNull class]] && [remark description].length > 0) ? [NSString stringWithFormat:@"%@ (%@)", remark, nick ?: @""] : nick;
-            [self addFriendWithId:[NSString stringWithFormat:@"%@", friendId]
-                             name:finalName
-                              tag:(isMutual ? @"双向好友(必达)" : @"单向好友")
-                       chatMeType:cmType];
-        }
-
-        if (dict[@"contentText"] && [dict[@"userInfo"] isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *uInfo = dict[@"userInfo"];
-            NSString *uid = [NSString stringWithFormat:@"%@", uInfo[@"id"] ?: dict[@"userId"]];
-            NSString *nick = uInfo[@"clientUserNickName"];
-            NSInteger cmType = [[NSString stringWithFormat:@"%@", uInfo[@"chatMeType"] ?: @"0"] integerValue];
-            [self addFriendWithId:uid name:nick tag:(cmType == 0 ? @"开放私聊(必达)" : @"限制非好友(chatMe=1)") chatMeType:cmType];
-        }
-
         for (id key in dict) {
             id val = dict[key];
             if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
@@ -538,7 +513,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     }
 }
 
-#pragma mark - 2.3 针对万人大群的 nextSeq 无限游标翻页引擎
+#pragma mark - 2.3 群成员无限游标翻页
 
 - (void)crawlGroupMembersPageForGroup:(NSString *)gid
                               nextSeq:(uint64_t)seq
@@ -573,31 +548,23 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (progressBlock) {
-                progressBlock([NSString stringWithFormat:@"⏳ 正在深度拉取群成员(第%ld页)：累计已获 %lu 人...",
+                progressBlock([NSString stringWithFormat:@"⏳ 深度拉取群成员(第%ld页)：已获 %lu 人...",
                                (long)(pageIdx + 1), (unsigned long)weakSelf.groupMemberList.count]);
             }
         });
 
-        if (pageIdx % 5 == 0) {
-            [weakSelf saveLocalPermanentCache];
-        }
+        if (pageIdx % 5 == 0) [weakSelf saveLocalPermanentCache];
 
         if (nextSeq != 0 && nextSeq != seq && memberList.count > 0 && pageIdx < 800) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [weakSelf crawlGroupMembersPageForGroup:gid
-                                                nextSeq:nextSeq
-                                              pageIndex:pageIdx + 1
-                                               progress:progressBlock
-                                             completion:completion];
+                [weakSelf crawlGroupMembersPageForGroup:gid nextSeq:nextSeq pageIndex:pageIdx + 1 progress:progressBlock completion:completion];
             });
         } else {
-            if (completion) dispatch_async(dispatch_get_main_queue(), completion);
+            if (completion) completion();
         }
     };
 
-    void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) {
-        if (completion) dispatch_async(dispatch_get_main_queue(), completion);
-    };
+    void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) { if (completion) completion(); };
 
     NSMethodSignature *sig = [mgr methodSignatureForSelector:getMemSel];
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
@@ -632,19 +599,11 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     __weak typeof(self) weakSelf = self;
     void (^succBlock)(NSArray *) = ^(NSArray *msgs) {
         if (![msgs isKindOfClass:[NSArray class]] || msgs.count == 0) {
-            if (completion) dispatch_async(dispatch_get_main_queue(), completion);
+            if (completion) completion();
             return;
         }
         for (id msg in msgs) {
             @try {
-                NSData *cData = [msg valueForKey:@"cloudCustomData"];
-                if ([cData isKindOfClass:[NSData class]] && cData.length > 10) {
-                    NSDictionary *cDict = [NSJSONSerialization JSONObjectWithData:cData options:0 error:nil];
-                    if ([cDict isKindOfClass:[NSDictionary class]] && cDict[@"client_typeV2"]) {
-                        weakSelf.capturedClientTypeV2 = cDict[@"client_typeV2"];
-                        weakSelf.capturedCloudCustomData = cData;
-                    }
-                }
                 NSString *sender = [msg valueForKey:@"sender"];
                 NSString *nick = [msg valueForKey:@"nickName"] ?: [msg valueForKey:@"nameCard"];
                 [weakSelf addGroupMemberWithId:sender name:nick groupId:gid role:@"群发言" chatMeType:0];
@@ -656,13 +615,10 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
                 [weakSelf crawlGroupHistoryMessages:gid lastMsg:oldestMsg pageIndex:pageIdx + 1 completion:completion];
             });
         } else {
-            if (completion) dispatch_async(dispatch_get_main_queue(), completion);
+            if (completion) completion();
         }
     };
-
-    void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) {
-        if (completion) dispatch_async(dispatch_get_main_queue(), completion);
-    };
+    void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) { if (completion) completion(); };
 
     NSMethodSignature *sig = [mgr methodSignatureForSelector:getHistSel];
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
@@ -733,44 +689,12 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     Class v2Cls = NSClassFromString(@"V2TIMManager");
     if (!v2Cls || ![v2Cls respondsToSelector:@selector(sharedInstance)]) {
         [self saveLocalPermanentCache];
-        if (completion) completion(@"IM未就绪，已显示本地永久缓存");
+        if (completion) completion(@"IM未就绪，已加载本地永久缓存");
         return;
     }
 
     id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
     dispatch_group_t baseGroup = dispatch_group_create();
-
-    SEL getConvSel = NSSelectorFromString(@"getConversationList:count:succ:fail:");
-    if ([mgr respondsToSelector:getConvSel]) {
-        dispatch_group_enter(baseGroup);
-        void (^succBlock)(NSArray *, uint64_t, BOOL) = ^(NSArray *list, uint64_t nextSeq, BOOL isFinished) {
-            for (id conv in list) {
-                @try {
-                    NSString *showName = [conv valueForKey:@"showName"];
-                    NSString *uid = [conv valueForKey:@"userID"];
-                    NSString *gid = [conv valueForKey:@"groupID"];
-                    if (gid && [gid isKindOfClass:[NSString class]] && gid.length > 0) {
-                        [self addGroupWithId:gid name:showName];
-                    } else if (uid && [uid isKindOfClass:[NSString class]] && uid.length > 0) {
-                        [self addFriendWithId:uid name:showName tag:@"已有会话" chatMeType:0];
-                    }
-                } @catch (NSException *e) {}
-            }
-            dispatch_group_leave(baseGroup);
-        };
-        void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) { dispatch_group_leave(baseGroup); };
-        NSMethodSignature *sig = [mgr methodSignatureForSelector:getConvSel];
-        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-        [inv setTarget:mgr];
-        [inv setSelector:getConvSel];
-        uint64_t nextSeq = 0;
-        int count = 500;
-        [inv setArgument:&nextSeq atIndex:2];
-        [inv setArgument:&count atIndex:3];
-        [inv setArgument:&succBlock atIndex:4];
-        [inv setArgument:&failBlock atIndex:5];
-        [inv invoke];
-    }
 
     SEL getGroupsSel = NSSelectorFromString(@"getJoinedGroupList:fail:");
     if ([mgr respondsToSelector:getGroupsSel]) {
@@ -780,7 +704,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
                 @try {
                     NSString *gid = [gInfo valueForKey:@"groupID"];
                     NSString *gName = [gInfo valueForKey:@"groupName"];
-                    [self addGroupWithId:gid name:gName];
+                    [self addGroupWithId:gid name:gName ban:NO];
                 } @catch (NSException *e) {}
             }
             dispatch_group_leave(baseGroup);
@@ -828,18 +752,26 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     });
 }
 
-#pragma mark - 3. 终极破盾发送引擎（AirChat 原生 /userfriends/add + /useronechat/add + 群@TA兜底）
+#pragma mark - 3. 防封号文本动态混淆包装 (真人化处理)
 
-// 调用 AirChat 后端的真实加好友接口 (/client/biz/userfriends/add) 与单聊登记接口 (/client/biz/useronechat/add)
+- (NSString *)obfuscateMessageText:(NSString *)originalText {
+    if (!originalText || originalText.length == 0) return originalText;
+    // 随机追加无害的日常符号尾缀，防止每条消息 MD5 完全相同触发关键词封号
+    NSArray *tails = @[@"~", @" ✨", @" 👍", @" (咨询)", @" 😊", @" 收到~", @" 💡"];
+    NSString *randomTail = tails[arc4random_uniform((uint32_t)tails.count)];
+    return [originalText stringByAppendingString:randomTail];
+}
+
+#pragma mark - 4. 破盾发送引擎（后端接口破盾 + 智能禁言群过滤 @TA）
+
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
     if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
         if (completion) completion();
         return;
     }
-
     dispatch_group_t apiGroup = dispatch_group_create();
 
-    // 1. POST /client/biz/userfriends/add  {"friendId": targetUserId} (来自你最新抓包 17:52:55)
+    // 1. POST /client/biz/userfriends/add
     dispatch_group_enter(apiGroup);
     NSMutableURLRequest *req1 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/userfriends/add"]];
     req1.HTTPMethod = @"POST";
@@ -847,13 +779,12 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
         [req1 setValue:v forHTTPHeaderField:k];
     }];
     [req1 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    NSDictionary *body1 = @{@"friendId": targetUserId};
-    req1.HTTPBody = [NSJSONSerialization dataWithJSONObject:body1 options:0 error:nil];
+    req1.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"friendId": targetUserId} options:0 error:nil];
     [[[NSURLSession sharedSession] dataTaskWithRequest:req1 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
         dispatch_group_leave(apiGroup);
     }] resume];
 
-    // 2. POST /client/biz/useronechat/add  {"chatWithHimId": targetUserId, "userId": selfUserId}
+    // 2. POST /client/biz/useronechat/add
     dispatch_group_enter(apiGroup);
     NSMutableURLRequest *req2 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/useronechat/add"]];
     req2.HTTPMethod = @"POST";
@@ -861,22 +792,8 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
         [req2 setValue:v forHTTPHeaderField:k];
     }];
     [req2 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    NSDictionary *body2 = @{@"chatWithHimId": targetUserId, @"id": targetUserId, @"userId": self.selfUserId};
-    req2.HTTPBody = [NSJSONSerialization dataWithJSONObject:body2 options:0 error:nil];
+    req2.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"chatWithHimId": targetUserId, @"id": targetUserId, @"userId": self.selfUserId} options:0 error:nil];
     [[[NSURLSession sharedSession] dataTaskWithRequest:req2 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        dispatch_group_leave(apiGroup);
-    }] resume];
-
-    // 3. POST /client/biz/chat/checkChatType {"id": targetUserId}
-    dispatch_group_enter(apiGroup);
-    NSMutableURLRequest *req3 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/chat/checkChatType"]];
-    req3.HTTPMethod = @"POST";
-    [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
-        [req3 setValue:v forHTTPHeaderField:k];
-    }];
-    [req3 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    req3.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"id": targetUserId} options:0 error:nil];
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req3 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
         dispatch_group_leave(apiGroup);
     }] resume];
 
@@ -931,7 +848,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     SEL sendMsgSel = NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:");
 
     if (!v2Msg || ![manager respondsToSelector:sendMsgSel]) {
-        if (completion) completion(NO, -1, @"无法构造IM消息");
+        if (completion) completion(NO, -1, @"构造消息失败");
         return;
     }
 
@@ -978,20 +895,26 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     [inv invoke];
 }
 
-// 群内 @TA 强提醒送达（绕过个人 chatMeType==1 隐私锁）
+// 智能禁言群过滤：只在开放（未禁言）的群内进行 @TA 强提醒兜底
 - (void)fallbackSendGroupAtMessage:(NSString *)text forMember:(ACContactItem *)item completion:(void(^)(BOOL ok, NSString *detail))completion {
     NSString *gid = item.fromGroupId;
-    if (!gid || gid.length == 0 || [gid isEqualToString:@"@TGS#_7374342892571"] || [gid isEqualToString:@"@TGS#_4213428102302"]) {
-        // 优先选用未禁言的业务群（如 @TGS#_1583750000876）进行 @ 强提醒
+    
+    // 检查指定群是否被禁言
+    BOOL isBanned = [self.groupBanStatusMap[gid] boolValue];
+    if (isBanned || !gid || gid.length == 0) {
+        // 如果原群被禁言，自动寻找一个【未全员禁言】的开放群进行 @
+        gid = nil;
         for (ACContactItem *g in self.groupList) {
-            if ([g.targetId isEqualToString:@"@TGS#_1583750000876"]) {
+            BOOL banned = [self.groupBanStatusMap[g.targetId] boolValue];
+            if (!banned && [g.targetId hasPrefix:@"@TGS#"]) {
                 gid = g.targetId;
                 break;
             }
         }
     }
+
     if (!gid || gid.length == 0) {
-        if (completion) completion(NO, @"对方已设[仅双向好友私聊]，已自动向他发起好友添加！");
+        if (completion) completion(NO, @"(120001)对方拒收且无开放群可@");
         return;
     }
 
@@ -1009,14 +932,14 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
 
         [self rawSendV2Message:atMsg toItem:grpTarget completion:^(BOOL ok, int code, NSString *desc) {
             if (ok) {
-                if (completion) completion(YES, @"已加好友并通过群内@TA强提醒送达");
+                if (completion) completion(YES, @"已在开放群中@TA提醒");
             } else {
-                if (completion) completion(NO, @"已自动向对方发送好友添加请求(待回加)");
+                if (completion) completion(NO, @"(120001)私信受限且群内发送失败");
             }
         }];
         return;
     }
-    if (completion) completion(NO, @"已自动向对方发起好友申请");
+    if (completion) completion(NO, @"(120001)私信受限");
 }
 
 - (void)sendMessageWithText:(NSString *)text
@@ -1043,25 +966,25 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
         }
     }
 
+    // 核心：对发送的文本应用防封号混淆包装
+    NSString *obfuscatedText = [self obfuscateMessageText:text];
     id v2TextMsg = nil;
-    NSString *cleanText = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (cleanText.length > 0) {
+    if (obfuscatedText.length > 0) {
         SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
         if ([manager respondsToSelector:createTextSel]) {
-            v2TextMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, cleanText);
+            v2TextMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, obfuscatedText);
         }
     }
 
     id primaryMsg = v2ImageMsg ?: v2TextMsg;
     if (!primaryMsg) {
-        if (completion) completion(NO, @"消息内容为空");
+        if (completion) completion(NO, @"内容为空");
         return;
     }
 
-    // 第一步：直接携带合法的 client_typeV2 发送
     [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok, int code, NSString *desc) {
         if (ok) {
-            item.chatMeType = 0; // 发送成功说明对方开放私聊
+            item.chatMeType = 0;
             if (v2ImageMsg && v2TextMsg) {
                 [self rawSendV2Message:v2TextMsg toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
                     if (completion) completion(YES, @"图文送达");
@@ -1072,22 +995,18 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
             return;
         }
 
-        // 第二步：如果返回 120001（对方开启了 chatMeType=1 仅双向好友可私聊），立刻执行四维破盾：
-        // 1. 调 AirChat 后端的 /client/biz/userfriends/add + /useronechat/add
-        // 2. 调腾讯 IM 的 simulateIncomingMessageFrom 伪造对方发信激活本地会话
-        // 3. 调腾讯 IM 的 addFriend 双向加好友
-        // 4. 再次重发，若服务端依然死锁 120001，则自动通过群内 @TA 强提醒送达！
         if (item.sourceType != 2) {
-            item.chatMeType = 1; // 标记该用户开启了 chatMeType=1 限制
+            item.chatMeType = 1;
             [self callAirChatBackendAddFriendAndUnlock:item.targetId completion:^{
                 [self simulateIncomingMessageFrom:item.targetId completion:^{
                     [self autoAddIMFriend:item.targetId completion:^{
                         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                             [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
                                 if (ok2) {
-                                    if (completion) completion(YES, @"破盾重发成功");
+                                    if (completion) completion(YES, @"破盾成功");
                                 } else {
-                                    [self fallbackSendGroupAtMessage:(cleanText.length > 0 ? cleanText : @"你好，认识一下")
+                                    // 自动检查是否为禁言群，如果是禁言群则放弃 @，只走加好友申请
+                                    [self fallbackSendGroupAtMessage:(obfuscatedText.length > 0 ? obfuscatedText : @"你好")
                                                            forMember:item
                                                           completion:completion];
                                 }
@@ -1097,7 +1016,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
                 }];
             }];
         } else {
-            if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"该群已全员禁言"]);
+            if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"群禁言"]);
         }
     }];
 }
@@ -1135,9 +1054,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(dismissSelf)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"全量刷新" style:UIBarButtonItemStyleDone target:self action:@selector(refreshData)];
 
-    if (__pendingForwardImage) {
-        self.selectedImage = __pendingForwardImage;
-    }
+    if (__pendingForwardImage) self.selectedImage = __pendingForwardImage;
 
     [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onWelcomeStatusUpdate) name:@"ACWelcomeStatusUpdated" object:nil];
@@ -1430,7 +1347,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
 - (void)quickSelectAction:(UIButton *)sender {
     [self.view endEditing:YES];
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-    if (sender.tag == 600) { // 🟢只选必达 (只选 chatMeType == 0 的开放私聊用户，100% 不报 120001)
+    if (sender.tag == 600) {
         for (ACContactItem *i in [self currentItems]) {
             i.isSelected = (i.chatMeType == 0);
         }
@@ -1514,11 +1431,12 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
 
     NSString *badge = @"";
     if (item.sourceType == 2) {
-        badge = @"👥 [群聊]";
+        BOOL banned = [ACForwardHelperManager shared].groupBanStatusMap[item.targetId].boolValue;
+        badge = banned ? @"🔒 [禁言群]" : @"🟢 [开放群]";
     } else if (item.chatMeType == 0) {
         badge = [NSString stringWithFormat:@"🟢 [%@]", item.roleDesc ?: @"可直聊"];
     } else {
-        badge = @"🔒 [对方仅双向好友可私聊]";
+        badge = @"🔒 [仅好友可聊]";
     }
     cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", badge, item.name];
     cell.detailTextLabel.text = [NSString stringWithFormat:@"ID: %@ %@", item.targetId, item.fromGroupId.length > 0 ? [NSString stringWithFormat:@"| 群:%@", item.fromGroupId] : @""];
@@ -1585,7 +1503,7 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
         if (idx >= total) {
             weakSelf.floatingSendBtn.enabled = YES;
             weakSelf.statusLabel.textColor = okCount > 0 ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-            weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 完成：成功送达 %ld | 受限已申请加好友 %ld %@", (long)okCount, (long)failCount, lastFail];
+            weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 发送完成：成功送达 %ld | 受限已处理 %ld %@", (long)okCount, (long)failCount, lastFail];
             [weakSelf.tableView reloadData];
             return;
         }
@@ -1597,7 +1515,9 @@ static NSString *__currentChatPeerId = nil; // 记录当前单聊页面的对方
             if (ok) okCount++;
             else { failCount++; lastFail = detail ?: @""; }
             idx++;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // 随机真人化延迟：0.5 ~ 1.2 秒
+            NSTimeInterval randDelay = 0.5 + (arc4random_uniform(70) / 100.0);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nextStep();
             });
         }];
@@ -1685,21 +1605,18 @@ static void ACPresentForwardAssistantFromTopVC(void) {
     [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-#pragma mark - 6. 全局拦截器（捕获 HTTP Token + 解析 JSON + 聊天气泡长按 + 聊天页右上角强发）
+#pragma mark - 6. 全局钩子与强发
 
-// 拦截 NSMutableURLRequest，实时捕获最新的 token / x-userid / X-Lts-Id / channel，供 /userfriends/add 使用
 %hook NSMutableURLRequest
 
-- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString * _Nullable)field {
     %orig;
     if (field && value) {
         NSString *lowerField = field.lowercaseString;
         if ([lowerField isEqualToString:@"token"] ||
             [lowerField isEqualToString:@"x-userid"] ||
             [lowerField isEqualToString:@"x-lts-id"] ||
-            [lowerField isEqualToString:@"channel"] ||
-            [lowerField isEqualToString:@"version"] ||
-            [lowerField isEqualToString:@"user-agent"]) {
+            [lowerField isEqualToString:@"channel"]) {
             [ACForwardHelperManager shared].latestHTTPHeaders[field] = value;
             if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
                 [ACForwardHelperManager shared].selfUserId = value;
@@ -1722,26 +1639,9 @@ static void ACPresentForwardAssistantFromTopVC(void) {
                 [[ACForwardHelperManager shared] saveLocalPermanentCache];
                 [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
             });
-        } else if (dict[@"objectId"] && dict[@"actionName"]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [[ACForwardHelperManager shared] parseJSONWithContext:dict];
-            });
         }
     }
     return res;
-}
-
-+ (NSData *)dataWithJSONObject:(id)obj options:(NSJSONWritingOptions)opt error:(NSError * _Nullable *)error {
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *dict = (NSDictionary *)obj;
-        if (dict[@"objectId"] && [dict[@"objectId"] isKindOfClass:[NSString class]]) {
-            NSString *oid = dict[@"objectId"];
-            if ([oid hasPrefix:@"会话："]) {
-                __currentChatPeerId = [oid substringFromIndex:3];
-            }
-        }
-    }
-    return %orig;
 }
 
 %end
@@ -1815,8 +1715,6 @@ static void ACPresentForwardAssistantFromTopVC(void) {
     %orig;
     [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
     NSString *clsName = NSStringFromClass([self class]);
-
-    // 1. 关于飞机页面右上角固定入口
     if ([clsName containsString:@"HelpAboutViewController"]) {
         if (self.navigationItem) {
             UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"🚀 转发助手"
@@ -1828,7 +1726,6 @@ static void ACPresentForwardAssistantFromTopVC(void) {
         }
     }
 
-    // 2. 单聊页面 (ChatC2CViewController) 右上角增加「⚡强发」按钮，绕过聊天框点击发送无反应的前端限制
     if ([clsName containsString:@"ChatC2CViewController"]) {
         UIView *existingForceBtn = [self.view viewWithTag:665544];
         if (!existingForceBtn) {
@@ -1857,7 +1754,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
 - (void)ac_forceSendInCurrentChat {
     UITextView *inputTV = ACFindInputTextViewInView(self.view);
     NSString *text = inputTV ? [inputTV.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : @"";
-    if (text.length == 0) text = @"你好，认识一下";
+    if (text.length == 0) text = @"你好";
     if (!__currentChatPeerId || __currentChatPeerId.length < 5) return;
 
     ACContactItem *peer = [[ACContactItem alloc] init];
@@ -1866,10 +1763,8 @@ static void ACPresentForwardAssistantFromTopVC(void) {
     peer.sourceType = 0;
 
     [[ACForwardHelperManager shared] sendMessageWithText:text image:nil toItem:peer completion:^(BOOL ok, NSString *detail) {
-        if (ok && inputTV) {
-            inputTV.text = @"";
-        }
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 强发成功" : @"⚠️ 服务端隐私锁提示")
+        if (ok && inputTV) inputTV.text = @"";
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 强发成功" : @"⚠️ 发送结果")
                                                                        message:detail
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
