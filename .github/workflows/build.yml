@@ -32,23 +32,6 @@ jobs:
           which ldid || true
           which dpkg-deb || true
 
-      - name: Ensure ACContactItem.isGroup declaration
-        run: |
-          # Tweak.xm 多次被覆盖后丢失 ACContactItem.isGroup 声明，但仍在用 item.isGroup。
-          # 此处仅在使用但未声明时自动补上声明与实现，避免重复构建失败。
-          if grep -qE 'isGroup[[:space:]]*;' Tweak.xm; then
-            echo "isGroup already declared"
-          elif grep -q '\.isGroup' Tweak.xm; then
-            echo "isGroup used but not declared -> injecting"
-            awk '
-              {print}
-              /^@interface[[:space:]]+ACContactItem[[:space:]]*:/ {print "@property (nonatomic, readonly) BOOL isGroup;"}
-              /^@implementation[[:space:]]+ACContactItem[[:space:]]*$/ {print "- (BOOL)isGroup { return self.sourceType == ACContactSourceGroupChat; }"}
-            ' Tweak.xm > Tweak.xm.tmp && mv Tweak.xm.tmp Tweak.xm
-          else
-            echo "isGroup not used"
-          fi
-
       - name: Build dylib
         run: make -j"$(sysctl -n hw.ncpu)"
 
