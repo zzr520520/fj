@@ -1,9 +1,9 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <sqlite3.h>
-#import <MobileCoreServices/MobileCoreServices.h>
 
 #pragma mark - 1. 数据模型
 
@@ -49,11 +49,9 @@
 
 static __weak UIView *__lastLongPressedView = nil;
 static NSString *__pendingForwardText = nil;
-static UIImage *__pendingForwardImage = nil;
-static NSURL *__pendingForwardVideoURL = nil;
 static NSString *__currentChatPeerId = nil;
 
-#pragma mark - 2. 核心管理器（支持视频/图片长期沙盒持久化 + 8-15秒随机迎新）
+#pragma mark - 2. 核心管理器（永久保存图片/视频 + 8~15秒迎新 + 指定群采集 + 清除缓存）
 
 @interface ACForwardHelperManager : NSObject
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *friendList;
@@ -70,6 +68,11 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, strong) NSData *capturedCloudCustomData;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *latestHTTPHeaders;
 
+// --- 永久保存的媒体（图片或视频，迎新与群发通用，不掉图） ---
+@property (nonatomic, assign) NSInteger savedMediaType; // 0: 无媒体, 1: 图片, 2: 视频
+@property (nonatomic, strong) UIImage *savedImage;      // 永久保存的图片或视频封面
+@property (nonatomic, assign) int savedVideoDuration;   // 视频时长（秒）
+
 // --- 迎新配置 ---
 @property (nonatomic, assign) BOOL autoWelcomeEnabled;
 @property (nonatomic, copy) NSString *welcomeMessageText;
@@ -80,6 +83,13 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, assign) BOOL listenerRegistered;
 
 + (instancetype)shared;
+- (NSString *)permanentImagePath;
+- (NSString *)permanentVideoPath;
+- (NSString *)permanentVideoThumbPath;
+- (void)savePermanentImage:(UIImage *)img;
+- (void)savePermanentVideoAtURL:(NSURL *)videoURL;
+- (void)clearPermanentMedia;
+
 - (void)setupIMGroupWelcomeListener;
 - (void)loadLocalPermanentCache;
 - (void)saveLocalPermanentCache;
@@ -91,11 +101,9 @@ static NSString *__currentChatPeerId = nil;
                       completion:(void(^)(NSString *finalMsg))completion;
 - (void)reloadAllDataWithProgress:(void(^)(NSString *progressMsg))progressBlock
                        completion:(void(^)(NSString *finalMsg))completion;
-- (void)sendMessageWithText:(NSString *)text
-                      image:(UIImage *)image
-                   videoURL:(NSURL *)videoURL
-                     toItem:(ACContactItem *)item
-                 completion:(void(^)(BOOL ok, NSString *detail))completion;
+- (void)sendCurrentMediaAndText:(NSString *)text
+                         toItem:(ACContactItem *)item
+                     completion:(void(^)(BOOL ok, NSString *detail))completion;
 @end
 
 @implementation ACForwardHelperManager
@@ -122,8 +130,131 @@ static NSString *__currentChatPeerId = nil;
 
         [instance loadLocalPermanentCache];
         [instance loadWelcomeSettings];
+        [instance loadPermanentMediaFromDisk];
     });
     return instance;
+}
+
+#pragma mark - 2.0 永久保存图片与视频到沙盒（彻底解决掉图与迎新不发图问题）
+
+- (NSString *)permanentImagePath {
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    return [docDir stringByAppendingPathComponent:@"AC_Permanent_Media.jpg"];
+}
+
+- (NSString *)permanentVideoPath {
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    return [docDir stringByAppendingPathComponent:@"AC_Permanent_Media.mp4"];
+}
+
+- (NSString *)permanentVideoThumbPath {
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    return [docDir stringByAppendingPathComponent:@"AC_Permanent_VideoThumb.jpg"];
+}
+
+- (void)loadPermanentMediaFromDisk {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    self.savedMediaType = [ud integerForKey:@"AC_SavedMediaType"];
+    self.savedVideoDuration = (int)[ud integerForKey:@"AC_SavedVideoDuration"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (self.savedMediaType == 1 && [fm fileExistsAtPath:[self permanentImagePath]]) {
+        self.savedImage = [UIImage imageWithContentsOfFile:[self permanentImagePath]];
+    } else if (self.savedMediaType == 2 && [fm fileExistsAtPath:[self permanentVideoPath]]) {
+        if ([fm fileExistsAtPath:[self permanentVideoThumbPath]]) {
+            self.savedImage = [UIImage imageWithContentsOfFile:[self permanentVideoThumbPath]];
+        }
+    } else {
+        self.savedMediaType = 0;
+        self.savedImage = nil;
+    }
+}
+
+- (void)savePermanentImage:(UIImage *)img {
+    if (!img) return;
+    NSData *jpgData = UIImageJPEGRepresentation(img, 0.88);
+    if (jpgData) {
+        [jpgData writeToFile:[self permanentImagePath] atomically:YES];
+        [[NSFileManager defaultManager] removeItemAtPath:[self permanentVideoPath] error:nil];
+        self.savedImage = img;
+        self.savedMediaType = 1;
+        self.savedVideoDuration = 0;
+
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud setInteger:1 forKey:@"AC_SavedMediaType"];
+        [ud setInteger:0 forKey:@"AC_SavedVideoDuration"];
+        [ud synchronize];
+    }
+}
+
+- (void)savePermanentVideoAtURL:(NSURL *)videoURL {
+    if (!videoURL) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *destVideoPath = [self permanentVideoPath];
+    [fm removeItemAtPath:destVideoPath error:nil];
+    [fm removeItemAtPath:[self permanentImagePath] error:nil];
+
+    BOOL copied = [fm copyItemAtURL:videoURL toURL:[NSURL fileURLWithPath:destVideoPath] error:nil];
+    if (!copied) {
+        NSData *vData = [NSData dataWithContentsOfURL:videoURL];
+        if (vData) copied = [vData writeToFile:destVideoPath atomically:YES];
+    }
+    if (!copied) return;
+
+    // 提取视频时长与第一帧封面图
+    int durationSec = 5;
+    UIImage *thumbImg = nil;
+    @try {
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:destVideoPath] options:nil];
+        CMTime durTime = asset.duration;
+        if (durTime.timescale > 0) {
+            durationSec = MAX(1, (int)round((double)durTime.value / (double)durTime.timescale));
+        }
+        AVAssetImageGenerator *gen = [[AVAssetImageGenerator alloc] initWithAsset:asset];
+        gen.appliesPreferredTrackTransform = YES;
+        CGImageRef cgImg = [gen copyCGImageAtTime:CMTimeMake(0, 1) actualTime:NULL error:NULL];
+        if (cgImg) {
+            thumbImg = [UIImage imageWithCGImage:cgImg];
+            CGImageRelease(cgImg);
+        }
+    } @catch (NSException *e) {}
+
+    if (!thumbImg) {
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(200, 200), YES, 1.0);
+        [[UIColor darkGrayColor] setFill];
+        UIRectFill(CGRectMake(0, 0, 200, 200));
+        thumbImg = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+    }
+
+    NSData *thumbData = UIImageJPEGRepresentation(thumbImg, 0.85);
+    if (thumbData) {
+        [thumbData writeToFile:[self permanentVideoThumbPath] atomically:YES];
+    }
+
+    self.savedImage = thumbImg;
+    self.savedMediaType = 2;
+    self.savedVideoDuration = durationSec;
+
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setInteger:2 forKey:@"AC_SavedMediaType"];
+    [ud setInteger:durationSec forKey:@"AC_SavedVideoDuration"];
+    [ud synchronize];
+}
+
+- (void)clearPermanentMedia {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:[self permanentImagePath] error:nil];
+    [fm removeItemAtPath:[self permanentVideoPath] error:nil];
+    [fm removeItemAtPath:[self permanentVideoThumbPath] error:nil];
+    self.savedMediaType = 0;
+    self.savedImage = nil;
+    self.savedVideoDuration = 0;
+
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setInteger:0 forKey:@"AC_SavedMediaType"];
+    [ud setInteger:0 forKey:@"AC_SavedVideoDuration"];
+    [ud synchronize];
 }
 
 - (NSString *)cacheFilePath:(NSString *)type {
@@ -215,7 +346,7 @@ static NSString *__currentChatPeerId = nil;
     }
 }
 
-#pragma mark - 2.1 腾讯云 IM 实时监听新人进群 (调整为 8-15 秒随机延迟)
+#pragma mark - 2.1 腾讯云 IM 实时监听新人进群（8~15秒防封延迟 + 自动带永久图片/视频迎新）
 
 - (void)setupIMGroupWelcomeListener {
     if (self.listenerRegistered) return;
@@ -319,34 +450,38 @@ static NSString *__currentChatPeerId = nil;
     [self saveLocalPermanentCache];
     if (newTargetsToGreet.count == 0) return;
 
-    // 调整为 8 ~ 15 秒随机延迟迎新
+    // 迎新打招呼：首位新人进群后先等待 8~15 秒再发，后续每位同样间隔 8~15 秒，并自动携带永久保存的图片或视频！
     __block NSInteger idx = 0;
     __weak typeof(self) weakSelf = self;
     __block void (^greetNext)(void) = ^{
         if (idx >= newTargetsToGreet.count) return;
         ACContactItem *newMember = newTargetsToGreet[idx];
 
-        NSString *templateText = weakSelf.welcomeMessageText.length > 0 ? weakSelf.welcomeMessageText : @"您好 {name}，欢迎进群！认识一下~";
+        NSString *templateText = weakSelf.welcomeMessageText ?: @"";
         NSString *displayNick = (newMember.name && ![newMember.name hasPrefix:@"群友_"]) ? newMember.name : @"新朋友";
         NSString *finalGreeting = [templateText stringByReplacingOccurrencesOfString:@"{name}" withString:displayNick];
 
-        [weakSelf sendMessageWithText:finalGreeting image:nil videoURL:nil toItem:newMember completion:^(BOOL ok, NSString *detail) {
+        // 直接调用支持【永久图片/永久视频 + 文本】的统一发送方法
+        [weakSelf sendCurrentMediaAndText:finalGreeting toItem:newMember completion:^(BOOL ok, NSString *detail) {
             if (ok) {
                 weakSelf.greetedCount++;
-                weakSelf.lastGreetLog = [NSString stringWithFormat:@"✅ 已安全迎新: %@ (累计%ld人)", newMember.name, (long)weakSelf.greetedCount];
+                weakSelf.lastGreetLog = [NSString stringWithFormat:@"✅ 已安全迎新(%@): %@ (共%ld人)", detail, newMember.name, (long)weakSelf.greetedCount];
             } else {
                 weakSelf.lastGreetLog = [NSString stringWithFormat:@"⚠️ 迎新 %@: %@", newMember.name, detail];
             }
             [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
             idx++;
-            NSTimeInterval secureDelay = 8.0 + (arc4random_uniform(80) / 10.0); // 8.0 ~ 16.0 秒随机
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secureDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // 严格按照要求：8.0 ~ 15.0 秒随机延迟
+            NSTimeInterval safeRandomDelay = 8.0 + (arc4random_uniform(71) / 10.0);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(safeRandomDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 greetNext();
             });
         }];
     };
 
-    dispatch_async(dispatch_get_main_queue(), ^{
+    // 检测到新人进群后，先延迟 8~15 秒再发出第一条迎新
+    NSTimeInterval initialDelay = 8.0 + (arc4random_uniform(71) / 10.0);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(initialDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         greetNext();
     });
 }
@@ -537,7 +672,7 @@ static NSString *__currentChatPeerId = nil;
     }
 }
 
-#pragma mark - 2.3 群成员拉取
+#pragma mark - 2.3 群成员拉取（支持指定群定向获取）
 
 - (void)crawlGroupMembersPageForGroup:(NSString *)gid
                               nextSeq:(uint64_t)seq
@@ -572,7 +707,7 @@ static NSString *__currentChatPeerId = nil;
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (progressBlock) {
-                progressBlock([NSString stringWithFormat:@"⏳ 采集(第%ld页)：已获 %lu 人...",
+                progressBlock([NSString stringWithFormat:@"⏳ 定向采集(第%ld页)：已获 %lu 人...",
                                (long)(pageIdx + 1), (unsigned long)weakSelf.groupMemberList.count]);
             }
         });
@@ -705,7 +840,6 @@ static NSString *__currentChatPeerId = nil;
     }
 }
 
-// 定向采集指定群
 - (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
                         progress:(void(^)(NSString *progressMsg))progressBlock
                       completion:(void(^)(NSString *finalMsg))completion {
@@ -713,7 +847,7 @@ static NSString *__currentChatPeerId = nil;
     [self scanLocalDatabases];
 
     if (!targetGroupIds || targetGroupIds.count == 0) {
-        if (completion) completion(@"❌ 请先在「群聊」面板勾选要采集的群！");
+        if (completion) completion(@"❌ 请先在「群聊」面板勾选要采集的指定群聊！");
         return;
     }
 
@@ -811,16 +945,16 @@ static NSString *__currentChatPeerId = nil;
     });
 }
 
-#pragma mark - 3. 防封号混淆
+#pragma mark - 3. 防封号文本动态混淆包装
 
 - (NSString *)obfuscateMessageText:(NSString *)originalText {
-    if (!originalText || originalText.length == 0) return originalText;
-    NSArray *tails = @[@"~", @" ✨", @" 👍", @" (咨询)", @" 😊", @" 收到~", @" 💡"];
+    if (!originalText || originalText.length == 0) return @"";
+    NSArray *tails = @[@"~", @" ✨", @" 👍", @" 😊", @" ~", @" 💡"];
     NSString *randomTail = tails[arc4random_uniform((uint32_t)tails.count)];
     return [originalText stringByAppendingString:randomTail];
 }
 
-#pragma mark - 4. 破盾发送引擎（支持图片、视频原件发送）
+#pragma mark - 4. 支持「永久图片 / 永久视频 / 文本」三合一破盾发送引擎
 
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
     if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
@@ -951,54 +1085,51 @@ static NSString *__currentChatPeerId = nil;
     [inv invoke];
 }
 
-- (void)sendMessageWithText:(NSString *)text
-                      image:(UIImage *)image
-                   videoURL:(NSURL *)videoURL
-                     toItem:(ACContactItem *)item
-                 completion:(void(^)(BOOL ok, NSString *detail))completion {
+// 统一使用沙盒中永久保存的图片/视频 + 文本进行发送（无论是手动群发还是后台迎新，都不会掉图/掉视频）
+- (void)sendCurrentMediaAndText:(NSString *)text
+                         toItem:(ACContactItem *)item
+                     completion:(void(^)(BOOL ok, NSString *detail))completion {
     Class v2MgrCls = NSClassFromString(@"V2TIMManager");
     if (!v2MgrCls || ![v2MgrCls respondsToSelector:@selector(sharedInstance)]) {
         if (completion) completion(NO, @"IM未初始化");
         return;
     }
     id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+    NSFileManager *fm = [NSFileManager defaultManager];
 
-    // 1. 优先检查视频消息构造
-    id v2VideoMsg = nil;
-    if (videoURL) {
-        NSString *videoPath = [videoURL path];
-        NSString *thumbPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ac_video_thumb.jpg"];
-        UIImage *thumbImg = [UIImage imageNamed:@"ac_video_thumb.jpg"];
-        if (!thumbImg) {
-            thumbImg = [UIImage systemImageNamed:@"video.fill"] ?: [[UIImage alloc] init];
+    // 1. 构造永久媒体消息（图片或视频）
+    id v2MediaMsg = nil;
+    if (self.savedMediaType == 1 && [fm fileExistsAtPath:[self permanentImagePath]]) {
+        SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
+        if ([manager respondsToSelector:createImgSel]) {
+            v2MediaMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createImgSel, [self permanentImagePath]);
         }
-        NSData *thumbData = UIImageJPEGRepresentation(thumbImg, 0.7);
-        [thumbData writeToFile:thumbPath atomically:YES];
-        
-        SEL createVideoSel = NSSelectorFromString(@"createVideoMessage:videoFilepath:duration:snapshotPath:");
-        if ([manager respondsToSelector:createVideoSel]) {
-            v2VideoMsg = ((id (*)(id, SEL, NSString *, NSString *, int, NSString *))objc_msgSend)(
-                manager, createVideoSel, videoPath, videoPath, 10, thumbPath
-            );
-        }
-    }
+    } else if (self.savedMediaType == 2 && [fm fileExistsAtPath:[self permanentVideoPath]]) {
+        SEL createVidSel = NSSelectorFromString(@"createVideoMessage:type:duration:snapshotPath:");
+        if ([manager respondsToSelector:createVidSel]) {
+            NSString *vPath = [self permanentVideoPath];
+            NSString *vType = @"mp4";
+            int dur = self.savedVideoDuration > 0 ? self.savedVideoDuration : 5;
+            NSString *sPath = [fm fileExistsAtPath:[self permanentVideoThumbPath]] ? [self permanentVideoThumbPath] : @"";
 
-    // 2. 检查图片消息构造
-    id v2ImageMsg = nil;
-    if (!v2VideoMsg && image) {
-        NSData *jpgData = UIImageJPEGRepresentation(image, 0.85);
-        if (jpgData) {
-            NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ac_forward_temp.jpg"];
-            [jpgData writeToFile:tmpPath atomically:YES];
-            SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
-            if ([manager respondsToSelector:createImgSel]) {
-                v2ImageMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createImgSel, tmpPath);
-            }
+            NSMethodSignature *sig = [manager methodSignatureForSelector:createVidSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            [inv setTarget:manager];
+            [inv setSelector:createVidSel];
+            [inv setArgument:&vPath atIndex:2];
+            [inv setArgument:&vType atIndex:3];
+            [inv setArgument:&dur atIndex:4];
+            [inv setArgument:&sPath atIndex:5];
+            [inv invoke];
+            __unsafe_unretained id tempVideoMsg = nil;
+            [inv getReturnValue:&tempVideoMsg];
+            v2MediaMsg = tempVideoMsg;
         }
     }
 
-    // 3. 构造文本消息
-    NSString *obfuscatedText = [self obfuscateMessageText:text];
+    // 2. 构造文本消息（应用防封尾缀混淆）
+    NSString *cleanText = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *obfuscatedText = cleanText.length > 0 ? [self obfuscateMessageText:cleanText] : @"";
     id v2TextMsg = nil;
     if (obfuscatedText.length > 0) {
         SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
@@ -1007,21 +1138,24 @@ static NSString *__currentChatPeerId = nil;
         }
     }
 
-    id primaryMsg = v2VideoMsg ?: (v2ImageMsg ?: v2TextMsg);
+    id primaryMsg = v2MediaMsg ?: v2TextMsg;
     if (!primaryMsg) {
-        if (completion) completion(NO, @"发送内容为空");
+        if (completion) completion(NO, @"内容为空");
         return;
     }
 
     [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok, int code, NSString *desc) {
         if (ok) {
             item.chatMeType = 0;
-            if ((v2VideoMsg || v2ImageMsg) && v2TextMsg) {
-                [self rawSendV2Message:v2TextMsg toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
-                    if (completion) completion(YES, @"多媒体群发成功");
-                }];
+            // 如果既有图片/视频，又有文字，间隔 0.6 秒把文字也发过去
+            if (v2MediaMsg && v2TextMsg) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [self rawSendV2Message:v2TextMsg toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
+                        if (completion) completion(YES, self.savedMediaType == 2 ? @"视频+文送达" : @"图+文送达");
+                    }];
+                });
             } else {
-                if (completion) completion(YES, @"成功");
+                if (completion) completion(YES, self.savedMediaType == 2 ? @"视频送达" : (self.savedMediaType == 1 ? @"图片送达" : @"文本送达"));
             }
             return;
         }
@@ -1031,10 +1165,13 @@ static NSString *__currentChatPeerId = nil;
             [self callAirChatBackendAddFriendAndUnlock:item.targetId completion:^{
                 [self simulateIncomingMessageFrom:item.targetId completion:^{
                     [self autoAddIMFriend:item.targetId completion:^{
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                             [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
                                 if (ok2) {
-                                    if (completion) completion(YES, @"破盾重发成功");
+                                    if (v2MediaMsg && v2TextMsg) {
+                                        [self rawSendV2Message:v2TextMsg toItem:item completion:nil];
+                                    }
+                                    if (completion) completion(YES, @"破盾成功");
                                 } else {
                                     if (completion) completion(NO, @"(120001)已自动申请加好友");
                                 }
@@ -1051,16 +1188,15 @@ static NSString *__currentChatPeerId = nil;
 
 @end
 
-#pragma mark - 4. 转发助手弹窗控制器（长期沙盒持久化图片/视频选择器）
+#pragma mark - 5. 转发与迎新助手弹窗控制器（支持永久选图/选视频、8-15秒迎新、定向采集、清除群成员）
 
 @interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource, UINavigationControllerDelegate, UIImagePickerControllerDelegate, UITextViewDelegate>
 @property (nonatomic, strong) UIView *headerContainer;
 @property (nonatomic, strong) UITextView *contentTextView;
 @property (nonatomic, strong) UIImageView *previewImageView;
-@property (nonatomic, strong) UIButton *pickImageBtn;
-@property (nonatomic, strong) UIButton *clearImageBtn;
-@property (nonatomic, strong) UIImage *selectedImage;
-@property (nonatomic, strong) NSURL *selectedVideoURL;
+@property (nonatomic, strong) UIButton *pickMediaBtn;
+@property (nonatomic, strong) UIButton *clearMediaBtn;
+@property (nonatomic, strong) UILabel *mediaBadgeLabel;
 @property (nonatomic, strong) UISegmentedControl *tabControl;
 @property (nonatomic, strong) UIView *actionBar;
 @property (nonatomic, strong) UIView *welcomeControlBar;
@@ -1083,13 +1219,11 @@ static NSString *__currentChatPeerId = nil;
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(dismissSelf)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"全量刷新" style:UIBarButtonItemStyleDone target:self action:@selector(refreshData)];
 
-    // 读取沙盒中持久化的媒体文件
-    [self loadPersistentMedia];
-
     [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onWelcomeStatusUpdate) name:@"ACWelcomeStatusUpdated" object:nil];
 
     [self setupCleanUI];
+    [self refreshMediaPreviewUI];
     [self updateUI];
 
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
@@ -1107,63 +1241,6 @@ static NSString *__currentChatPeerId = nil;
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
-// 沙盒路径持久化存取多媒体
-- (NSString *)persistentMediaPath:(NSString *)ext {
-    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Persistent_Media.%@", ext]];
-}
-
-- (void)savePersistentMediaToDisk {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        @try {
-            NSFileManager *fm = [NSFileManager defaultManager];
-            NSString *imgP = [self persistentMediaPath:@"jpg"];
-            NSString *vidP = [self persistentMediaPath:@"mp4"];
-            [fm removeItemAtPath:imgP error:nil];
-            [fm removeItemAtPath:vidP error:nil];
-
-            if (self.selectedImage) {
-                NSData *d = UIImageJPEGRepresentation(self.selectedImage, 0.85);
-                [d writeToFile:imgP atomically:YES];
-            } else if (self.selectedVideoURL) {
-                NSData *vd = [NSData dataWithContentsOfURL:self.selectedVideoURL];
-                [vd writeToFile:vidP atomically:YES];
-            }
-        } @catch (NSException *e) {}
-    });
-}
-
-- (void)loadPersistentMedia {
-    @try {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *imgP = [self persistentMediaPath:@"jpg"];
-        NSString *vidP = [self persistentMediaPath:@"mp4"];
-        if ([fm fileExistsAtPath:imgP]) {
-            NSData *d = [NSData dataWithContentsOfFile:imgP];
-            if (d) {
-                self.selectedImage = [UIImage imageWithData:d];
-                self.selectedVideoURL = nil;
-                return;
-            }
-        }
-        if ([fm fileExistsAtPath:vidP]) {
-            self.selectedVideoURL = [NSURL fileURLWithPath:vidP];
-            self.selectedImage = [UIImage systemImageNamed:@"video.fill"];
-        }
-    } @catch (NSException *e) {}
-
-    if (!self.selectedImage && !self.selectedVideoURL) {
-        if (__pendingForwardImage) {
-            self.selectedImage = __pendingForwardImage;
-            [self savePersistentMediaToDisk];
-        } else if (__pendingForwardVideoURL) {
-            self.selectedVideoURL = __pendingForwardVideoURL;
-            self.selectedImage = [UIImage systemImageNamed:@"video.fill"];
-            [self savePersistentMediaToDisk];
-        }
-    }
-}
-
 - (void)onWelcomeStatusUpdate {
     if (self.tabControl.selectedSegmentIndex == 3) {
         self.statusLabel.textColor = [UIColor systemGreenColor];
@@ -1179,7 +1256,7 @@ static NSString *__currentChatPeerId = nil;
     self.headerContainer.backgroundColor = [UIColor systemGroupedBackgroundColor];
     [self.view addSubview:self.headerContainer];
 
-    CGFloat imgBoxW = 84.0;
+    CGFloat imgBoxW = 86.0;
     self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 18, width - 32 - imgBoxW - 10, 84)];
     self.contentTextView.font = [UIFont systemFontOfSize:15];
     self.contentTextView.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
@@ -1190,13 +1267,12 @@ static NSString *__currentChatPeerId = nil;
     self.contentTextView.delegate = self;
     if (__pendingForwardText && __pendingForwardText.length > 0) {
         self.contentTextView.text = __pendingForwardText;
-    } else if (self.selectedImage || self.selectedVideoURL) {
-        self.contentTextView.text = @"";
     } else {
-        self.contentTextView.text = @"您好，这是一条群发消息！";
+        self.contentTextView.text = [ACForwardHelperManager shared].welcomeMessageText ?: @"您好，认识一下！";
     }
     [self.headerContainer addSubview:self.contentTextView];
 
+    // 右侧永久图片/视频预览框
     self.previewImageView = [[UIImageView alloc] initWithFrame:CGRectMake(width - 16 - imgBoxW, 18, imgBoxW, 84)];
     self.previewImageView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.previewImageView.layer.cornerRadius = 12;
@@ -1205,27 +1281,33 @@ static NSString *__currentChatPeerId = nil;
     self.previewImageView.contentMode = UIViewContentModeScaleAspectFill;
     self.previewImageView.clipsToBounds = YES;
     self.previewImageView.userInteractionEnabled = YES;
-    self.previewImageView.image = self.selectedImage;
     [self.headerContainer addSubview:self.previewImageView];
 
-    self.pickImageBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.pickImageBtn.frame = self.previewImageView.bounds;
-    self.pickImageBtn.titleLabel.numberOfLines = 2;
-    self.pickImageBtn.titleLabel.textAlignment = NSTextAlignmentCenter;
-    self.pickImageBtn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
-    [self.pickImageBtn setTitle:(self.selectedImage || self.selectedVideoURL) ? (self.selectedVideoURL ? @"🎬\n[已选视频]" : @"") : @"🖼️\n选图/视频" forState:UIControlStateNormal];
-    [self.pickImageBtn addTarget:self action:@selector(chooseMediaFromAlbum) forControlEvents:UIControlEventTouchUpInside];
-    [self.previewImageView addSubview:self.pickImageBtn];
+    self.pickMediaBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.pickMediaBtn.frame = self.previewImageView.bounds;
+    self.pickMediaBtn.titleLabel.numberOfLines = 2;
+    self.pickMediaBtn.titleLabel.textAlignment = NSTextAlignmentCenter;
+    self.pickMediaBtn.titleLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightSemibold];
+    [self.pickMediaBtn addTarget:self action:@selector(chooseMediaFromAlbum) forControlEvents:UIControlEventTouchUpInside];
+    [self.previewImageView addSubview:self.pickMediaBtn];
 
-    self.clearImageBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.clearImageBtn.frame = CGRectMake(imgBoxW - 24, 2, 22, 22);
-    self.clearImageBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
-    self.clearImageBtn.layer.cornerRadius = 11;
-    [self.clearImageBtn setTitle:@"✕" forState:UIControlStateNormal];
-    self.clearImageBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    self.clearImageBtn.hidden = (self.selectedImage == nil && self.selectedVideoURL == nil);
-    [self.clearImageBtn addTarget:self action:@selector(clearSelectedMedia) forControlEvents:UIControlEventTouchUpInside];
-    [self.previewImageView addSubview:self.clearImageBtn];
+    self.mediaBadgeLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 62, imgBoxW, 22)];
+    self.mediaBadgeLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.65];
+    self.mediaBadgeLabel.textColor = [UIColor whiteColor];
+    self.mediaBadgeLabel.font = [UIFont boldSystemFontOfSize:10];
+    self.mediaBadgeLabel.textAlignment = NSTextAlignmentCenter;
+    self.mediaBadgeLabel.hidden = YES;
+    [self.previewImageView addSubview:self.mediaBadgeLabel];
+
+    self.clearMediaBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.clearMediaBtn.frame = CGRectMake(imgBoxW - 24, 2, 22, 22);
+    self.clearMediaBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.65];
+    self.clearMediaBtn.layer.cornerRadius = 11;
+    [self.clearMediaBtn setTitle:@"✕" forState:UIControlStateNormal];
+    self.clearMediaBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    self.clearMediaBtn.hidden = YES;
+    [self.clearMediaBtn addTarget:self action:@selector(clearSelectedMedia) forControlEvents:UIControlEventTouchUpInside];
+    [self.previewImageView addSubview:self.clearMediaBtn];
 
     self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友(0)", @"群成员(0)", @"群聊(0)", @"🤖迎新"]];
     self.tabControl.frame = CGRectMake(16, 114, width - 32, 34);
@@ -1255,8 +1337,8 @@ static NSString *__currentChatPeerId = nil;
     self.welcomeControlBar.hidden = YES;
 
     self.welcomeSwitchLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, width - 190, 38)];
-    self.welcomeSwitchLabel.font = [UIFont boldSystemFontOfSize:13];
-    self.welcomeSwitchLabel.text = @"🤖 监听勾选群新人自动打招呼";
+    self.welcomeSwitchLabel.font = [UIFont boldSystemFontOfSize:12.5];
+    self.welcomeSwitchLabel.text = @"🤖 迎新(8-15秒随机 | 自动带图/视频)";
     [self.welcomeControlBar addSubview:self.welcomeSwitchLabel];
 
     UIButton *allWelcomeGrpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1289,6 +1371,29 @@ static NSString *__currentChatPeerId = nil;
     [self.view addSubview:self.tableView];
 
     [self setupFloatingButton];
+}
+
+// 刷新右上角永久图片/视频预览状态
+- (void)refreshMediaPreviewUI {
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    if (mgr.savedMediaType == 1 && mgr.savedImage) {
+        self.previewImageView.image = mgr.savedImage;
+        [self.pickMediaBtn setTitle:@"" forState:UIControlStateNormal];
+        self.clearMediaBtn.hidden = NO;
+        self.mediaBadgeLabel.hidden = NO;
+        self.mediaBadgeLabel.text = @"🖼️ 永久图片";
+    } else if (mgr.savedMediaType == 2 && mgr.savedImage) {
+        self.previewImageView.image = mgr.savedImage;
+        [self.pickMediaBtn setTitle:@"" forState:UIControlStateNormal];
+        self.clearMediaBtn.hidden = NO;
+        self.mediaBadgeLabel.hidden = NO;
+        self.mediaBadgeLabel.text = [NSString stringWithFormat:@"🎬 视频(%ds)", mgr.savedVideoDuration];
+    } else {
+        self.previewImageView.image = nil;
+        [self.pickMediaBtn setTitle:@"🖼️/🎬\n选图或视频" forState:UIControlStateNormal];
+        self.clearMediaBtn.hidden = YES;
+        self.mediaBadgeLabel.hidden = YES;
+    }
 }
 
 - (void)viewDidLayoutSubviews {
@@ -1341,10 +1446,8 @@ static NSString *__currentChatPeerId = nil;
 }
 
 - (void)textViewDidChange:(UITextView * _Nonnull)textView {
-    if (self.tabControl.selectedSegmentIndex == 3) {
-        [ACForwardHelperManager shared].welcomeMessageText = textView.text;
-        [[ACForwardHelperManager shared] saveWelcomeSettings];
-    }
+    [ACForwardHelperManager shared].welcomeMessageText = textView.text;
+    [[ACForwardHelperManager shared] saveWelcomeSettings];
 }
 
 - (void)welcomeSwitchChanged:(UISwitch * _Nonnull)sw {
@@ -1356,8 +1459,9 @@ static NSString *__currentChatPeerId = nil;
     [mgr setupIMGroupWelcomeListener];
 
     if (sw.isOn) {
+        NSString *mediaTip = mgr.savedMediaType == 2 ? @"+永久视频" : (mgr.savedMediaType == 1 ? @"+永久图片" : @"纯文本");
         self.statusLabel.textColor = [UIColor systemGreenColor];
-        self.statusLabel.text = [NSString stringWithFormat:@"🟢 安全迎新已开(8-15秒随机) | 监控 %lu 个群", (unsigned long)mgr.welcomeGroupIds.count];
+        self.statusLabel.text = [NSString stringWithFormat:@"🟢 迎新已开启(8-15秒随机|%@) | 监控 %lu 群", mediaTip, (unsigned long)mgr.welcomeGroupIds.count];
     } else {
         self.statusLabel.textColor = [UIColor secondaryLabelColor];
         self.statusLabel.text = @"⚪ 迎新已关闭";
@@ -1380,54 +1484,43 @@ static NSString *__currentChatPeerId = nil;
     [self.tableView reloadData];
 }
 
+// 打开系统相册：同时支持选择【图片】和【视频】
 - (void)chooseMediaFromAlbum {
     [self.view endEditing:YES];
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.mediaTypes = @[@"public.image", @"public.movie"];
+    picker.videoQuality = UIImagePickerControllerQualityTypeMedium;
     picker.delegate = self;
     [self presentViewController:picker animated:YES completion:nil];
 }
 
 - (void)imagePickerController:(UIImagePickerController * _Nonnull)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> * _Nonnull)info {
     NSString *mediaType = info[UIImagePickerControllerMediaType];
-    if ([mediaType isEqualToString:@"public.image"]) {
+    if ([mediaType isEqualToString:@"public.movie"]) {
+        NSURL *videoURL = info[UIImagePickerControllerMediaURL];
+        if (videoURL) {
+            [[ACForwardHelperManager shared] savePermanentVideoAtURL:videoURL];
+            self.statusLabel.textColor = [UIColor systemGreenColor];
+            self.statusLabel.text = [NSString stringWithFormat:@"🎬 视频已永久保存(%d秒)，群发与迎新均自动携带！", [ACForwardHelperManager shared].savedVideoDuration];
+        }
+    } else {
         UIImage *img = info[UIImagePickerControllerOriginalImage];
         if (img) {
-            self.selectedImage = img;
-            self.selectedVideoURL = nil;
-            self.previewImageView.image = img;
-            [self.pickImageBtn setTitle:@"" forState:UIControlStateNormal];
-            self.clearImageBtn.hidden = NO;
-            [self savePersistentMediaToDisk];
-        }
-    } else if ([mediaType isEqualToString:@"public.movie"]) {
-        NSURL *vidUrl = info[UIImagePickerControllerMediaURL];
-        if (vidUrl) {
-            self.selectedVideoURL = vidUrl;
-            self.selectedImage = [UIImage systemImageNamed:@"video.fill"];
-            self.previewImageView.image = self.selectedImage;
-            [self.pickImageBtn setTitle:@"🎬\n[已选视频]" forState:UIControlStateNormal];
-            self.clearImageBtn.hidden = NO;
-            [self savePersistentMediaToDisk];
+            [[ACForwardHelperManager shared] savePermanentImage:img];
+            self.statusLabel.textColor = [UIColor systemGreenColor];
+            self.statusLabel.text = @"🖼️ 图片已永久保存到本地，关闭弹窗或迎新均不会掉图！";
         }
     }
+    [self refreshMediaPreviewUI];
     [picker dismissViewControllerAnimated:YES completion:nil];
 }
 
 - (void)clearSelectedMedia {
-    self.selectedImage = nil;
-    self.selectedVideoURL = nil;
-    __pendingForwardImage = nil;
-    __pendingForwardVideoURL = nil;
-    self.previewImageView.image = nil;
-    [self.pickImageBtn setTitle:@"🖼️\n选图/视频" forState:UIControlStateNormal];
-    self.clearImageBtn.hidden = YES;
-    
-    // 清除沙盒中持久化的媒体文件
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm removeItemAtPath:[self persistentMediaPath:@"jpg"] error:nil];
-    [fm removeItemAtPath:[self persistentMediaPath:@"mp4"] error:nil];
+    [[ACForwardHelperManager shared] clearPermanentMedia];
+    [self refreshMediaPreviewUI];
+    self.statusLabel.textColor = [UIColor secondaryLabelColor];
+    self.statusLabel.text = @"已清除永久图片/视频";
 }
 
 - (void)refreshData {
@@ -1519,14 +1612,12 @@ static NSString *__currentChatPeerId = nil;
 
     if (isWelcomeTab) {
         self.contentTextView.text = mgr.welcomeMessageText ?: @"您好 {name}，欢迎进群！认识一下~";
+        NSString *mediaDesc = mgr.savedMediaType == 2 ? @"🎬带视频" : (mgr.savedMediaType == 1 ? @"🖼️带图片" : @"纯文字");
         self.statusLabel.textColor = mgr.autoWelcomeEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-        self.statusLabel.text = [NSString stringWithFormat:@"%@ | 请在下方勾选要监听新人的群 (已选%lu个)",
-                                 mgr.autoWelcomeEnabled ? @"🟢 迎新监听中" : @"⚪ 迎新未开启",
+        self.statusLabel.text = [NSString stringWithFormat:@"%@(%@) | 勾选要监听新人的群 (已选%lu个)",
+                                 mgr.autoWelcomeEnabled ? @"🟢 8-15s迎新中" : @"⚪ 迎新未开启",
+                                 mediaDesc,
                                  (unsigned long)mgr.welcomeGroupIds.count];
-    } else {
-        if ([self.contentTextView.text isEqualToString:mgr.welcomeMessageText]) {
-            self.contentTextView.text = __pendingForwardText ?: @"您好，这是一条群发消息！";
-        }
     }
 
     [self updateUI];
@@ -1613,14 +1704,14 @@ static NSString *__currentChatPeerId = nil;
 
 - (void)startBatchSend {
     [self.view endEditing:YES];
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
     NSString *text = [self.contentTextView.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (text.length == 0 && !self.selectedImage && !self.selectedVideoURL) {
+    if (text.length == 0 && mgr.savedMediaType == 0) {
         self.statusLabel.textColor = [UIColor systemRedColor];
-        self.statusLabel.text = @"❌ 请输入文字、选择图片或视频！";
+        self.statusLabel.text = @"❌ 请输入文字，或选择一张图片/视频！";
         return;
     }
 
-    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
     NSMutableArray<ACContactItem *> *targets = [NSMutableArray array];
     for (ACContactItem *i in mgr.friendList) if (i.isSelected) [targets addObject:i];
     for (ACContactItem *i in mgr.groupMemberList) if (i.isSelected) [targets addObject:i];
@@ -1628,7 +1719,7 @@ static NSString *__currentChatPeerId = nil;
 
     if (targets.count == 0) {
         self.statusLabel.textColor = [UIColor systemRedColor];
-        self.statusLabel.text = @"❌ 请先勾选发送目标！";
+        self.statusLabel.text = @"❌ 请先勾选好友、群成员或群聊！";
         return;
     }
 
@@ -1638,8 +1729,6 @@ static NSString *__currentChatPeerId = nil;
     __block NSString *lastFail = @"";
     __block NSInteger idx = 0;
     NSInteger total = targets.count;
-    UIImage *imgToSend = self.selectedImage;
-    NSURL *vidToSend = self.selectedVideoURL;
     __weak typeof(self) weakSelf = self;
 
     __block void (^nextStep)(void) = ^{
@@ -1654,12 +1743,12 @@ static NSString *__currentChatPeerId = nil;
         weakSelf.statusLabel.textColor = [UIColor systemBlueColor];
         weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在发送 (%ld/%ld): %@", (long)(idx + 1), (long)total, cur.name];
 
-        [[ACForwardHelperManager shared] sendMessageWithText:text image:imgToSend videoURL:vidToSend toItem:cur completion:^(BOOL ok, NSString *detail) {
+        [[ACForwardHelperManager shared] sendCurrentMediaAndText:text toItem:cur completion:^(BOOL ok, NSString *detail) {
             if (ok) okCount++;
             else { failCount++; lastFail = detail ?: @""; }
             idx++;
-            // 延长群发真人化延迟：3.0 ~ 6.5 秒随机
-            NSTimeInterval randDelay = 3.0 + (arc4random_uniform(35) / 10.0);
+            // 手动群发同样采用 3.5 ~ 6.5 秒安全随机间隔
+            NSTimeInterval randDelay = 3.5 + (arc4random_uniform(31) / 10.0);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nextStep();
             });
@@ -1674,7 +1763,7 @@ static NSString *__currentChatPeerId = nil;
 
 @end
 
-#pragma mark - 5. 视图树提取工具（支持抓取图片与视频 URL）
+#pragma mark - 6. 视图树提取工具
 
 static UIImage *ACFindLargestImageInView(UIView *view) {
     if (!view || view.hidden || view.alpha < 0.05) return nil;
@@ -1748,7 +1837,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
     [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-#pragma mark - 6. 换绑突破与全局钩子
+#pragma mark - 7. 换绑突破与全局钩子
 
 %hook NSURLSession
 
@@ -1769,7 +1858,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
 
 %hook NSMutableURLRequest
 
-- (void)setValue:(NSString * _Nullable)value forHTTPHeaderField:(NSString * _Nullable)field {
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString * _Nullable)field {
     %orig;
     if (field && value) {
         NSString *lowerField = field.lowercaseString;
@@ -1789,7 +1878,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
 
 %hook NSJSONSerialization
 
-+ (id)JSONObjectWithData:(NSData * _Nonnull)data options:(NSJSONReadingOptions)opt error:(NSError * _Nullable * _Nullable)error {
++ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError * _Nullable *)error {
     id res = %orig;
     if ([res isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)res;
@@ -1821,7 +1910,11 @@ static void ACPresentForwardAssistantFromTopVC(void) {
         NSString *cellCls = NSStringFromClass([cellView class]);
         if ([cellCls containsString:@"Chat"] || [cellCls containsString:@"Bubble"] || [cellCls containsString:@"Message"]) {
             __lastLongPressedView = cellView;
-            __pendingForwardImage = ACFindLargestImageInView(cellView);
+            UIImage *extractedImg = ACFindLargestImageInView(cellView);
+            if (extractedImg) {
+                // 长按图片气泡时，自动将图片永久保存到本地
+                [[ACForwardHelperManager shared] savePermanentImage:extractedImg];
+            }
             __pendingForwardText = ACFindChatTextInView(cellView);
 
             UIWindow *win = v.window ?: [UIApplication sharedApplication].keyWindow;
@@ -1843,7 +1936,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
             quickForwardPill.layer.shadowOffset = CGSizeMake(0, 4);
             quickForwardPill.layer.shadowRadius = 6.0;
 
-            NSString *typeTag = __pendingForwardImage ? @"🖼️群发此图片" : @"📝群发此消息";
+            NSString *typeTag = extractedImg ? @"🖼️已存此图并群发" : @"📝群发此消息";
             [quickForwardPill setTitle:[NSString stringWithFormat:@"🚀 转发助手 (%@)", typeTag] forState:UIControlStateNormal];
             [quickForwardPill setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
             quickForwardPill.titleLabel.font = [UIFont boldSystemFontOfSize:14];
@@ -1905,8 +1998,6 @@ static void ACPresentForwardAssistantFromTopVC(void) {
 
 %new
 - (void)ac_openFromAbout {
-    __pendingForwardImage = nil;
-    __pendingForwardVideoURL = nil;
     __pendingForwardText = nil;
     ACPresentForwardAssistantFromTopVC();
 }
@@ -1915,7 +2006,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
 - (void)ac_forceSendInCurrentChat {
     UITextView *inputTV = ACFindInputTextViewInView(self.view);
     NSString *text = inputTV ? [inputTV.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : @"";
-    if (text.length == 0) text = @"你好";
+    if (text.length == 0 && [ACForwardHelperManager shared].savedMediaType == 0) text = @"你好";
     if (!__currentChatPeerId || __currentChatPeerId.length < 5) return;
 
     ACContactItem *peer = [[ACContactItem alloc] init];
@@ -1923,7 +2014,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
     peer.name = self.title ?: __currentChatPeerId;
     peer.sourceType = 0;
 
-    [[ACForwardHelperManager shared] sendMessageWithText:text image:nil videoURL:nil toItem:peer completion:^(BOOL ok, NSString *detail) {
+    [[ACForwardHelperManager shared] sendCurrentMediaAndText:text toItem:peer completion:^(BOOL ok, NSString *detail) {
         if (ok && inputTV) inputTV.text = @"";
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 强发成功" : @"⚠️ 发送结果")
                                                                        message:detail
