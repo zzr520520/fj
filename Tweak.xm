@@ -4,7 +4,7 @@
 #import <objc/message.h>
 #import <sqlite3.h>
 
-#pragma mark - 1. 数据模型与永久本地缓存
+#pragma mark - 1. 数据模型（支持 NSCoding 永久本地序列化）
 
 @interface ACContactItem : NSObject <NSCoding>
 @property (nonatomic, copy) NSString *targetId;
@@ -13,7 +13,7 @@
 @property (nonatomic, copy) NSString *roleDesc;
 @property (nonatomic, assign) NSInteger sourceType; // 0: 好友, 1: 群成员, 2: 群聊
 @property (nonatomic, assign) NSInteger chatMeType; // 0: 开放私聊, 1: 仅双向好友
-@property (nonatomic, assign) BOOL isGroupBanned;   // 该群是否被禁言
+@property (nonatomic, assign) BOOL isGroupBanned;   
 @property (nonatomic, assign) BOOL isSelected;
 @end
 
@@ -51,7 +51,7 @@ static NSString *__pendingForwardText = nil;
 static UIImage *__pendingForwardImage = nil;
 static NSString *__currentChatPeerId = nil;
 
-#pragma mark - 2. 核心管理器（防封混淆 + 禁言群智能过滤 + 破盾发送）
+#pragma mark - 2. 核心管理器（防封混淆 + 破盾发送）
 
 @interface ACForwardHelperManager : NSObject
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *friendList;
@@ -61,7 +61,7 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *friendMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMemberMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMap;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupBanStatusMap; // 群禁言状态缓存
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupBanStatusMap;
 
 @property (nonatomic, copy) NSString *selfUserId;
 @property (nonatomic, copy) NSString *capturedClientTypeV2;
@@ -459,14 +459,20 @@ static NSString *__currentChatPeerId = nil;
             NSString *uid = [NSString stringWithFormat:@"%@", dict[@"id"]];
             NSString *nick = [NSString stringWithFormat:@"%@", dict[@"clientUserNickName"]];
             NSInteger cmType = [[NSString stringWithFormat:@"%@", dict[@"chatMeType"]] integerValue];
-            [self addFriendWithId:uid name:nick tag:(cmType == 0 ? @"开放私聊" : @"受限(chatMe=1)") chatMeType:cmType];
+            [self addFriendWithId:uid name:nick tag:(cmType == 0 ? @"开放私聊(必达)" : @"限制非好友(chatMe=1)") chatMeType:cmType];
             if (self.groupMemberMap[uid]) {
                 self.groupMemberMap[uid].chatMeType = cmType;
                 self.groupMemberMap[uid].name = nick;
             }
         }
 
-        // 提取群详情中的 ban 状态 (来自抓包: "ban": "true" 或 "false")
+        if ([dict[@"cloudCustomData"] isKindOfClass:[NSDictionary class]]) {
+            NSString *v2Token = dict[@"cloudCustomData"][@"client_typeV2"];
+            if (v2Token && [v2Token isKindOfClass:[NSString class]] && v2Token.length > 10) {
+                self.capturedClientTypeV2 = v2Token;
+            }
+        }
+
         NSString *directId = [NSString stringWithFormat:@"%@", dict[@"id"] ?: @""];
         if ([directId hasPrefix:@"@TGS#"] && dict[@"name"]) {
             BOOL isBan = [[NSString stringWithFormat:@"%@", dict[@"ban"] ?: @"false"] isEqualToString:@"true"];
@@ -498,6 +504,23 @@ static NSString *__currentChatPeerId = nil;
                                       role:@"群活跃"
                                 chatMeType:cmType];
             }
+        }
+
+        id friendId = dict[@"friendId"];
+        if (friendId && ![friendId isKindOfClass:[NSNull class]]) {
+            NSString *remark = dict[@"remark"];
+            NSString *nick = dict[@"nickname"] ?: dict[@"appUserInfo"][@"clientUserNickName"];
+            BOOL isMutual = [[NSString stringWithFormat:@"%@", dict[@"mutual"] ?: @"false"] isEqualToString:@"true"];
+            NSDictionary *appU = [dict[@"appUserInfo"] isKindOfClass:[NSDictionary class]] ? dict[@"appUserInfo"] : nil;
+            NSInteger cmType = 0;
+            if (!isMutual && appU && appU[@"chatMeType"] && ![appU[@"chatMeType"] isKindOfClass:[NSNull class]]) {
+                cmType = [[NSString stringWithFormat:@"%@", appU[@"chatMeType"]] integerValue];
+            }
+            NSString *finalName = (remark && ![remark isKindOfClass:[NSNull class]] && [remark description].length > 0) ? [NSString stringWithFormat:@"%@ (%@)", remark, nick ?: @""] : nick;
+            [self addFriendWithId:[NSString stringWithFormat:@"%@", friendId]
+                             name:finalName
+                              tag:(isMutual ? @"双向好友(必达)" : @"单向好友")
+                       chatMeType:cmType];
         }
 
         for (id key in dict) {
@@ -762,7 +785,7 @@ static NSString *__currentChatPeerId = nil;
     return [originalText stringByAppendingString:randomTail];
 }
 
-#pragma mark - 4. 破盾发送引擎（后端接口破盾 + 智能禁言群过滤 @TA）
+#pragma mark - 4. 破盾发送引擎（后端接口破盾，绝不在禁言群@）
 
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
     if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
@@ -771,7 +794,6 @@ static NSString *__currentChatPeerId = nil;
     }
     dispatch_group_t apiGroup = dispatch_group_create();
 
-    // 1. POST /client/biz/userfriends/add
     dispatch_group_enter(apiGroup);
     NSMutableURLRequest *req1 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/userfriends/add"]];
     req1.HTTPMethod = @"POST";
@@ -784,7 +806,6 @@ static NSString *__currentChatPeerId = nil;
         dispatch_group_leave(apiGroup);
     }] resume];
 
-    // 2. POST /client/biz/useronechat/add
     dispatch_group_enter(apiGroup);
     NSMutableURLRequest *req2 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/useronechat/add"]];
     req2.HTTPMethod = @"POST";
@@ -895,53 +916,6 @@ static NSString *__currentChatPeerId = nil;
     [inv invoke];
 }
 
-// 智能禁言群过滤：只在开放（未禁言）的群内进行 @TA 强提醒兜底
-- (void)fallbackSendGroupAtMessage:(NSString *)text forMember:(ACContactItem *)item completion:(void(^)(BOOL ok, NSString *detail))completion {
-    NSString *gid = item.fromGroupId;
-    
-    // 检查指定群是否被禁言
-    BOOL isBanned = [self.groupBanStatusMap[gid] boolValue];
-    if (isBanned || !gid || gid.length == 0) {
-        // 如果原群被禁言，自动寻找一个【未全员禁言】的开放群进行 @
-        gid = nil;
-        for (ACContactItem *g in self.groupList) {
-            BOOL banned = [self.groupBanStatusMap[g.targetId] boolValue];
-            if (!banned && [g.targetId hasPrefix:@"@TGS#"]) {
-                gid = g.targetId;
-                break;
-            }
-        }
-    }
-
-    if (!gid || gid.length == 0) {
-        if (completion) completion(NO, @"(120001)对方拒收且无开放群可@");
-        return;
-    }
-
-    Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-    id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
-    SEL createAtSel = NSSelectorFromString(@"createTextAtMessage:atUserList:");
-    if ([manager respondsToSelector:createAtSel]) {
-        NSString *atText = [NSString stringWithFormat:@"@%@ %@", item.name ?: item.targetId, text];
-        NSMutableArray *atList = [NSMutableArray arrayWithObject:item.targetId];
-        id atMsg = ((id (*)(id, SEL, NSString *, NSArray *))objc_msgSend)(manager, createAtSel, atText, atList);
-
-        ACContactItem *grpTarget = [[ACContactItem alloc] init];
-        grpTarget.targetId = gid;
-        grpTarget.sourceType = 2;
-
-        [self rawSendV2Message:atMsg toItem:grpTarget completion:^(BOOL ok, int code, NSString *desc) {
-            if (ok) {
-                if (completion) completion(YES, @"已在开放群中@TA提醒");
-            } else {
-                if (completion) completion(NO, @"(120001)私信受限且群内发送失败");
-            }
-        }];
-        return;
-    }
-    if (completion) completion(NO, @"(120001)私信受限");
-}
-
 - (void)sendMessageWithText:(NSString *)text
                       image:(UIImage *)image
                      toItem:(ACContactItem *)item
@@ -966,7 +940,6 @@ static NSString *__currentChatPeerId = nil;
         }
     }
 
-    // 核心：对发送的文本应用防封号混淆包装
     NSString *obfuscatedText = [self obfuscateMessageText:text];
     id v2TextMsg = nil;
     if (obfuscatedText.length > 0) {
@@ -1005,10 +978,8 @@ static NSString *__currentChatPeerId = nil;
                                 if (ok2) {
                                     if (completion) completion(YES, @"破盾成功");
                                 } else {
-                                    // 自动检查是否为禁言群，如果是禁言群则放弃 @，只走加好友申请
-                                    [self fallbackSendGroupAtMessage:(obfuscatedText.length > 0 ? obfuscatedText : @"你好")
-                                                           forMember:item
-                                                          completion:completion];
+                                    // 隐私受限时，直接转为自动发送好友申请，不再在禁言群或公屏发送任何 @ 提醒
+                                    if (completion) completion(NO, @"(120001)已自动发送好友申请");
                                 }
                             }];
                         });
