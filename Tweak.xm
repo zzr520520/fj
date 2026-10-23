@@ -708,7 +708,7 @@ static NSString *__currentChatPeerId = nil;
 // 定向采集指定群
 - (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
                         progress:(void(^)(NSString *progressMsg))progressBlock
-                      completion:(void(^)(String *finalMsg))completion {
+                      completion:(void(^)(NSString *finalMsg))completion {
     [self setupIMGroupWelcomeListener];
     [self scanLocalDatabases];
 
@@ -1384,14 +1384,14 @@ static NSString *__currentChatPeerId = nil;
     [self.view endEditing:YES];
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = @[(NSString *)kUTTypeImage, (NSString *)kUTTypeMovie];
+    picker.mediaTypes = @[@"public.image", @"public.movie"];
     picker.delegate = self;
     [self presentViewController:picker animated:YES completion:nil];
 }
 
 - (void)imagePickerController:(UIImagePickerController * _Nonnull)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> * _Nonnull)info {
     NSString *mediaType = info[UIImagePickerControllerMediaType];
-    if ([mediaType isEqualToString:(NSString *)kUTTypeImage]) {
+    if ([mediaType isEqualToString:@"public.image"]) {
         UIImage *img = info[UIImagePickerControllerOriginalImage];
         if (img) {
             self.selectedImage = img;
@@ -1401,7 +1401,7 @@ static NSString *__currentChatPeerId = nil;
             self.clearImageBtn.hidden = NO;
             [self savePersistentMediaToDisk];
         }
-    } else if ([mediaType isEqualToString:(NSString *)kUTTypeMovie]) {
+    } else if ([mediaType isEqualToString:@"public.movie"]) {
         NSURL *vidUrl = info[UIImagePickerControllerMediaURL];
         if (vidUrl) {
             self.selectedVideoURL = vidUrl;
@@ -1752,7 +1752,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
 
 %hook NSURLSession
 
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest * _Nonnull)request completionHandler:(void (^ _Nonnull)(NSData * _Nullable, NSURLResponse * _Nullable, NSError * _Nullable))completionHandler {
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     NSString *urlStr = request.URL.absoluteString;
     if ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] || [urlStr containsString:@"validate"]) {
         void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {

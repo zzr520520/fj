@@ -17,6 +17,113 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Normalize source filename
+        run: |
+          # Makefile 固定引用 Tweak.xm；上传的源文件可能叫别的名字或后缀（.m/.mm/.x）。
+          # 这里统一改名为 Tweak.xm（Logos 对纯 ObjC 文件也兼容）。
+          echo "--- before ---"
+          ls -la
+          shopt -s nullglob
+          target=""
+          for f in Tweak.xm tweak.xm *.xm *.x *.mm *.m; do
+            if [ -f "$f" ]; then target="$f"; break; fi
+          done
+          if [ -n "$target" ] && [ "$target" != "Tweak.xm" ]; then
+            mv -- "$target" Tweak.xm
+            echo "renamed '$target' -> 'Tweak.xm'"
+          fi
+          echo "--- after ---"
+          ls -la Tweak.xm
+
+      - name: Fix Swift 'String' type leaks
+        run: |
+          # 混入 Swift 类型名 String 会报 unknown type name 'String'，统一改成 NSString。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(r'(?<![A-Za-z_])String(?=[ \t]*\*)', 'NSString', s)
+          if n:
+              p.write_text(new)
+          print("fixed", n, "Swift String type leak(s)")
+          PY
+
+      - name: Fix kUTType constants
+        run: |
+          # 新版 iOS SDK 里 kUTType* 常量可能已不可用，统一替换为等价的 UTI 字符串。
+          python3 - <<'PY'
+          import re, pathlib
+          uti = {
+              "kUTTypeItem": "public.item", "kUTTypeContent": "public.content",
+              "kUTTypeData": "public.data", "kUTTypeDirectory": "public.directory",
+              "kUTTypeFolder": "public.folder", "kUTTypeImage": "public.image",
+              "kUTTypeMovie": "public.movie", "kUTTypeVideo": "public.video",
+              "kUTTypeAudio": "public.audio", "kUTTypeText": "public.text",
+              "kUTTypePlainText": "public.plain-text", "kUTTypeUTF8PlainText": "public.utf8-plain-text",
+              "kUTTypeHTML": "public.html", "kUTTypeXML": "public.xml", "kUTTypeJSON": "public.json",
+              "kUTTypeURL": "public.url", "kUTTypeFileURL": "public.file-url",
+              "kUTTypePDF": "com.adobe.pdf", "kUTTypeJPEG": "public.jpeg",
+              "kUTTypePNG": "public.png", "kUTTypeGIF": "com.compuserve.gif",
+              "kUTTypeRTF": "public.rtf", "kUTTypeMPEG4": "public.mpeg-4",
+              "kUTTypeQuickTimeMovie": "com.apple.quicktime-movie",
+          }
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          count = 0
+          # 先处理 "(NSString *)kUTTypeXxx" 这种带转换的写法
+          for name in sorted(uti, key=len, reverse=True):
+              s, n1 = re.subn(r'\(\s*NSString\s*\*+\s*\)\s*%s\b' % name, '"%s"' % uti[name], s)
+              s, n2 = re.subn(r'\b%s\b' % name, '"%s"' % uti[name], s)
+              count += n1 + n2
+          if count:
+              p.write_text(s)
+          print("replaced", count, "kUTType constant(s)")
+          PY
+
+      - name: Strip block nullability annotations in hook signatures
+        run: |
+          # Logos 解析不了块参数类型里紧跟 ^ 的 _Nonnull/_Nullable，
+          # 会导致参数名丢失并报 "use of undeclared identifier <param>"，删掉这些标注即可。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(r'(\^)\s*_(?:Nonnull|Nullable|Null_unspecified)\b', r'\1', s)
+          if n:
+              p.write_text(new)
+          print("stripped", n, "nullability annotation(s) after '^'")
+          PY
+
+      - name: Fix void* to function pointer casts
+        run: |
+          # "X = (void *)method_getImplementation(...)" 在 ObjC++ 下是错误，
+          # 改成目标变量自身的类型转换（幂等）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(r'([A-Za-z_]\w*)\s*=\s*\(void \*\)method_getImplementation\(',
+                           r'\1 = (__typeof__(\1))method_getImplementation(', s)
+          if n:
+              p.write_text(new)
+          print("rewrote", n)
+          PY
+
+      - name: Fix __bridge void* to typed C pointer casts
+        run: |
+          # ARC 下 "uint8_t *base = (__bridge void *)obj;" 需显式补上目标类型转换（幂等）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(
+              r'(?m)^([ \t]*)([A-Za-z_]\w*(?:[ \t]*\*)+)[ \t]*([A-Za-z_]\w*)[ \t]*=[ \t]*\(__bridge void \*\)',
+              r'\1\2\3 = (\2)(__bridge void *)', s)
+          if n:
+              p.write_text(new)
+          print("fixed", n, "bridge-void cast(s)")
+          PY
+
       - name: Install Theos and iOS SDK
         run: |
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
