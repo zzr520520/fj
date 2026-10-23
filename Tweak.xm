@@ -51,7 +51,7 @@ static NSString *__pendingForwardText = nil;
 static UIImage *__pendingForwardImage = nil;
 static NSString *__currentChatPeerId = nil;
 
-#pragma mark - 2. 核心管理器（防封混淆 + 破盾发送）
+#pragma mark - 2. 核心管理器（防封混淆 + 破盾发送 + 换绑突破）
 
 @interface ACForwardHelperManager : NSObject
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *friendList;
@@ -779,13 +779,12 @@ static NSString *__currentChatPeerId = nil;
 
 - (NSString *)obfuscateMessageText:(NSString *)originalText {
     if (!originalText || originalText.length == 0) return originalText;
-    // 随机追加无害的日常符号尾缀，防止每条消息 MD5 完全相同触发关键词封号
     NSArray *tails = @[@"~", @" ✨", @" 👍", @" (咨询)", @" 😊", @" 收到~", @" 💡"];
     NSString *randomTail = tails[arc4random_uniform((uint32_t)tails.count)];
     return [originalText stringByAppendingString:randomTail];
 }
 
-#pragma mark - 4. 破盾发送引擎（后端接口破盾，绝不在禁言群@）
+#pragma mark - 4. 破盾发送引擎（后端接口破盾，绝不进行群@）
 
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
     if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
@@ -978,7 +977,6 @@ static NSString *__currentChatPeerId = nil;
                                 if (ok2) {
                                     if (completion) completion(YES, @"破盾成功");
                                 } else {
-                                    // 隐私受限时，直接转为自动发送好友申请，不再在禁言群或公屏发送任何 @ 提醒
                                     if (completion) completion(NO, @"(120001)已自动发送好友申请");
                                 }
                             }];
@@ -1486,7 +1484,6 @@ static NSString *__currentChatPeerId = nil;
             if (ok) okCount++;
             else { failCount++; lastFail = detail ?: @""; }
             idx++;
-            // 随机真人化延迟：0.5 ~ 1.2 秒
             NSTimeInterval randDelay = 0.5 + (arc4random_uniform(70) / 100.0);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nextStep();
@@ -1576,7 +1573,24 @@ static void ACPresentForwardAssistantFromTopVC(void) {
     [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-#pragma mark - 6. 全局钩子与强发
+#pragma mark - 6. 突破换绑手机号限制 & 全局拦截
+
+%hook NSURLSession
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    NSString *urlStr = request.URL.absoluteString;
+    if ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] || [urlStr containsString:@"validate"]) {
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSDictionary *successDict = @{@"code": @200, @"msg": @"操作成功", @"data": @YES};
+            NSData *newData = [NSJSONSerialization dataWithJSONObject:successDict options:0 error:nil];
+            completionHandler(newData, response, error);
+        };
+        return %orig(request, wrappedHandler);
+    }
+    return %orig;
+}
+
+%end
 
 %hook NSMutableURLRequest
 
