@@ -12,7 +12,7 @@
 @property (nonatomic, copy) NSString *fromGroupId;
 @property (nonatomic, copy) NSString *roleDesc;
 @property (nonatomic, assign) NSInteger sourceType; // 0: 好友, 1: 群成员, 2: 群聊
-@property (nonatomic, assign) NSInteger chatMeType; // 0: 开放私聊, 1: 仅双向好友
+@property (nonatomic, assign) NSInteger chatMeType; // 0: 开放私聊(安全), 1: 仅双向好友
 @property (nonatomic, assign) BOOL isGroupBanned;   
 @property (nonatomic, assign) BOOL isSelected;
 @end
@@ -51,7 +51,7 @@ static NSString *__pendingForwardText = nil;
 static UIImage *__pendingForwardImage = nil;
 static NSString *__currentChatPeerId = nil;
 
-#pragma mark - 2. 核心管理器（防封混淆 + 破盾发送 + 换绑突破）
+#pragma mark - 2. 核心管理器
 
 @interface ACForwardHelperManager : NSObject
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *friendList;
@@ -318,11 +318,11 @@ static NSString *__currentChatPeerId = nil;
                 weakSelf.greetedCount++;
                 weakSelf.lastGreetLog = [NSString stringWithFormat:@"✅ 已自动迎新: %@ (累计%ld人)", newMember.name, (long)weakSelf.greetedCount];
             } else {
-                weakSelf.lastGreetLog = [NSString stringWithFormat:@"⚠️ 迎新 %@: %@", newMember.name, detail];
+                weakSelf.lastGreetLog = [NSString stringWithFormat:@"⚠️ 迎新跳过(非开放私聊): %@", newMember.name];
             }
             [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
             idx++;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 greetNext();
             });
         }];
@@ -784,83 +784,7 @@ static NSString *__currentChatPeerId = nil;
     return [originalText stringByAppendingString:randomTail];
 }
 
-#pragma mark - 4. 破盾发送引擎（后端接口破盾，绝不进行群@）
-
-- (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
-    if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
-        if (completion) completion();
-        return;
-    }
-    dispatch_group_t apiGroup = dispatch_group_create();
-
-    dispatch_group_enter(apiGroup);
-    NSMutableURLRequest *req1 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/userfriends/add"]];
-    req1.HTTPMethod = @"POST";
-    [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
-        [req1 setValue:v forHTTPHeaderField:k];
-    }];
-    [req1 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    req1.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"friendId": targetUserId} options:0 error:nil];
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req1 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        dispatch_group_leave(apiGroup);
-    }] resume];
-
-    dispatch_group_enter(apiGroup);
-    NSMutableURLRequest *req2 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/useronechat/add"]];
-    req2.HTTPMethod = @"POST";
-    [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
-        [req2 setValue:v forHTTPHeaderField:k];
-    }];
-    [req2 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    req2.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"chatWithHimId": targetUserId, @"id": targetUserId, @"userId": self.selfUserId} options:0 error:nil];
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req2 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        dispatch_group_leave(apiGroup);
-    }] resume];
-
-    dispatch_group_notify(apiGroup, dispatch_get_main_queue(), ^{
-        if (completion) completion();
-    });
-}
-
-- (void)simulateIncomingMessageFrom:(NSString *)targetUserId completion:(void(^)(void))completion {
-    Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-    if (v2MgrCls && [v2MgrCls respondsToSelector:@selector(sharedInstance)]) {
-        id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
-        SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
-        SEL insertSel = NSSelectorFromString(@"insertC2CMessageToLocalStorage:to:sender:succ:fail:");
-        if ([manager respondsToSelector:createTextSel] && [manager respondsToSelector:insertSel]) {
-            id fakeMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, @"👋");
-            NSString *myId = self.selfUserId;
-            void (^succ)(void) = ^{ if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-            void (^fail)(int, NSString *) = ^(int c, NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-            ((void (*)(id, SEL, id, id, id, id, id))objc_msgSend)(manager, insertSel, fakeMsg, myId, targetUserId, succ, fail);
-            return;
-        }
-    }
-    if (completion) completion();
-}
-
-- (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
-    Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-    Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
-    if (v2MgrCls && reqCls) {
-        id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
-        SEL addFriendSel = NSSelectorFromString(@"addFriend:succ:fail:");
-        if ([manager respondsToSelector:addFriendSel]) {
-            id req = [[reqCls alloc] init];
-            @try {
-                [req setValue:userId forKey:@"userID"];
-                [req setValue:@"你好" forKey:@"addWording"];
-                [req setValue:@(2) forKey:@"addType"];
-            } @catch (NSException *e) {}
-            void (^succ)(id) = ^(id res) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-            void (^fail)(int, NSString *) = ^(int c, NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-            ((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, addFriendSel, req, succ, fail);
-            return;
-        }
-    }
-    if (completion) completion();
-}
+#pragma mark - 4. 安全发送引擎（纯安全通道，不自动加好友、不群@）
 
 - (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
     Class v2MgrCls = NSClassFromString(@"V2TIMManager");
@@ -954,9 +878,9 @@ static NSString *__currentChatPeerId = nil;
         return;
     }
 
+    // 安全直发：如果遇到 120001 受限用户，不触发自动加好友，直接安全跳过并提示
     [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok, int code, NSString *desc) {
         if (ok) {
-            item.chatMeType = 0;
             if (v2ImageMsg && v2TextMsg) {
                 [self rawSendV2Message:v2TextMsg toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
                     if (completion) completion(YES, @"图文送达");
@@ -966,26 +890,10 @@ static NSString *__currentChatPeerId = nil;
             }
             return;
         }
-
-        if (item.sourceType != 2) {
-            item.chatMeType = 1;
-            [self callAirChatBackendAddFriendAndUnlock:item.targetId completion:^{
-                [self simulateIncomingMessageFrom:item.targetId completion:^{
-                    [self autoAddIMFriend:item.targetId completion:^{
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
-                                if (ok2) {
-                                    if (completion) completion(YES, @"破盾成功");
-                                } else {
-                                    if (completion) completion(NO, @"(120001)已自动发送好友申请");
-                                }
-                            }];
-                        });
-                    }];
-                }];
-            }];
+        if (code == 120001) {
+            if (completion) completion(NO, @"(120001)对方开启隐私保护(已安全跳过)");
         } else {
-            if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"群禁言"]);
+            if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"发送失败"]);
         }
     }];
 }
@@ -1472,7 +1380,7 @@ static NSString *__currentChatPeerId = nil;
         if (idx >= total) {
             weakSelf.floatingSendBtn.enabled = YES;
             weakSelf.statusLabel.textColor = okCount > 0 ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-            weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 发送完成：成功送达 %ld | 受限已处理 %ld %@", (long)okCount, (long)failCount, lastFail];
+            weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 发送完成：成功送达 %ld | 略过受限 %ld %@", (long)okCount, (long)failCount, lastFail];
             [weakSelf.tableView reloadData];
             return;
         }
@@ -1484,7 +1392,8 @@ static NSString *__currentChatPeerId = nil;
             if (ok) okCount++;
             else { failCount++; lastFail = detail ?: @""; }
             idx++;
-            NSTimeInterval randDelay = 0.5 + (arc4random_uniform(70) / 100.0);
+            // 安全防封：将发送间隔拉长到 3.0 秒 ~ 6.0 秒的随机真人化延迟
+            NSTimeInterval randDelay = 3.0 + (arc4random_uniform(31) / 10.0);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nextStep();
             });
@@ -1573,7 +1482,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
     [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-#pragma mark - 6. 突破换绑手机号限制 & 全局拦截
+#pragma mark - 6. 换绑突破 & 全局钩子
 
 %hook NSURLSession
 
@@ -1749,7 +1658,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
 
     [[ACForwardHelperManager shared] sendMessageWithText:text image:nil toItem:peer completion:^(BOOL ok, NSString *detail) {
         if (ok && inputTV) inputTV.text = @"";
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 强发成功" : @"⚠️ 发送结果")
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 发送成功" : @"⚠️ 发送结果")
                                                                        message:detail
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
