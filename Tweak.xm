@@ -51,7 +51,7 @@ static __weak UIView *__lastLongPressedView = nil;
 static NSString *__pendingForwardText = nil;
 static NSString *__currentChatPeerId = nil;
 
-#pragma mark - 2. 核心管理器（永久保存图片/视频 + 8~15秒迎新 + 指定群采集 + 清除缓存）
+#pragma mark - 2. 核心管理器
 
 @interface ACForwardHelperManager : NSObject
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *friendList;
@@ -68,10 +68,10 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, strong) NSData *capturedCloudCustomData;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *latestHTTPHeaders;
 
-// --- 永久保存的媒体（图片或视频，迎新与群发通用，不掉图） ---
-@property (nonatomic, assign) NSInteger savedMediaType; // 0: 无媒体, 1: 图片, 2: 视频
-@property (nonatomic, strong) UIImage *savedImage;      // 永久保存的图片或视频封面
-@property (nonatomic, assign) int savedVideoDuration;   // 视频时长（秒）
+// --- 永久保存的媒体 ---
+@property (nonatomic, assign) NSInteger savedMediaType; // 0: 无, 1: 图片, 2: 视频
+@property (nonatomic, strong) UIImage *savedImage;
+@property (nonatomic, assign) int savedVideoDuration;
 
 // --- 迎新配置 ---
 @property (nonatomic, assign) BOOL autoWelcomeEnabled;
@@ -134,8 +134,6 @@ static NSString *__currentChatPeerId = nil;
     });
     return instance;
 }
-
-#pragma mark - 2.0 永久保存图片与视频到沙盒（彻底解决掉图与迎新不发图问题）
 
 - (NSString *)permanentImagePath {
     NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -201,7 +199,6 @@ static NSString *__currentChatPeerId = nil;
     }
     if (!copied) return;
 
-    // 提取视频时长与第一帧封面图
     int durationSec = 5;
     UIImage *thumbImg = nil;
     @try {
@@ -346,7 +343,7 @@ static NSString *__currentChatPeerId = nil;
     }
 }
 
-#pragma mark - 2.1 腾讯云 IM 实时监听新人进群（8~15秒防封延迟 + 自动带永久图片/视频迎新）
+#pragma mark - 2.1 腾讯云 IM 实时监听新人进群（8~15秒随机防封间隔）
 
 - (void)setupIMGroupWelcomeListener {
     if (self.listenerRegistered) return;
@@ -450,7 +447,6 @@ static NSString *__currentChatPeerId = nil;
     [self saveLocalPermanentCache];
     if (newTargetsToGreet.count == 0) return;
 
-    // 迎新打招呼：首位新人进群后先等待 8~15 秒再发，后续每位同样间隔 8~15 秒，并自动携带永久保存的图片或视频！
     __block NSInteger idx = 0;
     __weak typeof(self) weakSelf = self;
     __block void (^greetNext)(void) = ^{
@@ -461,17 +457,16 @@ static NSString *__currentChatPeerId = nil;
         NSString *displayNick = (newMember.name && ![newMember.name hasPrefix:@"群友_"]) ? newMember.name : @"新朋友";
         NSString *finalGreeting = [templateText stringByReplacingOccurrencesOfString:@"{name}" withString:displayNick];
 
-        // 直接调用支持【永久图片/永久视频 + 文本】的统一发送方法
         [weakSelf sendCurrentMediaAndText:finalGreeting toItem:newMember completion:^(BOOL ok, NSString *detail) {
             if (ok) {
                 weakSelf.greetedCount++;
-                weakSelf.lastGreetLog = [NSString stringWithFormat:@"✅ 已安全迎新(%@): %@ (共%ld人)", detail, newMember.name, (long)weakSelf.greetedCount];
+                weakSelf.lastGreetLog = [NSString stringWithFormat:@"✅ 已安全迎新: %@ (共%ld人)", newMember.name, (long)weakSelf.greetedCount];
             } else {
                 weakSelf.lastGreetLog = [NSString stringWithFormat:@"⚠️ 迎新 %@: %@", newMember.name, detail];
             }
             [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
             idx++;
-            // 严格按照要求：8.0 ~ 15.0 秒随机延迟
+            // 8.0 ~ 15.0 秒随机延迟
             NSTimeInterval safeRandomDelay = 8.0 + (arc4random_uniform(71) / 10.0);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(safeRandomDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 greetNext();
@@ -479,7 +474,6 @@ static NSString *__currentChatPeerId = nil;
         }];
     };
 
-    // 检测到新人进群后，先延迟 8~15 秒再发出第一条迎新
     NSTimeInterval initialDelay = 8.0 + (arc4random_uniform(71) / 10.0);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(initialDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         greetNext();
@@ -672,7 +666,7 @@ static NSString *__currentChatPeerId = nil;
     }
 }
 
-#pragma mark - 2.3 群成员拉取（支持指定群定向获取）
+#pragma mark - 2.3 群成员拉取
 
 - (void)crawlGroupMembersPageForGroup:(NSString *)gid
                               nextSeq:(uint64_t)seq
@@ -847,7 +841,7 @@ static NSString *__currentChatPeerId = nil;
     [self scanLocalDatabases];
 
     if (!targetGroupIds || targetGroupIds.count == 0) {
-        if (completion) completion(@"❌ 请先在「群聊」面板勾选要采集的指定群聊！");
+        if (completion) completion(@"❌ 请先在「群聊」面板勾选要采集的群！");
         return;
     }
 
@@ -869,7 +863,7 @@ static NSString *__currentChatPeerId = nil;
     dispatch_group_notify(memberCrawlGroup, dispatch_get_main_queue(), ^{
         [self saveLocalPermanentCache];
         [self saveWelcomeSettings];
-        NSString *finalStr = [NSString stringWithFormat:@"✅ 指定群采集完成：当前共有 %lu 个群成员", (unsigned long)self.groupMemberList.count];
+        NSString *finalStr = [NSString stringWithFormat:@"✅ 指定群采集完成：共有 %lu 个群成员", (unsigned long)self.groupMemberList.count];
         if (completion) completion(finalStr);
     });
 }
@@ -954,7 +948,7 @@ static NSString *__currentChatPeerId = nil;
     return [originalText stringByAppendingString:randomTail];
 }
 
-#pragma mark - 4. 支持「永久图片 / 永久视频 / 文本」三合一破盾发送引擎
+#pragma mark - 4. 破盾发送引擎（已移除手掌表情模拟，直接后端加好友加单聊）
 
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
     if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
@@ -990,24 +984,6 @@ static NSString *__currentChatPeerId = nil;
     dispatch_group_notify(apiGroup, dispatch_get_main_queue(), ^{
         if (completion) completion();
     });
-}
-
-- (void)simulateIncomingMessageFrom:(NSString *)targetUserId completion:(void(^)(void))completion {
-    Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-    if (v2MgrCls && [v2MgrCls respondsToSelector:@selector(sharedInstance)]) {
-        id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
-        SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
-        SEL insertSel = NSSelectorFromString(@"insertC2CMessageToLocalStorage:to:sender:succ:fail:");
-        if ([manager respondsToSelector:createTextSel] && [manager respondsToSelector:insertSel]) {
-            id fakeMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, @"👋");
-            NSString *myId = self.selfUserId;
-            void (^succ)(void) = ^{ if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-            void (^fail)(int, NSString *) = ^(int c, NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-            ((void (*)(id, SEL, id, id, id, id, id))objc_msgSend)(manager, insertSel, fakeMsg, myId, targetUserId, succ, fail);
-            return;
-        }
-    }
-    if (completion) completion();
 }
 
 - (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
@@ -1085,7 +1061,6 @@ static NSString *__currentChatPeerId = nil;
     [inv invoke];
 }
 
-// 统一使用沙盒中永久保存的图片/视频 + 文本进行发送（无论是手动群发还是后台迎新，都不会掉图/掉视频）
 - (void)sendCurrentMediaAndText:(NSString *)text
                          toItem:(ACContactItem *)item
                      completion:(void(^)(BOOL ok, NSString *detail))completion {
@@ -1097,7 +1072,6 @@ static NSString *__currentChatPeerId = nil;
     id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // 1. 构造永久媒体消息（图片或视频）
     id v2MediaMsg = nil;
     if (self.savedMediaType == 1 && [fm fileExistsAtPath:[self permanentImagePath]]) {
         SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
@@ -1127,7 +1101,6 @@ static NSString *__currentChatPeerId = nil;
         }
     }
 
-    // 2. 构造文本消息（应用防封尾缀混淆）
     NSString *cleanText = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSString *obfuscatedText = cleanText.length > 0 ? [self obfuscateMessageText:cleanText] : @"";
     id v2TextMsg = nil;
@@ -1147,7 +1120,6 @@ static NSString *__currentChatPeerId = nil;
     [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok, int code, NSString *desc) {
         if (ok) {
             item.chatMeType = 0;
-            // 如果既有图片/视频，又有文字，间隔 0.6 秒把文字也发过去
             if (v2MediaMsg && v2TextMsg) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     [self rawSendV2Message:v2TextMsg toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
@@ -1163,21 +1135,19 @@ static NSString *__currentChatPeerId = nil;
         if (item.sourceType != 2) {
             item.chatMeType = 1;
             [self callAirChatBackendAddFriendAndUnlock:item.targetId completion:^{
-                [self simulateIncomingMessageFrom:item.targetId completion:^{
-                    [self autoAddIMFriend:item.targetId completion:^{
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
-                                if (ok2) {
-                                    if (v2MediaMsg && v2TextMsg) {
-                                        [self rawSendV2Message:v2TextMsg toItem:item completion:nil];
-                                    }
-                                    if (completion) completion(YES, @"破盾成功");
-                                } else {
-                                    if (completion) completion(NO, @"(120001)已自动申请加好友");
+                [self autoAddIMFriend:item.targetId completion:^{
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
+                            if (ok2) {
+                                if (v2MediaMsg && v2TextMsg) {
+                                    [self rawSendV2Message:v2TextMsg toItem:item completion:nil];
                                 }
-                            }];
-                        });
-                    }];
+                                if (completion) completion(YES, @"破盾成功");
+                            } else {
+                                if (completion) completion(NO, @"(120001)已自动申请加好友");
+                            }
+                        }];
+                    });
                 }];
             }];
         } else {
@@ -1188,7 +1158,7 @@ static NSString *__currentChatPeerId = nil;
 
 @end
 
-#pragma mark - 5. 转发与迎新助手弹窗控制器（支持永久选图/选视频、8-15秒迎新、定向采集、清除群成员）
+#pragma mark - 4. 转发助手弹窗控制器
 
 @interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource, UINavigationControllerDelegate, UIImagePickerControllerDelegate, UITextViewDelegate>
 @property (nonatomic, strong) UIView *headerContainer;
@@ -1272,7 +1242,6 @@ static NSString *__currentChatPeerId = nil;
     }
     [self.headerContainer addSubview:self.contentTextView];
 
-    // 右侧永久图片/视频预览框
     self.previewImageView = [[UIImageView alloc] initWithFrame:CGRectMake(width - 16 - imgBoxW, 18, imgBoxW, 84)];
     self.previewImageView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.previewImageView.layer.cornerRadius = 12;
@@ -1373,7 +1342,6 @@ static NSString *__currentChatPeerId = nil;
     [self setupFloatingButton];
 }
 
-// 刷新右上角永久图片/视频预览状态
 - (void)refreshMediaPreviewUI {
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
     if (mgr.savedMediaType == 1 && mgr.savedImage) {
@@ -1446,8 +1414,10 @@ static NSString *__currentChatPeerId = nil;
 }
 
 - (void)textViewDidChange:(UITextView * _Nonnull)textView {
-    [ACForwardHelperManager shared].welcomeMessageText = textView.text;
-    [[ACForwardHelperManager shared] saveWelcomeSettings];
+    if (self.tabControl.selectedSegmentIndex == 3) {
+        [ACForwardHelperManager shared].welcomeMessageText = textView.text;
+        [[ACForwardHelperManager shared] saveWelcomeSettings];
+    }
 }
 
 - (void)welcomeSwitchChanged:(UISwitch * _Nonnull)sw {
@@ -1484,7 +1454,6 @@ static NSString *__currentChatPeerId = nil;
     [self.tableView reloadData];
 }
 
-// 打开系统相册：同时支持选择【图片】和【视频】
 - (void)chooseMediaFromAlbum {
     [self.view endEditing:YES];
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
@@ -1551,18 +1520,18 @@ static NSString *__currentChatPeerId = nil;
     [self.view endEditing:YES];
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
     
-    if (sender.tag == 600) { // 🟢只选必达
+    if (sender.tag == 600) {
         for (ACContactItem *i in [self currentItems]) {
             i.isSelected = (i.chatMeType == 0);
         }
-    } else if (sender.tag == 601) { // 🗑️ 清空群成员缓存
+    } else if (sender.tag == 601) {
         [mgr clearAllGroupMembersCache];
         self.statusLabel.textColor = [UIColor systemOrangeColor];
         self.statusLabel.text = @"🗑️ 已清空本地群成员缓存";
         [self updateUI];
         [self.tableView reloadData];
         return;
-    } else if (sender.tag == 602) { // 🎯 定向采集勾选的群成员
+    } else if (sender.tag == 602) {
         if (self.tabControl.selectedSegmentIndex == 2) {
             NSMutableArray<NSString *> *selectedGids = [NSMutableArray array];
             for (ACContactItem *g in mgr.groupList) {
@@ -1592,7 +1561,7 @@ static NSString *__currentChatPeerId = nil;
             self.statusLabel.text = @"💡 请先切换到【群聊】面板勾选群，再点定向采集！";
             return;
         }
-    } else if (sender.tag == 603) { // 清空已选
+    } else if (sender.tag == 603) {
         for (ACContactItem *i in mgr.friendList) i.isSelected = NO;
         for (ACContactItem *i in mgr.groupMemberList) i.isSelected = NO;
         for (ACContactItem *i in mgr.groupList) i.isSelected = NO;
@@ -1611,7 +1580,7 @@ static NSString *__currentChatPeerId = nil;
     self.floatingSendBtn.hidden = isWelcomeTab;
 
     if (isWelcomeTab) {
-        self.contentTextView.text = mgr.welcomeMessageText ?: @"您好 {name}，欢迎进群！认识一下~";
+        self.contentTextView.text = mgr.welcomeMessageText ?: @"您w好 {name}，欢迎进群！认识一下~";
         NSString *mediaDesc = mgr.savedMediaType == 2 ? @"🎬带视频" : (mgr.savedMediaType == 1 ? @"🖼️带图片" : @"纯文字");
         self.statusLabel.textColor = mgr.autoWelcomeEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
         self.statusLabel.text = [NSString stringWithFormat:@"%@(%@) | 勾选要监听新人的群 (已选%lu个)",
@@ -1747,7 +1716,6 @@ static NSString *__currentChatPeerId = nil;
             if (ok) okCount++;
             else { failCount++; lastFail = detail ?: @""; }
             idx++;
-            // 手动群发同样采用 3.5 ~ 6.5 秒安全随机间隔
             NSTimeInterval randDelay = 3.5 + (arc4random_uniform(31) / 10.0);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 nextStep();
@@ -1763,7 +1731,7 @@ static NSString *__currentChatPeerId = nil;
 
 @end
 
-#pragma mark - 6. 视图树提取工具
+#pragma mark - 5. 视图树提取工具
 
 static UIImage *ACFindLargestImageInView(UIView *view) {
     if (!view || view.hidden || view.alpha < 0.05) return nil;
@@ -1837,21 +1805,99 @@ static void ACPresentForwardAssistantFromTopVC(void) {
     [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-#pragma mark - 7. 换绑突破与全局钩子
+#pragma mark - 6. 核心突破：伪装官方标识 com.flight.airchat + 25年老号高权重 + 解除搜索SVIP限制 + 换绑拦截
+
+%hook NSBundle
+
+- (NSString *)bundleIdentifier {
+    NSString *orig = %orig;
+    if ([orig containsString:@"airchat"] || [orig containsString:@"flight"]) {
+        return @"com.flight.airchat";
+    }
+    return orig;
+}
+
+%end
 
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     NSString *urlStr = request.URL.absoluteString;
+    NSMutableURLRequest *mutableReq = [request mutableCopy];
+
+    if ([urlStr containsString:@"userInfo/op"] && mutableReq.HTTPBody) {
+        NSString *bodyStr = [[NSString alloc] initWithData:mutableReq.HTTPBody encoding:NSUTF8StringEncoding];
+        if (bodyStr && [bodyStr containsString:@"bundleId="]) {
+            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"bundleId=com\\.flight\\.airchat[^ |]+" options:0 error:nil];
+            NSString *cleanBody = [regex stringByReplacingMatchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length) withTemplate:@"bundleId=com.flight.airchat"];
+            mutableReq.HTTPBody = [cleanBody dataUsingEncoding:NSUTF8StringEncoding];
+        }
+    }
+
     if ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] || [urlStr containsString:@"validate"]) {
         void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
             NSDictionary *successDict = @{@"code": @200, @"msg": @"操作成功", @"data": @YES};
             NSData *newData = [NSJSONSerialization dataWithJSONObject:successDict options:0 error:nil];
             completionHandler(newData, response, error);
         };
-        return %orig(request, wrappedHandler);
+        return %orig(mutableReq, wrappedHandler);
     }
-    return %orig;
+
+    // 核心：解除搜索栏及高级搜索的 SVIP 权限限制（无论接口返回什么，直接强制解锁、允许展开完整搜索与扩大搜索范围）
+    if ([urlStr containsString:@"search"] || [urlStr containsString:@"business/landing"] || [urlStr containsString:@"vipLevel"]) {
+        void (^searchUnlockHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (data && !error) {
+                NSMutableDictionary *rootDict = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+                if ([rootDict isKindOfClass:[NSDictionary class]]) {
+                    if ([rootDict[@"data"] isKindOfClass:[NSDictionary class]]) {
+                        NSMutableDictionary *dataDict = [rootDict[@"data"] mutableCopy];
+                        dataDict[@"isVip"] = @YES;
+                        dataDict[@"vipLevel"] = @(9);
+                        dataDict[@"isCurrentUserBusinessMember"] = @YES;
+                        dataDict[@"isTargetUserBusinessMember"] = @YES;
+                        dataDict[@"hasMore"] = @YES;
+                        dataDict[@"limit"] = @(9999);
+                        rootDict[@"data"] = dataDict;
+                    } else if ([rootDict[@"data"] isKindOfClass:[NSArray class]]) {
+                        // 搜索列表直接放行所有结果，不截断
+                    }
+                    rootDict[@"code"] = @200;
+                    NSData *unlockedData = [NSJSONSerialization dataWithJSONObject:rootDict options:0 error:nil];
+                    completionHandler(unlockedData, response, error);
+                    return;
+                }
+            }
+            completionHandler(data, response, error);
+        };
+        return %orig(mutableReq, searchUnlockHandler);
+    }
+
+    // 核心：将新号身份伪装为 2025年注册 + 5280经验 + 18级老号
+    if ([urlStr containsString:@"userinfo/detail"]) {
+        void (^userinfoDetailHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (data && !error) {
+                NSMutableDictionary *rootDict = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+                if ([rootDict isKindOfClass:[NSDictionary class]] && [rootDict[@"data"] isKindOfClass:[NSDictionary class]]) {
+                    NSMutableDictionary *dataDict = [rootDict[@"data"] mutableCopy];
+                    dataDict[@"createTime"] = @"2025-05-18 10:22:30";
+                    dataDict[@"accountLevel"] = @(18);
+                    dataDict[@"experienceValue"] = @(5280.0);
+                    dataDict[@"muted"] = @"0";
+                    dataDict[@"mutedTime"] = [NSNull null];
+                    dataDict[@"disable"] = @"0";
+
+                    rootDict[@"data"] = dataDict;
+                    NSData *spoofedData = [NSJSONSerialization dataWithJSONObject:rootDict options:0 error:nil];
+                    completionHandler(spoofedData, response, error);
+                    return;
+                }
+            }
+            completionHandler(data, response, error);
+        };
+        return %orig(mutableReq, userinfoDetailHandler);
+    }
+
+    return %orig(mutableReq, completionHandler);
 }
 
 %end
@@ -1912,7 +1958,6 @@ static void ACPresentForwardAssistantFromTopVC(void) {
             __lastLongPressedView = cellView;
             UIImage *extractedImg = ACFindLargestImageInView(cellView);
             if (extractedImg) {
-                // 长按图片气泡时，自动将图片永久保存到本地
                 [[ACForwardHelperManager shared] savePermanentImage:extractedImg];
             }
             __pendingForwardText = ACFindChatTextInView(cellView);
