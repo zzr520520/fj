@@ -96,14 +96,15 @@ jobs:
 
       - name: Fix void* to function pointer casts
         run: |
-          # "X = (void *)method_getImplementation(...)" 在 ObjC++ 下是错误，
-          # 改成目标变量自身的类型转换（幂等）。
+          # 形如 "X = (void *)method_getImplementation(...)" 或
+          # "X = (void *)SafeSwizzleInstanceMethod(...)" 在 ObjC++ 下是错误：
+          # void* 不能直接赋给函数指针。此处通用改写为目标变量自身的类型（幂等）。
           python3 - <<'PY'
           import re, pathlib
           p = pathlib.Path("Tweak.xm")
           s = p.read_text()
-          new, n = re.subn(r'([A-Za-z_]\w*)\s*=\s*\(void \*\)method_getImplementation\(',
-                           r'\1 = (__typeof__(\1))method_getImplementation(', s)
+          new, n = re.subn(r'([A-Za-z_]\w*)\s*=\s*\(void \*\)(\w+\()',
+                           r'\1 = (__typeof__(\1))\2', s)
           if n:
               p.write_text(new)
           print("rewrote", n)
@@ -122,6 +123,23 @@ jobs:
           if n:
               p.write_text(new)
           print("fixed", n, "bridge-void cast(s)")
+          PY
+
+      - name: Fix ARC strong/unsafe_unretained pointer casts
+        run: |
+          # ARC 下 "*(id __unsafe_unretained *)(uint8_t *...)" 或 "*(id __strong *)(...)"
+          # 会报 "cast of a non-Objective-C pointer type 'uint8_t *' to '... id *' is
+          #  disallowed with ARC"。在转换前插入中间 (void *) 转换即可合法（幂等）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+          new, n = re.subn(
+              r'\(\s*([A-Za-z_]\w*(?:\s*\*)?)\s*__(strong|unsafe_unretained)\s*\*\)\s*(?!\(void \*\))\((?!(?:void|id|NSString|NSObject|Class)\b)',
+              r'(\1 __\2 *)(void *)(', s)
+          if n:
+              p.write_text(new)
+          print("wrapped", n, "ARC pointer cast(s)")
           PY
 
       - name: Install Theos and iOS SDK
