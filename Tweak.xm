@@ -47,6 +47,39 @@
 
 @end
 
+// 定时发动态任务模型
+@interface ACPostTask : NSObject <NSCoding>
+@property (nonatomic, copy) NSString *taskName;
+@property (nonatomic, copy) NSString *content;
+@property (nonatomic, assign) NSInteger intervalSeconds;
+@property (nonatomic, assign) BOOL enabled;
+@property (nonatomic, assign) NSTimeInterval lastExecutedTime;
+@end
+
+@implementation ACPostTask
+
+- (void)encodeWithCoder:(NSCoder *)coder {
+    [coder encodeObject:self.taskName ?: @"" forKey:@"taskName"];
+    [coder encodeObject:self.content ?: @"" forKey:@"content"];
+    [coder encodeInteger:self.intervalSeconds forKey:@"intervalSeconds"];
+    [coder encodeBool:self.enabled forKey:@"enabled"];
+    [coder encodeDouble:self.lastExecutedTime forKey:@"lastExecutedTime"];
+}
+
+- (instancetype)initWithCoder:(NSCoder *)coder {
+    self = [super init];
+    if (self) {
+        self.taskName = [coder decodeObjectForKey:@"taskName"];
+        self.content = [coder decodeObjectForKey:@"content"];
+        self.intervalSeconds = [coder decodeIntegerForKey:@"intervalSeconds"];
+        self.enabled = [coder decodeBoolForKey:@"enabled"];
+        self.lastExecutedTime = [coder decodeDoubleForKey:@"lastExecutedTime"];
+    }
+    return self;
+}
+
+@end
+
 static __weak UIView *__lastLongPressedView = nil;
 static NSString *__pendingForwardText = nil;
 static NSString *__currentChatPeerId = nil;
@@ -82,6 +115,18 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, copy) NSString *lastGreetLog;
 @property (nonatomic, assign) BOOL listenerRegistered;
 
+// --- 1. 自动回复配置 ---
+@property (nonatomic, assign) BOOL autoReplyEnabled;
+@property (nonatomic, copy) NSString *autoReplyText;
+@property (nonatomic, strong) NSMutableSet<NSString *> *repliedMsgIds;
+
+// --- 2. 多任务定时发动态配置 ---
+@property (nonatomic, assign) BOOL autoPostEnabled;
+@property (nonatomic, strong) NSMutableArray<ACPostTask *> *postTasks;
+
+// --- 3. 全局后台调度器与保活定时器 ---
+@property (nonatomic, strong) NSTimer *globalSchedulerTimer;
+
 + (instancetype)shared;
 - (NSString *)permanentImagePath;
 - (NSString *)permanentVideoPath;
@@ -95,6 +140,10 @@ static NSString *__currentChatPeerId = nil;
 - (void)saveLocalPermanentCache;
 - (void)clearAllGroupMembersCache;
 - (void)saveWelcomeSettings;
+- (void)saveAutoReplyAndPostSettings;
+- (void)loadAutoReplyAndPostSettings;
+- (void)publishDynamicWithContent:(NSString *)content completion:(void(^)(BOOL ok, NSString *msg))completion;
+
 - (void)parseJSONWithContext:(id)jsonObj;
 - (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
                         progress:(void(^)(NSString *progressMsg))progressBlock
@@ -126,14 +175,97 @@ static NSString *__currentChatPeerId = nil;
 
         instance.welcomeGroupIds = [NSMutableSet set];
         instance.greetedUserIds = [NSMutableSet set];
-        instance.lastGreetLog = @"等待新人进群...";
+        instance.repliedMsgIds = [NSMutableSet set];
+        instance.postTasks = [NSMutableArray array];
+        instance.lastGreetLog = @"等待系统调度...";
 
         [instance loadLocalPermanentCache];
         [instance loadWelcomeSettings];
+        [instance loadAutoReplyAndPostSettings];
         [instance loadPermanentMediaFromDisk];
+        [instance startGlobalSchedulerTimer];
     });
     return instance;
 }
+
+#pragma mark - 2.0 全局后台定时任务调度器 (在线保活心跳 + 多任务定时发动态)
+
+- (void)startGlobalSchedulerTimer {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.globalSchedulerTimer) return;
+        self.globalSchedulerTimer = [NSTimer scheduledTimerWithTimeInterval:10.0 target:self selector:@selector(onSchedulerTick) userInfo:nil repeats:YES];
+        [[NSRunLoop currentRunLoop] addTimer:self.globalSchedulerTimer forMode:NSRunLoopCommonModes];
+    });
+}
+
+- (void)onSchedulerTick {
+    // 1. 在线心跳保活请求
+    [self updateOnlineTimeHeartbeat];
+    
+    // 2. 检查并执行多任务定时发动态
+    [self checkAndExecutePostTasks];
+}
+
+- (void)updateOnlineTimeHeartbeat {
+    if (!self.latestHTTPHeaders[@"token"]) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/clientuser/updateOnlineTime"]];
+    req.HTTPMethod = @"GET";
+    [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+        [req setValue:v forHTTPHeaderField:k];
+    }];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:nil] resume];
+}
+
+- (void)publishDynamicWithContent:(NSString *)content completion:(void(^)(BOOL ok, NSString *msg))completion {
+    if (!content || content.length == 0 || !self.latestHTTPHeaders[@"token"]) {
+        if (completion) completion(NO, @"Token或发布内容为空");
+        return;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/airchat/c/post/publish"]];
+    req.HTTPMethod = @"POST";
+    [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+        [req setValue:v forHTTPHeaderField:k];
+    }];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    NSDictionary *body = @{@"content": content, @"mediaUrls": @[], @"type": @0};
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (!e && d) {
+            NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+            if ([dict[@"code"] integerValue] == 200) {
+                if (completion) completion(YES, @"动态发布成功");
+                return;
+            }
+        }
+        if (completion) completion(NO, e.localizedDescription ?: @"发布失败");
+    }] resume];
+}
+
+- (void)checkAndExecutePostTasks {
+    if (!self.autoPostEnabled) return;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    @synchronized (self.postTasks) {
+        for (ACPostTask *task in self.postTasks) {
+            if (task.enabled && task.content.length > 0 && task.intervalSeconds > 0) {
+                if (now - task.lastExecutedTime >= task.intervalSeconds) {
+                    task.lastExecutedTime = now;
+                    [self saveAutoReplyAndPostSettings];
+                    [self publishDynamicWithContent:task.content completion:^(BOOL ok, NSString *msg) {
+                        if (ok) {
+                            self.lastGreetLog = [NSString stringWithFormat:@"📢 [定时动态] 成功发布: %@", task.taskName];
+                        } else {
+                            self.lastGreetLog = [NSString stringWithFormat:@"⚠️ [定时动态] 发布失败(%@): %@", task.taskName, msg];
+                        }
+                        [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+                    }];
+                }
+            }
+        }
+    }
+}
+
+#pragma mark - 2.1 媒体与缓存持久化
 
 - (NSString *)permanentImagePath {
     NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -294,6 +426,56 @@ static NSString *__currentChatPeerId = nil;
     }
 }
 
+- (void)saveAutoReplyAndPostSettings {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setBool:self.autoReplyEnabled forKey:@"AC_AutoReply_Enabled"];
+    [ud setObject:self.autoReplyText ?: @"您好！我现在正在忙，看到消息后会第一时间回复您~" forKey:@"AC_AutoReply_Text"];
+    [ud setBool:self.autoPostEnabled forKey:@"AC_AutoPost_Enabled"];
+
+    @try {
+        NSData *tasksData = [NSKeyedArchiver archivedDataWithRootObject:[self.postTasks copy] requiringSecureCoding:NO error:nil];
+        if (tasksData) [ud setObject:tasksData forKey:@"AC_PostTasks_Data"];
+    } @catch (NSException *e) {}
+
+    [ud synchronize];
+}
+
+- (void)loadAutoReplyAndPostSettings {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    self.autoReplyEnabled = [ud boolForKey:@"AC_AutoReply_Enabled"];
+    NSString *replyTxt = [ud stringForKey:@"AC_AutoReply_Text"];
+    self.autoReplyText = (replyTxt && replyTxt.length > 0) ? replyTxt : @"您好！我现在正在忙，看到消息后会第一时间回复您~";
+    self.autoPostEnabled = [ud boolForKey:@"AC_AutoPost_Enabled"];
+
+    NSData *tasksData = [ud objectForKey:@"AC_PostTasks_Data"];
+    if (tasksData) {
+        @try {
+            NSArray *arr = [NSKeyedUnarchiver unarchiveObjectWithData:tasksData];
+            if ([arr isKindOfClass:[NSArray class]]) {
+                [self.postTasks addObjectsFromArray:arr];
+            }
+        } @catch (NSException *e) {}
+    }
+
+    if (self.postTasks.count == 0) {
+        ACPostTask *t1 = [[ACPostTask alloc] init];
+        t1.taskName = @"任务1-早间动态";
+        t1.content = @"大家早上好！新的一天加油！";
+        t1.intervalSeconds = 3600;
+        t1.enabled = YES;
+
+        ACPostTask *t2 = [[ACPostTask alloc] init];
+        t2.taskName = @"任务2-日常业务推广";
+        t2.content = @"专业业务对接，欢迎私信咨询！";
+        t2.intervalSeconds = 7200;
+        t2.enabled = YES;
+
+        [self.postTasks addObject:t1];
+        [self.postTasks addObject:t2];
+        [self saveAutoReplyAndPostSettings];
+    }
+}
+
 - (void)saveLocalPermanentCache {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         @synchronized (self) {
@@ -343,7 +525,7 @@ static NSString *__currentChatPeerId = nil;
     }
 }
 
-#pragma mark - 2.1 腾讯云 IM 实时监听新人进群（8~15秒随机防封间隔）
+#pragma mark - 2.2 腾讯云 IM 实时监听（迎新 + 自动回复私信）
 
 - (void)setupIMGroupWelcomeListener {
     if (self.listenerRegistered) return;
@@ -386,23 +568,50 @@ static NSString *__currentChatPeerId = nil;
         }
 
         NSString *groupID = [msg valueForKey:@"groupID"];
-        if (!groupID || ![groupID isKindOfClass:[NSString class]] || groupID.length == 0) return;
-
         NSString *sender = [msg valueForKey:@"sender"];
-        NSString *nickName = [msg valueForKey:@"nickName"] ?: [msg valueForKey:@"nameCard"];
-        if (sender && sender.length > 0) {
-            if ([self addGroupMemberWithId:sender name:nickName groupId:groupID role:@"群活跃" chatMeType:0]) {
-                [self saveLocalPermanentCache];
+        NSString *msgId = [msg valueForKey:@"msgID"] ?: [msg valueForKey:@"id"];
+
+        // 核心新增：私信自动回复机制
+        BOOL isC2C = (!groupID || ![groupID isKindOfClass:[NSString class]] || groupID.length == 0);
+        if (isC2C && sender && sender.length > 0 && ![sender isEqualToString:self.selfUserId]) {
+            if (self.autoReplyEnabled && self.autoReplyText.length > 0) {
+                if (msgId && ![self.repliedMsgIds containsObject:msgId]) {
+                    [self.repliedMsgIds addObject:msgId];
+                    ACContactItem *item = self.friendMap[sender] ?: self.groupMemberMap[sender];
+                    if (!item) {
+                        item = [[ACContactItem alloc] init];
+                        item.targetId = sender;
+                        item.name = sender;
+                        item.sourceType = 0;
+                    }
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        [self sendCurrentMediaAndText:self.autoReplyText toItem:item completion:^(BOOL ok, NSString *detail) {
+                            if (ok) {
+                                self.lastGreetLog = [NSString stringWithFormat:@"💬 已自动回复私信给: %@", item.name];
+                                [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+                            }
+                        }];
+                    });
+                }
             }
         }
 
-        id tipsElem = [msg valueForKey:@"groupTipsElem"];
-        if (tipsElem) {
-            NSInteger tipsType = [[tipsElem valueForKey:@"type"] integerValue];
-            if (tipsType == 1 || tipsType == 2) {
-                NSArray *memberList = [tipsElem valueForKey:@"memberList"];
-                if ([memberList isKindOfClass:[NSArray class]] && memberList.count > 0) {
-                    [self handleNewMembersJoinedGroup:groupID memberList:memberList];
+        if (!isC2C) {
+            NSString *nickName = [msg valueForKey:@"nickName"] ?: [msg valueForKey:@"nameCard"];
+            if (sender && sender.length > 0) {
+                if ([self addGroupMemberWithId:sender name:nickName groupId:groupID role:@"群活跃" chatMeType:0]) {
+                    [self saveLocalPermanentCache];
+                }
+            }
+
+            id tipsElem = [msg valueForKey:@"groupTipsElem"];
+            if (tipsElem) {
+                NSInteger tipsType = [[tipsElem valueForKey:@"type"] integerValue];
+                if (tipsType == 1 || tipsType == 2) {
+                    NSArray *memberList = [tipsElem valueForKey:@"memberList"];
+                    if ([memberList isKindOfClass:[NSArray class]] && memberList.count > 0) {
+                        [self handleNewMembersJoinedGroup:groupID memberList:memberList];
+                    }
                 }
             }
         }
@@ -466,7 +675,6 @@ static NSString *__currentChatPeerId = nil;
             }
             [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
             idx++;
-            // 8.0 ~ 15.0 秒随机延迟
             NSTimeInterval safeRandomDelay = 8.0 + (arc4random_uniform(71) / 10.0);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(safeRandomDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 greetNext();
@@ -480,7 +688,7 @@ static NSString *__currentChatPeerId = nil;
     });
 }
 
-#pragma mark - 2.2 联系人与群成员管理
+#pragma mark - 2.3 联系人与群成员管理
 
 - (void)addFriendWithId:(NSString *)uid name:(NSString *)name tag:(NSString *)tag chatMeType:(NSInteger)chatMeType {
     if (!uid) return;
@@ -666,7 +874,7 @@ static NSString *__currentChatPeerId = nil;
     }
 }
 
-#pragma mark - 2.3 群成员拉取
+#pragma mark - 2.4 群成员拉取
 
 - (void)crawlGroupMembersPageForGroup:(NSString *)gid
                               nextSeq:(uint64_t)seq
@@ -948,7 +1156,7 @@ static NSString *__currentChatPeerId = nil;
     return [originalText stringByAppendingString:randomTail];
 }
 
-#pragma mark - 4. 破盾发送引擎（已移除手掌表情模拟，直接后端加好友加单聊）
+#pragma mark - 4. 破盾发送引擎（后端加好友加单聊）
 
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
     if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
@@ -1158,7 +1366,7 @@ static NSString *__currentChatPeerId = nil;
 
 @end
 
-#pragma mark - 4. 转发助手弹窗控制器
+#pragma mark - 5. 转发与全功能助手 UI 控制器
 
 @interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource, UINavigationControllerDelegate, UIImagePickerControllerDelegate, UITextViewDelegate>
 @property (nonatomic, strong) UIView *headerContainer;
@@ -1169,9 +1377,14 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, strong) UILabel *mediaBadgeLabel;
 @property (nonatomic, strong) UISegmentedControl *tabControl;
 @property (nonatomic, strong) UIView *actionBar;
+
+// 迎新与自动回复控制栏
 @property (nonatomic, strong) UIView *welcomeControlBar;
 @property (nonatomic, strong) UISwitch *welcomeSwitch;
+@property (nonatomic, strong) UISwitch *autoReplySwitch;
+@property (nonatomic, strong) UISwitch *autoPostSwitch;
 @property (nonatomic, strong) UILabel *welcomeSwitchLabel;
+
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIButton *floatingSendBtn;
@@ -1181,7 +1394,7 @@ static NSString *__currentChatPeerId = nil;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"转发与迎新助手";
+    self.title = @"AirChat 全能助手";
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
     self.edgesForExtendedLayout = UIRectEdgeNone;
     self.extendedLayoutIncludesOpaqueBars = NO;
@@ -1198,7 +1411,7 @@ static NSString *__currentChatPeerId = nil;
 
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
     if (mgr.friendList.count > 0 || mgr.groupMemberList.count > 0) {
-        self.statusLabel.text = [NSString stringWithFormat:@"📁 本地永久缓存：%lu 好友 | %lu 群成员 | %lu 群聊",
+        self.statusLabel.text = [NSString stringWithFormat:@"📁 本地缓存：%lu 好友 | %lu 群成员 | %lu 群聊",
                                  (unsigned long)mgr.friendList.count,
                                  (unsigned long)mgr.groupMemberList.count,
                                  (unsigned long)mgr.groupList.count];
@@ -1222,14 +1435,14 @@ static NSString *__currentChatPeerId = nil;
 - (void)setupCleanUI {
     CGFloat width = self.view.bounds.size.width;
 
-    self.headerContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 236)];
+    self.headerContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 250)];
     self.headerContainer.backgroundColor = [UIColor systemGroupedBackgroundColor];
     [self.view addSubview:self.headerContainer];
 
     CGFloat imgBoxW = 86.0;
-    self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 18, width - 32 - imgBoxW - 10, 84)];
-    self.contentTextView.font = [UIFont systemFontOfSize:15];
-    self.contentTextView.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
+    self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 12, width - 32 - imgBoxW - 10, 84)];
+    self.contentTextView.font = [UIFont systemFontOfSize:14];
+    self.contentTextView.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
     self.contentTextView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.contentTextView.layer.cornerRadius = 12;
     self.contentTextView.layer.borderColor = [UIColor separatorColor].CGColor;
@@ -1242,7 +1455,7 @@ static NSString *__currentChatPeerId = nil;
     }
     [self.headerContainer addSubview:self.contentTextView];
 
-    self.previewImageView = [[UIImageView alloc] initWithFrame:CGRectMake(width - 16 - imgBoxW, 18, imgBoxW, 84)];
+    self.previewImageView = [[UIImageView alloc] initWithFrame:CGRectMake(width - 16 - imgBoxW, 12, imgBoxW, 84)];
     self.previewImageView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.previewImageView.layer.cornerRadius = 12;
     self.previewImageView.layer.borderColor = [UIColor separatorColor].CGColor;
@@ -1278,13 +1491,13 @@ static NSString *__currentChatPeerId = nil;
     [self.clearMediaBtn addTarget:self action:@selector(clearSelectedMedia) forControlEvents:UIControlEventTouchUpInside];
     [self.previewImageView addSubview:self.clearMediaBtn];
 
-    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友(0)", @"群成员(0)", @"群聊(0)", @"🤖迎新"]];
-    self.tabControl.frame = CGRectMake(16, 114, width - 32, 34);
+    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友(0)", @"群成员(0)", @"群聊(0)", @"🤖自动机器人"]];
+    self.tabControl.frame = CGRectMake(16, 104, width - 32, 34);
     self.tabControl.selectedSegmentIndex = 1;
     [self.tabControl addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
     [self.headerContainer addSubview:self.tabControl];
 
-    self.actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 158, width - 32, 34)];
+    self.actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 148, width - 32, 34)];
     NSArray *btnTitles = @[@"🟢只选必达", @"🗑️清群成员", @"🎯定向采集", @"清空已选"];
     CGFloat btnW = (width - 32 - 24) / 4.0;
     for (int i = 0; i < 4; i++) {
@@ -1300,32 +1513,57 @@ static NSString *__currentChatPeerId = nil;
     }
     [self.headerContainer addSubview:self.actionBar];
 
-    self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 156, width - 32, 38)];
+    // 机器人面板控制（迎新 / 自动回复 / 定时发动态）
+    self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 144, width - 32, 68)];
     self.welcomeControlBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     self.welcomeControlBar.layer.cornerRadius = 10;
     self.welcomeControlBar.hidden = YES;
 
-    self.welcomeSwitchLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, width - 190, 38)];
-    self.welcomeSwitchLabel.font = [UIFont boldSystemFontOfSize:12.5];
-    self.welcomeSwitchLabel.text = @"🤖 迎新(8-15秒随机 | 自动带图/视频)";
-    [self.welcomeControlBar addSubview:self.welcomeSwitchLabel];
+    UILabel *welL = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, 70, 26)];
+    welL.text = @"🤖迎新:";
+    welL.font = [UIFont boldSystemFontOfSize:12];
+    [self.welcomeControlBar addSubview:welL];
+
+    self.welcomeSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(75, 4, 51, 31)];
+    self.welcomeSwitch.transform = CGAffineTransformMakeScale(0.75, 0.75);
+    self.welcomeSwitch.on = [ACForwardHelperManager shared].autoWelcomeEnabled;
+    [self.welcomeSwitch addTarget:self action:@selector(welcomeSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.welcomeControlBar addSubview:self.welcomeSwitch];
+
+    UILabel *repL = [[UILabel alloc] initWithFrame:CGRectMake(width - 32 - 150, 6, 80, 26)];
+    repL.text = @"💬自动私信:";
+    repL.font = [UIFont boldSystemFontOfSize:12];
+    [self.welcomeControlBar addSubview:repL];
+
+    self.autoReplySwitch = [[UISwitch alloc] initWithFrame:CGRectMake(width - 32 - 68, 4, 51, 31)];
+    self.autoReplySwitch.transform = CGAffineTransformMakeScale(0.75, 0.75);
+    self.autoReplySwitch.on = [ACForwardHelperManager shared].autoReplyEnabled;
+    [self.autoReplySwitch addTarget:self action:@selector(autoReplySwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.welcomeControlBar addSubview:self.autoReplySwitch];
+
+    UILabel *pstL = [[UILabel alloc] initWithFrame:CGRectMake(8, 36, 90, 26)];
+    pstL.text = @"📢定时发动态:";
+    pstL.font = [UIFont boldSystemFontOfSize:12];
+    [self.welcomeControlBar addSubview:pstL];
+
+    self.autoPostSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(95, 34, 51, 31)];
+    self.autoPostSwitch.transform = CGAffineTransformMakeScale(0.75, 0.75);
+    self.autoPostSwitch.on = [ACForwardHelperManager shared].autoPostEnabled;
+    [self.autoPostSwitch addTarget:self action:@selector(autoPostSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.welcomeControlBar addSubview:self.autoPostSwitch];
 
     UIButton *allWelcomeGrpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    allWelcomeGrpBtn.frame = CGRectMake(width - 32 - 118, 5, 56, 28);
-    [allWelcomeGrpBtn setTitle:@"全选群" forState:UIControlStateNormal];
-    allWelcomeGrpBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    allWelcomeGrpBtn.frame = CGRectMake(width - 32 - 80, 36, 72, 26);
+    [allWelcomeGrpBtn setTitle:@"监控全群" forState:UIControlStateNormal];
+    allWelcomeGrpBtn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
     allWelcomeGrpBtn.backgroundColor = [UIColor systemGroupedBackgroundColor];
     allWelcomeGrpBtn.layer.cornerRadius = 6;
     [allWelcomeGrpBtn addTarget:self action:@selector(selectAllWelcomeGroups) forControlEvents:UIControlEventTouchUpInside];
     [self.welcomeControlBar addSubview:allWelcomeGrpBtn];
 
-    self.welcomeSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(width - 32 - 56, 3.5, 51, 31)];
-    self.welcomeSwitch.on = [ACForwardHelperManager shared].autoWelcomeEnabled;
-    [self.welcomeSwitch addTarget:self action:@selector(welcomeSwitchChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.welcomeControlBar addSubview:self.welcomeSwitch];
     [self.headerContainer addSubview:self.welcomeControlBar];
 
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 200, width - 32, 24)];
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 218, width - 32, 24)];
     self.statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
     self.statusLabel.textColor = [UIColor secondaryLabelColor];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
@@ -1370,7 +1608,7 @@ static NSString *__currentChatPeerId = nil;
     CGFloat height = self.view.bounds.size.height;
     CGFloat topOffset = self.view.safeAreaInsets.top;
 
-    CGFloat headerH = 232.0;
+    CGFloat headerH = 246.0;
     self.headerContainer.frame = CGRectMake(0, topOffset, width, headerH);
 
     CGFloat tableY = topOffset + headerH;
@@ -1416,7 +1654,9 @@ static NSString *__currentChatPeerId = nil;
 - (void)textViewDidChange:(UITextView * _Nonnull)textView {
     if (self.tabControl.selectedSegmentIndex == 3) {
         [ACForwardHelperManager shared].welcomeMessageText = textView.text;
+        [ACForwardHelperManager shared].autoReplyText = textView.text;
         [[ACForwardHelperManager shared] saveWelcomeSettings];
+        [[ACForwardHelperManager shared] saveAutoReplyAndPostSettings];
     }
 }
 
@@ -1427,15 +1667,24 @@ static NSString *__currentChatPeerId = nil;
     mgr.welcomeMessageText = self.contentTextView.text;
     [mgr saveWelcomeSettings];
     [mgr setupIMGroupWelcomeListener];
+    [self updateUI];
+}
 
-    if (sw.isOn) {
-        NSString *mediaTip = mgr.savedMediaType == 2 ? @"+永久视频" : (mgr.savedMediaType == 1 ? @"+永久图片" : @"纯文本");
-        self.statusLabel.textColor = [UIColor systemGreenColor];
-        self.statusLabel.text = [NSString stringWithFormat:@"🟢 迎新已开启(8-15秒随机|%@) | 监控 %lu 群", mediaTip, (unsigned long)mgr.welcomeGroupIds.count];
-    } else {
-        self.statusLabel.textColor = [UIColor secondaryLabelColor];
-        self.statusLabel.text = @"⚪ 迎新已关闭";
-    }
+- (void)autoReplySwitchChanged:(UISwitch * _Nonnull)sw {
+    [self.view endEditing:YES];
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    mgr.autoReplyEnabled = sw.isOn;
+    mgr.autoReplyText = self.contentTextView.text;
+    [mgr saveAutoReplyAndPostSettings];
+    [mgr setupIMGroupWelcomeListener];
+    [self updateUI];
+}
+
+- (void)autoPostSwitchChanged:(UISwitch * _Nonnull)sw {
+    [self.view endEditing:YES];
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    mgr.autoPostEnabled = sw.isOn;
+    [mgr saveAutoReplyAndPostSettings];
     [self updateUI];
 }
 
@@ -1471,14 +1720,14 @@ static NSString *__currentChatPeerId = nil;
         if (videoURL) {
             [[ACForwardHelperManager shared] savePermanentVideoAtURL:videoURL];
             self.statusLabel.textColor = [UIColor systemGreenColor];
-            self.statusLabel.text = [NSString stringWithFormat:@"🎬 视频已永久保存(%d秒)，群发与迎新均自动携带！", [ACForwardHelperManager shared].savedVideoDuration];
+            self.statusLabel.text = [NSString stringWithFormat:@"🎬 视频已保存(%d秒)，群发与迎新自动携带！", [ACForwardHelperManager shared].savedVideoDuration];
         }
     } else {
         UIImage *img = info[UIImagePickerControllerOriginalImage];
         if (img) {
             [[ACForwardHelperManager shared] savePermanentImage:img];
             self.statusLabel.textColor = [UIColor systemGreenColor];
-            self.statusLabel.text = @"🖼️ 图片已永久保存到本地，关闭弹窗或迎新均不会掉图！";
+            self.statusLabel.text = @"🖼️ 图片已永久保存到本地！";
         }
     }
     [self refreshMediaPreviewUI];
@@ -1573,20 +1822,19 @@ static NSString *__currentChatPeerId = nil;
 - (void)tabChanged {
     [self.view endEditing:YES];
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-    BOOL isWelcomeTab = (self.tabControl.selectedSegmentIndex == 3);
+    BOOL isRobotTab = (self.tabControl.selectedSegmentIndex == 3);
 
-    self.actionBar.hidden = isWelcomeTab;
-    self.welcomeControlBar.hidden = !isWelcomeTab;
-    self.floatingSendBtn.hidden = isWelcomeTab;
+    self.actionBar.hidden = isRobotTab;
+    self.welcomeControlBar.hidden = !isRobotTab;
+    self.floatingSendBtn.hidden = isRobotTab;
 
-    if (isWelcomeTab) {
-        self.contentTextView.text = mgr.welcomeMessageText ?: @"您w好 {name}，欢迎进群！认识一下~";
-        NSString *mediaDesc = mgr.savedMediaType == 2 ? @"🎬带视频" : (mgr.savedMediaType == 1 ? @"🖼️带图片" : @"纯文字");
-        self.statusLabel.textColor = mgr.autoWelcomeEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-        self.statusLabel.text = [NSString stringWithFormat:@"%@(%@) | 勾选要监听新人的群 (已选%lu个)",
-                                 mgr.autoWelcomeEnabled ? @"🟢 8-15s迎新中" : @"⚪ 迎新未开启",
-                                 mediaDesc,
-                                 (unsigned long)mgr.welcomeGroupIds.count];
+    if (isRobotTab) {
+        self.contentTextView.text = mgr.welcomeMessageText ?: @"您好，欢迎使用！";
+        self.statusLabel.textColor = [UIColor systemGreenColor];
+        self.statusLabel.text = [NSString stringWithFormat:@"🤖 迎新:%@ | 私信回复:%@ | 定时发动态:%@",
+                                 mgr.autoWelcomeEnabled ? @"开" : @"关",
+                                 mgr.autoReplyEnabled ? @"开" : @"关",
+                                 mgr.autoPostEnabled ? @"开" : @"关"];
     }
 
     [self updateUI];
@@ -1598,7 +1846,7 @@ static NSString *__currentChatPeerId = nil;
     [self.tabControl setTitle:[NSString stringWithFormat:@"好友(%lu)", (unsigned long)mgr.friendList.count] forSegmentAtIndex:0];
     [self.tabControl setTitle:[NSString stringWithFormat:@"群成员(%lu)", (unsigned long)mgr.groupMemberList.count] forSegmentAtIndex:1];
     [self.tabControl setTitle:[NSString stringWithFormat:@"群聊(%lu)", (unsigned long)mgr.groupList.count] forSegmentAtIndex:2];
-    [self.tabControl setTitle:[NSString stringWithFormat:@"🤖迎新(%@)", mgr.autoWelcomeEnabled ? @"开" : @"关"] forSegmentAtIndex:3];
+    [self.tabControl setTitle:@"🤖机器人" forSegmentAtIndex:3];
 
     NSInteger selCount = 0;
     for (ACContactItem *i in mgr.friendList) if (i.isSelected) selCount++;
@@ -1626,7 +1874,7 @@ static NSString *__currentChatPeerId = nil;
     if (self.tabControl.selectedSegmentIndex == 3) {
         BOOL isMonitored = [[ACForwardHelperManager shared].welcomeGroupIds containsObject:item.targetId];
         cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", isMonitored ? @"📡 [监控迎新中]" : @"👥 [未监控]", item.name];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"群ID: %@ (点击切换是否监控新人进群)", item.targetId];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"群ID: %@ (点击勾选监控)", item.targetId];
         cell.accessoryType = isMonitored ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
         return cell;
     }
@@ -1659,9 +1907,6 @@ static NSString *__currentChatPeerId = nil;
             [mgr.welcomeGroupIds addObject:item.targetId];
         }
         [mgr saveWelcomeSettings];
-        self.statusLabel.text = [NSString stringWithFormat:@"%@ | 已勾选监控 %lu 个群",
-                                 mgr.autoWelcomeEnabled ? @"🟢 迎新监听中" : @"⚪ 迎新未开启",
-                                 (unsigned long)mgr.welcomeGroupIds.count];
         [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
         return;
     }
@@ -1731,7 +1976,7 @@ static NSString *__currentChatPeerId = nil;
 
 @end
 
-#pragma mark - 5. 视图树提取工具
+#pragma mark - 6. 视图树提取工具与弹出逻辑
 
 static UIImage *ACFindLargestImageInView(UIView *view) {
     if (!view || view.hidden || view.alpha < 0.05) return nil;
@@ -1805,7 +2050,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
     [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-#pragma mark - 6. 核心突破：伪装官方标识 com.flight.airchat + 25年老号高权重 + 解除搜索SVIP限制 + 换绑拦截
+#pragma mark - 7. Hook 逻辑引擎：身份伪装 + 搜索SVIP解除 + 网络报文拦截
 
 %hook NSBundle
 
@@ -1843,7 +2088,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
         return %orig(mutableReq, wrappedHandler);
     }
 
-    // 核心：解除搜索栏及高级搜索的 SVIP 权限限制（无论接口返回什么，直接强制解锁、允许展开完整搜索与扩大搜索范围）
+    // 解除搜索栏及高级搜索 SVIP 权限限制
     if ([urlStr containsString:@"search"] || [urlStr containsString:@"business/landing"] || [urlStr containsString:@"vipLevel"]) {
         void (^searchUnlockHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
             if (data && !error) {
@@ -1858,8 +2103,6 @@ static void ACPresentForwardAssistantFromTopVC(void) {
                         dataDict[@"hasMore"] = @YES;
                         dataDict[@"limit"] = @(9999);
                         rootDict[@"data"] = dataDict;
-                    } else if ([rootDict[@"data"] isKindOfClass:[NSArray class]]) {
-                        // 搜索列表直接放行所有结果，不截断
                     }
                     rootDict[@"code"] = @200;
                     NSData *unlockedData = [NSJSONSerialization dataWithJSONObject:rootDict options:0 error:nil];
@@ -1872,7 +2115,7 @@ static void ACPresentForwardAssistantFromTopVC(void) {
         return %orig(mutableReq, searchUnlockHandler);
     }
 
-    // 核心：将新号身份伪装为 2025年注册 + 5280经验 + 18级老号
+    // 账号身份伪装（老号高权重）
     if ([urlStr containsString:@"userinfo/detail"]) {
         void (^userinfoDetailHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
             if (data && !error) {
