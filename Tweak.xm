@@ -1,1566 +1,2072 @@
-//
-//  HaiouMassHelper.m
-//  海鸥 3.2.9 (Build 20261022) 严谨完善终极版 v8.0
-//
-//  结合《海鸥3.2.9全量逆向分析报告_3》(source: 14) 与抓包日志 (source: 17) 全面重构:
-//  1. 【零语法错误 & 零递归崩溃】：修复所有编译语法细节，所有 Hook 均采用单次指针校验保护，杜绝栈溢出闪退
-//  2. 【彻底屏蔽开屏广告】：精准置空 ZDBUAdSetUp、ZDOpenScreenAdvController、ABUSplashAd、CSJSplashAd、GMSplashAd
-//  3. 【JSON 解密层直接拦截 + 排行榜突破 200 人】：
-//     - 海鸥网络响应为 AES Base64 密文，解密后必调 NSJSONSerialization 解析明文。直接 Hook +[NSJSONSerialization JSONObjectWithData:options:error:]，在解密出口截获所有排行榜、群成员、搜索结果明文！
-//     - 后台自动遍历 type=1,2,3 (日榜/周榜/总榜) 且自动递增 zd_page (offset=1,2,3,4,5...) 突破单页 200 人限制！
-//  4. 【严格区分海鸥号(account)与19位内部串码(userId)】：
-//     - 自动识别并剔除 18~19 位雪花ID串码(如 1523106424866213888)，确保展示与搜索使用的是真正可搜到的海鸥号(如 8666688)！
-//  5. 【后台全自动静默获取所有群成员】：
-//     - 自动从 ZDMessageListController1.zd_groups 读取全部已加入群聊，不仅用 ivar_getOffset 强制开启群主权限，更在后台隐式驱动 ZDConversationGroupMemberListController 自动拉取所有群成员！
-//  6. 【点击人员直达其个人资料/加人主页】：
-//     - 优先使用 ZDUser/userId 直接打开 ZDNewUserInfoController / ZDStrangeUserInfoController；若为纯海鸥号则自动触发搜索并直接进入该人主页！
-//
-
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <dlfcn.h>
+#import <sqlite3.h>
 
-#pragma mark - ==================== 1. 底层安全 Hook 与动态 Ivar 工具 ====================
+#pragma mark - 1. 数据模型
 
-static NSString *g_myLoginUserId = @"1483263478134476800";
-
-static void SafeHookInstanceMethodOnce(Class cls, SEL sel, IMP newImp, IMP *origImpOut) {
-    if (!cls || !sel || !newImp || !origImpOut) return;
-    if (*origImpOut != NULL) return;
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-    IMP orig = method_getImplementation(m);
-    if (orig == newImp) return;
-    const char *types = method_getTypeEncoding(m);
-    if (class_addMethod(cls, sel, newImp, types)) {
-        *origImpOut = orig;
-    } else {
-        *origImpOut = method_setImplementation(m, newImp);
-    }
-}
-
-static void SafeHookClassMethodOnce(Class cls, SEL sel, IMP newImp, IMP *origImpOut) {
-    if (!cls || !sel || !newImp || !origImpOut) return;
-    if (*origImpOut != NULL) return;
-    Method m = class_getClassMethod(cls, sel);
-    if (!m) return;
-    IMP orig = method_getImplementation(m);
-    if (orig == newImp) return;
-    Class metaCls = object_getClass((id)cls);
-    const char *types = method_getTypeEncoding(m);
-    if (class_addMethod(metaCls, sel, newImp, types)) {
-        *origImpOut = orig;
-    } else {
-        *origImpOut = method_setImplementation(m, newImp);
-    }
-}
-
-static void DisableMethodWithNoop(Class cls, SEL sel, IMP noopImp) {
-    if (!cls || !sel || !noopImp) return;
-    Method m = class_getInstanceMethod(cls, sel);
-    if (m) {
-        const char *types = method_getTypeEncoding(m);
-        if (!class_addMethod(cls, sel, noopImp, types)) {
-            method_setImplementation(m, noopImp);
-        }
-    }
-    Method cm = class_getClassMethod(cls, sel);
-    if (cm) {
-        Class metaCls = object_getClass((id)cls);
-        const char *types = method_getTypeEncoding(cm);
-        if (!class_addMethod(metaCls, sel, noopImp, types)) {
-            method_setImplementation(cm, noopImp);
-        }
-    }
-}
-
-static ptrdiff_t GetRealIvarOffset(Class cls, const char *ivarName) {
-    if (!cls || !ivarName) return -1;
-    Ivar ivar = class_getInstanceVariable(cls, ivarName);
-    return ivar ? ivar_getOffset(ivar) : -1;
-}
-
-static id SafeCallObj(id obj, NSString *selName) {
-    if (!obj || !selName) return nil;
-    SEL sel = NSSelectorFromString(selName);
-    if ([obj respondsToSelector:sel]) {
-        @try {
-            return ((id (*)(id, SEL))objc_msgSend)(obj, sel);
-        } @catch (NSException *e) {}
-    }
-    return nil;
-}
-
-#pragma mark - ==================== 2. 严格区分「真实海鸥号」与「19位内部串码」 ====================
-
-// 判断是否是 17~20 位纯数字的雪花内部串码 (如 1523106424866213888)
-static BOOL IsInternalSnowflakeId(NSString *str) {
-    if (!str || str.length < 16) return NO;
-    for (NSUInteger i = 0; i < str.length; i++) {
-        unichar c = [str characterAtIndex:i];
-        if (c < '0' || c > '9') return NO;
-    }
-    return YES;
-}
-
-// 从文本中提取纯净的海鸥号（剥离“海鸥号：”中文，且绝不把 18~19 位内部串码当成海鸥号！）
-static NSString *ExtractValidHaiouAccount(NSString *raw) {
-    if (!raw || raw.length == 0) return nil;
-    NSMutableString *res = [NSMutableString string];
-    for (NSUInteger i = 0; i < raw.length; i++) {
-        unichar c = [raw characterAtIndex:i];
-        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
-            [res appendFormat:@"%C", c];
-        }
-    }
-    // 真实海鸥号长度通常在 5 ~ 15 位之间；如果是 17~20 位纯数字，那是内部 userId 串码，不是海鸥号！
-    if (res.length >= 4 && res.length <= 15) {
-        return res;
-    }
-    return nil;
-}
-
-// 严格剔除等级、排名、经验、系统词等非昵称文字
-static BOOL IsLevelOrNoiseText(NSString *text) {
-    if (!text || text.length == 0) return YES;
-    NSString *s = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (s.length == 0) return YES;
-    if (IsInternalSnowflakeId(s)) return YES; // 19位串码绝不当作名字
-    
-    BOOL allNum = YES;
-    for (NSUInteger i = 0; i < s.length; i++) {
-        unichar c = [s characterAtIndex:i];
-        if (c < '0' || c > '9') { allNum = NO; break; }
-    }
-    if (allNum && s.length <= 4) return YES; // 1~4位纯数字是等级或排名名次
-    
-    NSString *up = [s uppercaseString];
-    if ([up hasPrefix:@"LV"] || [up hasPrefix:@"VIP"] || [up hasPrefix:@"SVIP"] || [up hasPrefix:@"NO."]) return YES;
-    if ([s hasSuffix:@"级"] && s.length <= 6) return YES;
-    
-    NSArray *noises = @[
-        @"海鸥号", @"账号", @"经验", @"等级", @"排行", @"榜", @"距上一名", @"距离",
-        @"升级", @"加速", @"未上榜", @"分钟", @"小时", @"昨天", @"文件助手",
-        @"好友申请", @"关于", @"版本", @"海鸥助手", @"设置", @"新的朋友", @"群发助手",
-        @"系统通知", @"怎么升级快", @"遇到BUG", @"投诉举报"
-    ];
-    for (NSString *n in noises) {
-        if ([s containsString:n]) return YES;
-    }
-    return NO;
-}
-
-static UIImage *ExtractAvatarImage(UIView *view) {
-    if (!view || view.hidden) return nil;
-    if ([view isKindOfClass:[UIImageView class]]) {
-        UIImage *img = [(UIImageView *)view image];
-        if (img && img.size.width >= 22 && img.size.height >= 22 && fabs(img.size.width - img.size.height) <= 16) {
-            return img;
-        }
-    }
-    for (UIView *sub in view.subviews) {
-        UIImage *img = ExtractAvatarImage(sub);
-        if (img) return img;
-    }
-    return nil;
-}
-
-#pragma mark - ==================== 3. Swift String 内存安全读写 ====================
-
-typedef id (*SwiftBridgeToNSStringFn)(uint64_t, uint64_t);
-typedef struct { uint64_t w0; uint64_t w1; } SwiftStringWords;
-typedef SwiftStringWords (*NSStringToSwiftStringFn)(id);
-
-static NSString *ReadSwiftStringByIvar(id obj, const char *ivarName) {
-    if (!obj || !ivarName) return nil;
-    ptrdiff_t offset = GetRealIvarOffset([obj class], ivarName);
-    if (offset <= 0) return nil;
-    @try {
-        uint8_t *base = (uint8_t *)(__bridge void *)obj;
-        uint64_t w0 = *(uint64_t *)(base + offset);
-        uint64_t w1 = *(uint64_t *)(base + offset + 8);
-        if (w0 == 0 && w1 == 0) return nil;
-        
-        uint8_t topByte = (uint8_t)(w1 >> 56);
-        if ((topByte & 0xE0) == 0xE0) {
-            NSUInteger len = topByte & 0x0F;
-            if (len > 0 && len <= 15) {
-                char buf[16] = {0};
-                memcpy(buf, base + offset, len);
-                return [[NSString alloc] initWithBytes:buf length:len encoding:NSUTF8StringEncoding];
-            }
-            return nil;
-        }
-        static SwiftBridgeToNSStringFn bridgeFn = NULL;
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            void *sym = dlsym(RTLD_DEFAULT, "$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF");
-            if (!sym) sym = dlsym(RTLD_DEFAULT, "_$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF");
-            bridgeFn = (SwiftBridgeToNSStringFn)sym;
-        });
-        if (bridgeFn && w1 > 0x100000000ULL) {
-            id s = bridgeFn(w0, w1);
-            if ([s isKindOfClass:[NSString class]]) return (NSString *)s;
-        }
-    } @catch (NSException *e) {}
-    return nil;
-}
-
-static void WriteSwiftStringByIvar(id obj, const char *ivarName, NSString *newVal) {
-    if (!obj || !ivarName || !newVal) return;
-    ptrdiff_t offset = GetRealIvarOffset([obj class], ivarName);
-    if (offset <= 0) return;
-    static NSStringToSwiftStringFn toSwiftFn = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        void *sym = dlsym(RTLD_DEFAULT, "$sSS10FoundationE36_unconditionallyBridgeFromObjectiveCySSSo8NSStringCSgFZ");
-        if (!sym) sym = dlsym(RTLD_DEFAULT, "_$sSS10FoundationE36_unconditionallyBridgeFromObjectiveCySSSo8NSStringCSgFZ");
-        toSwiftFn = (NSStringToSwiftStringFn)sym;
-    });
-    if (!toSwiftFn) return;
-    @try {
-        uint8_t *base = (uint8_t *)(__bridge void *)obj;
-        SwiftStringWords words = toSwiftFn(newVal);
-        *(uint64_t *)(base + offset) = words.w0;
-        *(uint64_t *)(base + offset + 8) = words.w1;
-    } @catch (NSException *e) {}
-}
-
-#pragma mark - ==================== 4. 彻底屏蔽开屏广告 ====================
-
-static void ad_noop_0(id self, SEL _cmd) {}
-static void ad_noop_1(id self, SEL _cmd, id a1) {}
-static void ad_noop_2(id self, SEL _cmd, id a1, id a2) {}
-
-static IMP orig_openAdv_viewDidAppear = NULL;
-static void hook_openAdv_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
-    if (orig_openAdv_viewDidAppear) {
-        ((void (*)(id, SEL, BOOL))orig_openAdv_viewDidAppear)(self, _cmd, animated);
-    }
-    self.view.hidden = YES;
-    self.view.alpha = 0;
-    if (self.presentingViewController) {
-        [self dismissViewControllerAnimated:NO completion:nil];
-    }
-}
-
-static void SetupAdBlockerOnce(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSArray *adClasses = @[
-            @"ZDBUAdSetUp",
-            @"ABUSplashAd", @"CSJSplashAd", @"CSJSplashAdLoader",
-            @"BUSplashAd", @"GMSplashAd"
-        ];
-        NSArray *noop0Sels = @[@"loadAdData", @"loadSplashAd", @"loadAd", @"setUp"];
-        NSArray *noop1Sels = @[
-            @"showAdFromRootViewController:",
-            @"showSplashViewInRootViewController:",
-            @"showInWindow:",
-            @"showSplashAdWithWindow:"
-        ];
-        NSArray *noop2Sels = @[@"showAdFromRootViewController:bottomView:"];
-        
-        for (NSString *clsName in adClasses) {
-            Class c = objc_getClass([clsName UTF8String]);
-            if (!c) continue;
-            for (NSString *s in noop0Sels) DisableMethodWithNoop(c, NSSelectorFromString(s), (IMP)ad_noop_0);
-            for (NSString *s in noop1Sels) DisableMethodWithNoop(c, NSSelectorFromString(s), (IMP)ad_noop_1);
-            for (NSString *s in noop2Sels) DisableMethodWithNoop(c, NSSelectorFromString(s), (IMP)ad_noop_2);
-        }
-        
-        Class openAdvCls = objc_getClass("_TtC7ZhengDu25ZDOpenScreenAdvController");
-        if (openAdvCls) {
-            SafeHookInstanceMethodOnce(openAdvCls, @selector(viewDidAppear:), (IMP)hook_openAdv_viewDidAppear, &orig_openAdv_viewDidAppear);
-        }
-    });
-}
-
-#pragma mark - ==================== 5. 数据模型与全自动拓客引擎 ====================
-
-@interface HOModelItem : NSObject <NSCoding>
-@property (nonatomic, copy) NSString *userId;       // 内部19位唯一ID (用于直接实例化个人资料页)
-@property (nonatomic, copy) NSString *account;      // 真实海鸥号 (5~15位，用于搜索定位与展示，绝非19位串码)
-@property (nonatomic, copy) NSString *name;         // 真实昵称 (已剔除等级与串码)
-@property (nonatomic, copy) NSString *source;       // 精确来源 (日榜/周榜/总榜/具体群名)
-@property (nonatomic, copy) NSString *avatarUrl;    // 远程头像 URL
-@property (nonatomic, strong) NSData *avatarData;   // 本地头像图片缓存
-@property (nonatomic, assign) NSInteger collectSeq;
-@property (nonatomic, assign) BOOL isGroup;
+@interface ACContactItem : NSObject <NSCoding>
+@property (nonatomic, copy) NSString *targetId;
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, copy) NSString *fromGroupId;
+@property (nonatomic, copy) NSString *roleDesc;
+@property (nonatomic, assign) NSInteger sourceType; // 0: 好友, 1: 群成员, 2: 群聊
+@property (nonatomic, assign) NSInteger chatMeType; // 0: 开放私聊, 1: 仅双向好友
+@property (nonatomic, assign) BOOL isGroupBanned;   
+@property (nonatomic, assign) BOOL isSelected;
 @end
 
-@implementation HOModelItem
+@implementation ACContactItem
+
 - (void)encodeWithCoder:(NSCoder *)coder {
-    [coder encodeObject:_userId ?: @"" forKey:@"userId"];
-    [coder encodeObject:_account ?: @"" forKey:@"account"];
-    [coder encodeObject:_name ?: @"" forKey:@"name"];
-    [coder encodeObject:_source ?: @"" forKey:@"source"];
-    [coder encodeObject:_avatarUrl ?: @"" forKey:@"avatarUrl"];
-    if (_avatarData) [coder encodeObject:_avatarData forKey:@"avatarData"];
-    [coder encodeInteger:_collectSeq forKey:@"collectSeq"];
-    [coder encodeBool:_isGroup forKey:@"isGroup"];
+    [coder encodeObject:self.targetId ?: @"" forKey:@"targetId"];
+    [coder encodeObject:self.name ?: @"" forKey:@"name"];
+    [coder encodeObject:self.fromGroupId ?: @"" forKey:@"fromGroupId"];
+    [coder encodeObject:self.roleDesc ?: @"" forKey:@"roleDesc"];
+    [coder encodeInteger:self.sourceType forKey:@"sourceType"];
+    [coder encodeInteger:self.chatMeType forKey:@"chatMeType"];
+    [coder encodeBool:self.isGroupBanned forKey:@"isGroupBanned"];
 }
+
 - (instancetype)initWithCoder:(NSCoder *)coder {
-    if (self = [super init]) {
-        _userId = [coder decodeObjectForKey:@"userId"];
-        _account = [coder decodeObjectForKey:@"account"];
-        _name = [coder decodeObjectForKey:@"name"];
-        _source = [coder decodeObjectForKey:@"source"];
-        _avatarUrl = [coder decodeObjectForKey:@"avatarUrl"];
-        _avatarData = [coder decodeObjectForKey:@"avatarData"];
-        _collectSeq = [coder decodeIntegerForKey:@"collectSeq"];
-        _isGroup = [coder decodeBoolForKey:@"isGroup"];
+    self = [super init];
+    if (self) {
+        self.targetId = [coder decodeObjectForKey:@"targetId"];
+        self.name = [coder decodeObjectForKey:@"name"];
+        self.fromGroupId = [coder decodeObjectForKey:@"fromGroupId"];
+        self.roleDesc = [coder decodeObjectForKey:@"roleDesc"];
+        self.sourceType = [coder decodeIntegerForKey:@"sourceType"];
+        self.chatMeType = [coder decodeIntegerForKey:@"chatMeType"];
+        self.isGroupBanned = [coder decodeBoolForKey:@"isGroupBanned"];
+        self.isSelected = NO;
     }
     return self;
 }
+
 @end
 
-@interface HOMassEngine : NSObject
-@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *rankUsersMap;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *groupMembersMap;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *joinedGroupsMap;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, HOModelItem *> *contactFriendsMap;
-@property (nonatomic, strong) NSMutableSet<NSString *> *autoFetchedGroupIds;
-@property (nonatomic, assign) NSInteger seqCounter;
+static __weak UIView *__lastLongPressedView = nil;
+static NSString *__pendingForwardText = nil;
+static NSString *__currentChatPeerId = nil;
 
-@property (nonatomic, strong) NSMutableArray<UIViewController *> *hiddenRankVCs;
-@property (nonatomic, strong) NSMutableArray<UIViewController *> *hiddenMemberVCs;
-@property (nonatomic, strong) NSTimer *rankTimer;
-@property (nonatomic, assign) BOOL isFetchingRank;
-@property (nonatomic, assign) NSInteger currentRankPage;
-@property (nonatomic, copy) void (^onStatusChanged)(NSString *tip);
+#pragma mark - 2. 核心管理器
+
+@interface ACForwardHelperManager : NSObject
+@property (nonatomic, strong) NSMutableArray<ACContactItem *> *friendList;
+@property (nonatomic, strong) NSMutableArray<ACContactItem *> *groupMemberList;
+@property (nonatomic, strong) NSMutableArray<ACContactItem *> *groupList;
+
+@property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *friendMap;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMemberMap;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMap;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupBanStatusMap;
+
+@property (nonatomic, copy) NSString *selfUserId;
+@property (nonatomic, copy) NSString *capturedClientTypeV2;
+@property (nonatomic, strong) NSData *capturedCloudCustomData;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *latestHTTPHeaders;
+
+// --- 永久保存的媒体 ---
+@property (nonatomic, assign) NSInteger savedMediaType; // 0: 无, 1: 图片, 2: 视频
+@property (nonatomic, strong) UIImage *savedImage;
+@property (nonatomic, assign) int savedVideoDuration;
+
+// --- 迎新配置 ---
+@property (nonatomic, assign) BOOL autoWelcomeEnabled;
+@property (nonatomic, copy) NSString *welcomeMessageText;
+@property (nonatomic, strong) NSMutableSet<NSString *> *welcomeGroupIds;
+@property (nonatomic, strong) NSMutableSet<NSString *> *greetedUserIds;
+@property (nonatomic, assign) NSInteger greetedCount;
+@property (nonatomic, copy) NSString *lastGreetLog;
+@property (nonatomic, assign) BOOL listenerRegistered;
 
 + (instancetype)shared;
-- (void)saveToDisk;
-- (void)clearAllData;
+- (NSString *)permanentImagePath;
+- (NSString *)permanentVideoPath;
+- (NSString *)permanentVideoThumbPath;
+- (void)savePermanentImage:(UIImage *)img;
+- (void)savePermanentVideoAtURL:(NSURL *)videoURL;
+- (void)clearPermanentMedia;
 
-// 1. 强制解锁群主权限
-- (void)unlockGroupOwnerPrivilege:(id)groupObj;
-- (void)unlockMemberOwnerPrivilege:(id)memberObj;
-- (void)applyGroupOwnerOnVC:(UIViewController *)vc;
-
-// 2. 从解密后的明文 JSON 字典中精准提取排行榜、群成员与搜索用户
-- (void)consumeDecryptedJSONObject:(id)jsonObj;
-
-// 3. 从模型与 Cell 提取
-- (void)harvestRankCell:(UICollectionViewCell *)cell indexPath:(NSIndexPath *)ip rankVC:(UIViewController *)rankVC;
-- (void)harvestGroupObject:(id)groupObj;
-- (void)harvestGroupMemberObject:(id)memberObj;
-- (void)harvestUserObject:(id)userObj source:(NSString *)source;
-- (void)harvestContactCell:(UITableViewCell *)cell;
-
-// 4. 后台全自动静默拉取所有已加入群的群成员 (无需用户手动点进群聊)
-- (void)autoSilentFetchAllGroupMembersInBackground;
-
-// 5. 排行榜全量多榜+多页突破提取
-- (void)toggleMultiPageRankFetch:(void (^)(NSString *status))statusBlock;
-- (void)stopMultiPageRankFetch;
-
-// 6. 点击任意用户 -> 直接进入该用户的个人资料/添加好友结果主页
-- (void)openDirectUserHomePageForItem:(HOModelItem *)item fromVC:(UIViewController *)fromVC;
+- (void)setupIMGroupWelcomeListener;
+- (void)loadLocalPermanentCache;
+- (void)saveLocalPermanentCache;
+- (void)clearAllGroupMembersCache;
+- (void)saveWelcomeSettings;
+- (void)parseJSONWithContext:(id)jsonObj;
+- (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
+                        progress:(void(^)(NSString *progressMsg))progressBlock
+                      completion:(void(^)(NSString *finalMsg))completion;
+- (void)reloadAllDataWithProgress:(void(^)(NSString *progressMsg))progressBlock
+                       completion:(void(^)(NSString *finalMsg))completion;
+- (void)sendCurrentMediaAndText:(NSString *)text
+                         toItem:(ACContactItem *)item
+                     completion:(void(^)(BOOL ok, NSString *detail))completion;
 @end
 
-@implementation HOMassEngine
+@implementation ACForwardHelperManager
 
 + (instancetype)shared {
-    static HOMassEngine *ins = nil;
+    static ACForwardHelperManager *instance = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        ins = [[HOMassEngine alloc] init];
+        instance = [[ACForwardHelperManager alloc] init];
+        instance.friendList = [NSMutableArray array];
+        instance.groupMemberList = [NSMutableArray array];
+        instance.groupList = [NSMutableArray array];
+        instance.friendMap = [NSMutableDictionary dictionary];
+        instance.groupMemberMap = [NSMutableDictionary dictionary];
+        instance.groupMap = [NSMutableDictionary dictionary];
+        instance.groupBanStatusMap = [NSMutableDictionary dictionary];
+        instance.latestHTTPHeaders = [NSMutableDictionary dictionary];
+        instance.selfUserId = @"1958179249315647489";
+        instance.capturedClientTypeV2 = @"79b3h7aOxJurSbzVhPK2Wal1cKQzfppVutid7[d]gEtuxYU87uiCm3l2gMp7d5Eo3KZS3hFxBn8Db[d]yag55Ev1I3W[a]7xF6oF0FSXM[s]";
+
+        instance.welcomeGroupIds = [NSMutableSet set];
+        instance.greetedUserIds = [NSMutableSet set];
+        instance.lastGreetLog = @"等待新人进群...";
+
+        [instance loadLocalPermanentCache];
+        [instance loadWelcomeSettings];
+        [instance loadPermanentMediaFromDisk];
     });
-    return ins;
+    return instance;
 }
 
-- (instancetype)init {
-    if (self = [super init]) {
-        _rankUsersMap = [NSMutableDictionary dictionary];
-        _groupMembersMap = [NSMutableDictionary dictionary];
-        _joinedGroupsMap = [NSMutableDictionary dictionary];
-        _contactFriendsMap = [NSMutableDictionary dictionary];
-        _autoFetchedGroupIds = [NSMutableSet set];
-        _hiddenRankVCs = [NSMutableArray array];
-        _hiddenMemberVCs = [NSMutableArray array];
-        _seqCounter = 8000;
-        [self loadFromDisk];
-        [self purgeInvalidSnowflakeEntries];
-    }
-    return self;
+- (NSString *)permanentImagePath {
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    return [docDir stringByAppendingPathComponent:@"AC_Permanent_Media.jpg"];
 }
 
-// 自动清理之前误把 19 位内部串码当成海鸥号或误抓等级的脏数据
-- (void)purgeInvalidSnowflakeEntries {
-    for (NSMutableDictionary *map in @[_rankUsersMap, _groupMembersMap]) {
-        NSArray *keys = [map allKeys];
-        for (NSString *k in keys) {
-            HOModelItem *item = map[k];
-            if (IsInternalSnowflakeId(item.account) || IsLevelOrNoiseText(item.name)) {
-                [map removeObjectForKey:k];
-            }
-        }
-    }
-    [self saveToDisk];
+- (NSString *)permanentVideoPath {
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    return [docDir stringByAppendingPathComponent:@"AC_Permanent_Media.mp4"];
 }
 
-- (void)clearAllData {
-    [_rankUsersMap removeAllObjects];
-    [_groupMembersMap removeAllObjects];
-    [_joinedGroupsMap removeAllObjects];
-    [_contactFriendsMap removeAllObjects];
-    [_autoFetchedGroupIds removeAllObjects];
-    [self saveToDisk];
+- (NSString *)permanentVideoThumbPath {
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    return [docDir stringByAppendingPathComponent:@"AC_Permanent_VideoThumb.jpg"];
 }
 
-- (void)saveToDisk {
+- (void)loadPermanentMediaFromDisk {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    self.savedMediaType = [ud integerForKey:@"AC_SavedMediaType"];
+    self.savedVideoDuration = (int)[ud integerForKey:@"AC_SavedVideoDuration"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (self.savedMediaType == 1 && [fm fileExistsAtPath:[self permanentImagePath]]) {
+        self.savedImage = [UIImage imageWithContentsOfFile:[self permanentImagePath]];
+    } else if (self.savedMediaType == 2 && [fm fileExistsAtPath:[self permanentVideoPath]]) {
+        if ([fm fileExistsAtPath:[self permanentVideoThumbPath]]) {
+            self.savedImage = [UIImage imageWithContentsOfFile:[self permanentVideoThumbPath]];
+        }
+    } else {
+        self.savedMediaType = 0;
+        self.savedImage = nil;
+    }
+}
+
+- (void)savePermanentImage:(UIImage *)img {
+    if (!img) return;
+    NSData *jpgData = UIImageJPEGRepresentation(img, 0.88);
+    if (jpgData) {
+        [jpgData writeToFile:[self permanentImagePath] atomically:YES];
+        [[NSFileManager defaultManager] removeItemAtPath:[self permanentVideoPath] error:nil];
+        self.savedImage = img;
+        self.savedMediaType = 1;
+        self.savedVideoDuration = 0;
+
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud setInteger:1 forKey:@"AC_SavedMediaType"];
+        [ud setInteger:0 forKey:@"AC_SavedVideoDuration"];
+        [ud synchronize];
+    }
+}
+
+- (void)savePermanentVideoAtURL:(NSURL *)videoURL {
+    if (!videoURL) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *destVideoPath = [self permanentVideoPath];
+    [fm removeItemAtPath:destVideoPath error:nil];
+    [fm removeItemAtPath:[self permanentImagePath] error:nil];
+
+    BOOL copied = [fm copyItemAtURL:videoURL toURL:[NSURL fileURLWithPath:destVideoPath] error:nil];
+    if (!copied) {
+        NSData *vData = [NSData dataWithContentsOfURL:videoURL];
+        if (vData) copied = [vData writeToFile:destVideoPath atomically:YES];
+    }
+    if (!copied) return;
+
+    int durationSec = 5;
+    UIImage *thumbImg = nil;
     @try {
-        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_rankUsersMap requiringSecureCoding:NO error:nil] forKey:@"HO_V8_RankUsers"];
-        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_groupMembersMap requiringSecureCoding:NO error:nil] forKey:@"HO_V8_GroupMembers"];
-        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_joinedGroupsMap requiringSecureCoding:NO error:nil] forKey:@"HO_V8_Groups"];
-        [ud setObject:[NSKeyedArchiver archivedDataWithRootObject:_contactFriendsMap requiringSecureCoding:NO error:nil] forKey:@"HO_V8_Friends"];
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:destVideoPath] options:nil];
+        CMTime durTime = asset.duration;
+        if (durTime.timescale > 0) {
+            durationSec = MAX(1, (int)round((double)durTime.value / (double)durTime.timescale));
+        }
+        AVAssetImageGenerator *gen = [[AVAssetImageGenerator alloc] initWithAsset:asset];
+        gen.appliesPreferredTrackTransform = YES;
+        CGImageRef cgImg = [gen copyCGImageAtTime:CMTimeMake(0, 1) actualTime:NULL error:NULL];
+        if (cgImg) {
+            thumbImg = [UIImage imageWithCGImage:cgImg];
+            CGImageRelease(cgImg);
+        }
     } @catch (NSException *e) {}
+
+    if (!thumbImg) {
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(200, 200), YES, 1.0);
+        [[UIColor darkGrayColor] setFill];
+        UIRectFill(CGRectMake(0, 0, 200, 200));
+        thumbImg = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+    }
+
+    NSData *thumbData = UIImageJPEGRepresentation(thumbImg, 0.85);
+    if (thumbData) {
+        [thumbData writeToFile:[self permanentVideoThumbPath] atomically:YES];
+    }
+
+    self.savedImage = thumbImg;
+    self.savedMediaType = 2;
+    self.savedVideoDuration = durationSec;
+
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setInteger:2 forKey:@"AC_SavedMediaType"];
+    [ud setInteger:durationSec forKey:@"AC_SavedVideoDuration"];
     [ud synchronize];
 }
 
-- (void)loadFromDisk {
+- (void)clearPermanentMedia {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:[self permanentImagePath] error:nil];
+    [fm removeItemAtPath:[self permanentVideoPath] error:nil];
+    [fm removeItemAtPath:[self permanentVideoThumbPath] error:nil];
+    self.savedMediaType = 0;
+    self.savedImage = nil;
+    self.savedVideoDuration = 0;
+
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    @try {
-        NSData *r = [ud objectForKey:@"HO_V8_RankUsers"];
-        NSData *gm = [ud objectForKey:@"HO_V8_GroupMembers"];
-        NSData *g = [ud objectForKey:@"HO_V8_Groups"];
-        NSData *f = [ud objectForKey:@"HO_V8_Friends"];
-        if (r) [_rankUsersMap addEntriesFromDictionary:[NSKeyedUnarchiver unarchiveObjectWithData:r]];
-        if (gm) [_groupMembersMap addEntriesFromDictionary:[NSKeyedUnarchiver unarchiveObjectWithData:gm]];
-        if (g) [_joinedGroupsMap addEntriesFromDictionary:[NSKeyedUnarchiver unarchiveObjectWithData:g]];
-        if (f) [_contactFriendsMap addEntriesFromDictionary:[NSKeyedUnarchiver unarchiveObjectWithData:f]];
-    } @catch (NSException *e) {}
+    [ud setInteger:0 forKey:@"AC_SavedMediaType"];
+    [ud setInteger:0 forKey:@"AC_SavedVideoDuration"];
+    [ud synchronize];
 }
 
-#pragma mark - 1. 强制模拟群主权限 (动态 Ivar 偏移)
+- (NSString *)cacheFilePath:(NSString *)type {
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Permanent_%@.archive", type]];
+}
 
-- (void)unlockGroupOwnerPrivilege:(id)groupObj {
-    if (!groupObj) return;
-    Class cls = [groupObj class];
-    if (![NSStringFromClass(cls) containsString:@"ZDGroup"] || [NSStringFromClass(cls) containsString:@"Member"]) return;
-    @try {
-        uint8_t *base = (uint8_t *)(__bridge void *)groupObj;
-        if (g_myLoginUserId.length > 0) {
-            WriteSwiftStringByIvar(groupObj, "userId", g_myLoginUserId);
+- (void)clearAllGroupMembersCache {
+    @synchronized (self) {
+        [self.groupMemberList removeAllObjects];
+        [self.groupMemberMap removeAllObjects];
+        [[NSFileManager defaultManager] removeItemAtPath:[self cacheFilePath:@"members"] error:nil];
+        [self saveLocalPermanentCache];
+    }
+}
+
+- (void)saveWelcomeSettings {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setBool:self.autoWelcomeEnabled forKey:@"AC_AutoWelcome_Enabled"];
+    [ud setObject:self.welcomeMessageText ?: @"您好 {name}，欢迎进群！认识一下~" forKey:@"AC_AutoWelcome_Text"];
+    [ud setObject:[self.welcomeGroupIds allObjects] forKey:@"AC_AutoWelcome_Groups"];
+    if (self.capturedClientTypeV2) {
+        [ud setObject:self.capturedClientTypeV2 forKey:@"AC_Captured_ClientTypeV2"];
+    }
+    [ud synchronize];
+}
+
+- (void)loadWelcomeSettings {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    self.autoWelcomeEnabled = [ud boolForKey:@"AC_AutoWelcome_Enabled"];
+    NSString *savedText = [ud stringForKey:@"AC_AutoWelcome_Text"];
+    self.welcomeMessageText = (savedText && savedText.length > 0) ? savedText : @"您好 {name}，欢迎进群！认识一下~";
+    NSArray *savedGroups = [ud arrayForKey:@"AC_AutoWelcome_Groups"];
+    if ([savedGroups isKindOfClass:[NSArray class]]) {
+        [self.welcomeGroupIds addObjectsFromArray:savedGroups];
+    }
+    NSString *savedV2 = [ud stringForKey:@"AC_Captured_ClientTypeV2"];
+    if (savedV2 && savedV2.length > 10) {
+        self.capturedClientTypeV2 = savedV2;
+    }
+}
+
+- (void)saveLocalPermanentCache {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        @synchronized (self) {
+            @try {
+                NSData *fData = [NSKeyedArchiver archivedDataWithRootObject:[self.friendList copy] requiringSecureCoding:NO error:nil];
+                NSData *mData = [NSKeyedArchiver archivedDataWithRootObject:[self.groupMemberList copy] requiringSecureCoding:NO error:nil];
+                NSData *gData = [NSKeyedArchiver archivedDataWithRootObject:[self.groupList copy] requiringSecureCoding:NO error:nil];
+                if (fData) [fData writeToFile:[self cacheFilePath:@"friends"] atomically:YES];
+                if (mData) [mData writeToFile:[self cacheFilePath:@"members"] atomically:YES];
+                if (gData) [gData writeToFile:[self cacheFilePath:@"groups"] atomically:YES];
+            } @catch (NSException *e) {}
         }
-        ptrdiff_t protectOff = GetRealIvarOffset(cls, "protect");
-        if (protectOff > 0) base[protectOff] = 0; // 关闭群成员保护模式
-        
-        ptrdiff_t memberListOff = GetRealIvarOffset(cls, "groupMemberList");
-        if (memberListOff > 0) base[memberListOff] = 1; // 开启查看群成员列表
-        
-        ptrdiff_t myRoleOff = GetRealIvarOffset(cls, "myRole");
-        if (myRoleOff > 0) base[myRoleOff] = 1; // 群主
-        
-        ptrdiff_t roleOff = GetRealIvarOffset(cls, "role");
-        if (roleOff > 0) base[roleOff] = 1;
-        
-        const char *enableFields[] = {"allowInvite", "allowJoin", "allowSearch", "sendCard", "sendGroupCard", "whetherFriends"};
-        for (int i = 0; i < 6; i++) {
-            ptrdiff_t off = GetRealIvarOffset(cls, enableFields[i]);
-            if (off > 0) base[off] = 1;
-        }
-    } @catch (NSException *e) {}
+    });
 }
 
-- (void)unlockMemberOwnerPrivilege:(id)memberObj {
-    if (!memberObj) return;
-    Class cls = [memberObj class];
-    if (![NSStringFromClass(cls) containsString:@"ZDGroupMember"]) return;
-    @try {
-        uint8_t *base = (uint8_t *)(__bridge void *)memberObj;
-        ptrdiff_t roleOff = GetRealIvarOffset(cls, "role");
-        if (roleOff > 0) base[roleOff] = 1;
-    } @catch (NSException *e) {}
-}
-
-- (void)applyGroupOwnerOnVC:(UIViewController *)vc {
-    if (!vc) return;
-    @try {
-        unsigned int count = 0;
-        Ivar *ivars = class_copyIvarList([vc class], &count);
-        if (!ivars) return;
-        uint8_t *base = (uint8_t *)(__bridge void *)vc;
-        for (unsigned int i = 0; i < count; i++) {
-            const char *name = ivar_getName(ivars[i]);
-            ptrdiff_t off = ivar_getOffset(ivars[i]);
-            if (!name || off <= 0) continue;
-            NSString *ivarName = [NSString stringWithUTF8String:name];
-            if ([ivarName containsString:@"group"] || [ivarName containsString:@"Group"] || [ivarName containsString:@"delegate"] || [ivarName containsString:@"viewModel"]) {
-                uintptr_t ptr = *(uintptr_t *)(base + off);
-                if (ptr > 0x100000000ULL && (ptr & 0x7) == 0) {
-                    id subObj = (__bridge id)(void *)ptr;
-                    NSString *subCls = NSStringFromClass([subObj class]);
-                    if ([subCls containsString:@"ZDGroup"] && ![subCls containsString:@"Member"]) {
-                        [self unlockGroupOwnerPrivilege:subObj];
-                        [self harvestGroupObject:subObj];
-                    } else if ([subCls containsString:@"ZDGroupMember"]) {
-                        [self unlockMemberOwnerPrivilege:subObj];
+- (void)loadLocalPermanentCache {
+    @synchronized (self) {
+        @try {
+            NSArray *fArr = [NSKeyedUnarchiver unarchiveObjectWithFile:[self cacheFilePath:@"friends"]];
+            if ([fArr isKindOfClass:[NSArray class]]) {
+                for (ACContactItem *item in fArr) {
+                    if (item.targetId.length > 0 && !self.friendMap[item.targetId]) {
+                        self.friendMap[item.targetId] = item;
+                        [self.friendList addObject:item];
                     }
                 }
             }
+            NSArray *mArr = [NSKeyedUnarchiver unarchiveObjectWithFile:[self cacheFilePath:@"members"]];
+            if ([mArr isKindOfClass:[NSArray class]]) {
+                for (ACContactItem *item in mArr) {
+                    if (item.targetId.length > 0 && !self.groupMemberMap[item.targetId]) {
+                        self.groupMemberMap[item.targetId] = item;
+                        [self.groupMemberList addObject:item];
+                    }
+                }
+            }
+            NSArray *gArr = [NSKeyedUnarchiver unarchiveObjectWithFile:[self cacheFilePath:@"groups"]];
+            if ([gArr isKindOfClass:[NSArray class]]) {
+                for (ACContactItem *item in gArr) {
+                    if (item.targetId.length > 0 && !self.groupMap[item.targetId]) {
+                        self.groupMap[item.targetId] = item;
+                        [self.groupList addObject:item];
+                    }
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+}
+
+#pragma mark - 2.1 腾讯云 IM 实时监听新人进群（8~15秒随机防封间隔）
+
+- (void)setupIMGroupWelcomeListener {
+    if (self.listenerRegistered) return;
+    Class v2Cls = NSClassFromString(@"V2TIMManager");
+    if (!v2Cls || ![v2Cls respondsToSelector:@selector(sharedInstance)]) return;
+    id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
+    if (!mgr) return;
+
+    SEL addGrpListenerSel = NSSelectorFromString(@"addGroupListener:");
+    if ([mgr respondsToSelector:addGrpListenerSel]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(mgr, addGrpListenerSel, self);
+        self.listenerRegistered = YES;
+    }
+
+    SEL addMsgListenerSel = NSSelectorFromString(@"addAdvancedMsgListener:");
+    if ([mgr respondsToSelector:addMsgListenerSel]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(mgr, addMsgListenerSel, self);
+        self.listenerRegistered = YES;
+    }
+}
+
+- (void)onMemberEnter:(NSString *)groupID memberList:(NSArray *)memberList {
+    [self handleNewMembersJoinedGroup:groupID memberList:memberList];
+}
+
+- (void)onMemberInvited:(NSString *)groupID opUser:(id)opUser memberList:(NSArray *)memberList {
+    [self handleNewMembersJoinedGroup:groupID memberList:memberList];
+}
+
+- (void)onRecvNewMessage:(id)msg {
+    if (!msg) return;
+    @try {
+        NSData *cData = [msg valueForKey:@"cloudCustomData"];
+        if ([cData isKindOfClass:[NSData class]] && cData.length > 10) {
+            NSDictionary *cDict = [NSJSONSerialization JSONObjectWithData:cData options:0 error:nil];
+            if ([cDict isKindOfClass:[NSDictionary class]] && cDict[@"client_typeV2"]) {
+                self.capturedClientTypeV2 = cDict[@"client_typeV2"];
+                self.capturedCloudCustomData = cData;
+            }
         }
-        free(ivars);
+
+        NSString *groupID = [msg valueForKey:@"groupID"];
+        if (!groupID || ![groupID isKindOfClass:[NSString class]] || groupID.length == 0) return;
+
+        NSString *sender = [msg valueForKey:@"sender"];
+        NSString *nickName = [msg valueForKey:@"nickName"] ?: [msg valueForKey:@"nameCard"];
+        if (sender && sender.length > 0) {
+            if ([self addGroupMemberWithId:sender name:nickName groupId:groupID role:@"群活跃" chatMeType:0]) {
+                [self saveLocalPermanentCache];
+            }
+        }
+
+        id tipsElem = [msg valueForKey:@"groupTipsElem"];
+        if (tipsElem) {
+            NSInteger tipsType = [[tipsElem valueForKey:@"type"] integerValue];
+            if (tipsType == 1 || tipsType == 2) {
+                NSArray *memberList = [tipsElem valueForKey:@"memberList"];
+                if ([memberList isKindOfClass:[NSArray class]] && memberList.count > 0) {
+                    [self handleNewMembersJoinedGroup:groupID memberList:memberList];
+                }
+            }
+        }
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 2. 核心大招：直接解析海鸥 AES 解密后的明文 JSON 字典 (全量截获排行榜与群成员)
+- (void)handleNewMembersJoinedGroup:(NSString *)groupID memberList:(NSArray *)memberList {
+    if (!groupID || ![memberList isKindOfClass:[NSArray class]] || memberList.count == 0) return;
 
-- (void)consumeDecryptedJSONObject:(id)jsonObj {
+    NSMutableArray<ACContactItem *> *newTargetsToGreet = [NSMutableArray array];
+
+    for (id mem in memberList) {
+        @try {
+            NSString *uid = [mem valueForKey:@"userID"];
+            if (!uid || ![uid isKindOfClass:[NSString class]] || uid.length < 5) continue;
+            if ([uid isEqualToString:self.selfUserId]) continue;
+
+            NSString *nick = [mem valueForKey:@"nickName"];
+            if (!nick || [nick isKindOfClass:[NSNull class]] || nick.length == 0) nick = [mem valueForKey:@"nameCard"];
+            if (!nick || [nick isKindOfClass:[NSNull class]] || nick.length == 0) nick = [mem valueForKey:@"friendRemark"];
+
+            [self addGroupMemberWithId:uid name:nick groupId:groupID role:@"新进群" chatMeType:0];
+
+            if (self.autoWelcomeEnabled && [self.welcomeGroupIds containsObject:groupID]) {
+                if (![self.greetedUserIds containsObject:uid]) {
+                    [self.greetedUserIds addObject:uid];
+                    ACContactItem *target = self.groupMemberMap[uid];
+                    if (!target) {
+                        target = [[ACContactItem alloc] init];
+                        target.targetId = uid;
+                        target.name = (nick && nick.length > 0) ? nick : uid;
+                        target.fromGroupId = groupID;
+                        target.sourceType = 1;
+                        target.chatMeType = 0;
+                    }
+                    [newTargetsToGreet addObject:target];
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+
+    [self saveLocalPermanentCache];
+    if (newTargetsToGreet.count == 0) return;
+
+    __block NSInteger idx = 0;
+    __weak typeof(self) weakSelf = self;
+    __block void (^greetNext)(void) = ^{
+        if (idx >= newTargetsToGreet.count) return;
+        ACContactItem *newMember = newTargetsToGreet[idx];
+
+        NSString *templateText = weakSelf.welcomeMessageText ?: @"";
+        NSString *displayNick = (newMember.name && ![newMember.name hasPrefix:@"群友_"]) ? newMember.name : @"新朋友";
+        NSString *finalGreeting = [templateText stringByReplacingOccurrencesOfString:@"{name}" withString:displayNick];
+
+        [weakSelf sendCurrentMediaAndText:finalGreeting toItem:newMember completion:^(BOOL ok, NSString *detail) {
+            if (ok) {
+                weakSelf.greetedCount++;
+                weakSelf.lastGreetLog = [NSString stringWithFormat:@"✅ 已安全迎新: %@ (共%ld人)", newMember.name, (long)weakSelf.greetedCount];
+            } else {
+                weakSelf.lastGreetLog = [NSString stringWithFormat:@"⚠️ 迎新 %@: %@", newMember.name, detail];
+            }
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+            idx++;
+            // 8.0 ~ 15.0 秒随机延迟
+            NSTimeInterval safeRandomDelay = 8.0 + (arc4random_uniform(71) / 10.0);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(safeRandomDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                greetNext();
+            });
+        }];
+    };
+
+    NSTimeInterval initialDelay = 8.0 + (arc4random_uniform(71) / 10.0);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(initialDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        greetNext();
+    });
+}
+
+#pragma mark - 2.2 联系人与群成员管理
+
+- (void)addFriendWithId:(NSString *)uid name:(NSString *)name tag:(NSString *)tag chatMeType:(NSInteger)chatMeType {
+    if (!uid) return;
+    NSString *cleanId = [[NSString stringWithFormat:@"%@", uid] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (cleanId.length < 5 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"-1"]) return;
+    if ([cleanId isEqualToString:self.selfUserId] || [cleanId hasSuffix:@"_collection"] || [cleanId hasPrefix:@"@TGS#"]) return;
+
+    NSString *cleanName = (name && ![name isKindOfClass:[NSNull class]]) ? [NSString stringWithFormat:@"%@", name] : @"";
+    if ([cleanName isEqualToString:@"柠檬008"] || [cleanName isEqualToString:@"收藏夹"]) return;
+
+    @synchronized (self) {
+        ACContactItem *existing = self.friendMap[cleanId];
+        if (existing) {
+            if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId] && ([existing.name isEqualToString:cleanId] || [existing.name hasPrefix:@"用户_"])) {
+                existing.name = cleanName;
+            }
+            existing.chatMeType = chatMeType;
+            if (tag && tag.length > 0) existing.roleDesc = tag;
+            return;
+        }
+
+        ACContactItem *item = [[ACContactItem alloc] init];
+        item.targetId = cleanId;
+        item.name = cleanName.length > 0 ? cleanName : [NSString stringWithFormat:@"用户_%@", [cleanId substringFromIndex:MAX(0, (int)cleanId.length - 4)]];
+        item.roleDesc = tag ?: @"好友";
+        item.sourceType = 0;
+        item.chatMeType = chatMeType;
+        item.isSelected = NO;
+
+        self.friendMap[cleanId] = item;
+        if (chatMeType == 0) {
+            [self.friendList insertObject:item atIndex:0];
+        } else {
+            [self.friendList addObject:item];
+        }
+    }
+}
+
+- (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)name groupId:(NSString *)gid role:(NSString *)role chatMeType:(NSInteger)chatMeType {
+    if (!uid) return NO;
+    NSString *cleanId = [[NSString stringWithFormat:@"%@", uid] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (cleanId.length < 5 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"-1"] || [cleanId isEqualToString:@"0"]) return NO;
+    if ([cleanId isEqualToString:self.selfUserId] || [cleanId hasPrefix:@"@TGS#"]) return NO;
+
+    NSString *cleanName = (name && ![name isKindOfClass:[NSNull class]]) ? [NSString stringWithFormat:@"%@", name] : @"";
+
+    @synchronized (self) {
+        ACContactItem *existing = self.groupMemberMap[cleanId];
+        if (existing) {
+            if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId] && ([existing.name isEqualToString:cleanId] || [existing.name hasPrefix:@"群友_"])) {
+                existing.name = cleanName;
+            }
+            if (gid && gid.length > 0) existing.fromGroupId = gid;
+            if (role && role.length > 0) existing.roleDesc = role;
+            existing.chatMeType = chatMeType;
+            return NO;
+        }
+
+        ACContactItem *item = [[ACContactItem alloc] init];
+        item.targetId = cleanId;
+        item.name = cleanName.length > 0 ? cleanName : [NSString stringWithFormat:@"群友_%@", [cleanId substringFromIndex:MAX(0, (int)cleanId.length - 4)]];
+        item.fromGroupId = gid ?: @"";
+        item.roleDesc = role ?: @"群成员";
+        item.sourceType = 1;
+        item.chatMeType = chatMeType;
+        item.isSelected = NO;
+
+        self.groupMemberMap[cleanId] = item;
+        if (chatMeType == 0) {
+            [self.groupMemberList insertObject:item atIndex:0];
+        } else {
+            [self.groupMemberList addObject:item];
+        }
+        return YES;
+    }
+}
+
+- (void)addGroupWithId:(NSString *)gid name:(NSString *)name ban:(BOOL)ban {
+    if (!gid) return;
+    NSString *cleanId = [[NSString stringWithFormat:@"%@", gid] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (cleanId.length < 3 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"0"]) return;
+    if (![cleanId hasPrefix:@"@TGS#"] && cleanId.length > 15) return;
+
+    NSString *cleanName = (name && ![name isKindOfClass:[NSNull class]]) ? [NSString stringWithFormat:@"%@", name] : @"";
+
+    @synchronized (self) {
+        self.groupBanStatusMap[cleanId] = @(ban);
+        ACContactItem *existing = self.groupMap[cleanId];
+        if (existing) {
+            if (cleanName.length > 0 && ![cleanName isEqualToString:cleanId] && [existing.name hasPrefix:@"群聊"]) {
+                existing.name = cleanName;
+            }
+            return;
+        }
+
+        ACContactItem *item = [[ACContactItem alloc] init];
+        item.targetId = cleanId;
+        item.name = cleanName.length > 0 ? cleanName : [NSString stringWithFormat:@"群聊 (%@)", cleanId];
+        item.sourceType = 2;
+        item.roleDesc = ban ? @"🔒 [禁言群]" : @"🟢 [开放群]";
+        item.chatMeType = 0;
+        item.isSelected = NO;
+
+        self.groupMap[cleanId] = item;
+        [self.groupList addObject:item];
+    }
+}
+
+- (void)parseJSONWithContext:(id)jsonObj {
     if (!jsonObj) return;
     if ([jsonObj isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)jsonObj;
-        
-        // 识别是否是用户/排行榜条目/群成员字典
-        id rawAccount = dict[@"account"] ?: dict[@"haiouNo"] ?: dict[@"userNo"];
-        id rawUserId  = dict[@"userId"]  ?: dict[@"id"]      ?: dict[@"uid"];
-        id rawNick    = dict[@"nickName"] ?: dict[@"nickname"] ?: dict[@"name"] ?: dict[@"showName"];
-        id rawAvatar  = dict[@"portrait"] ?: dict[@"avatar"]   ?: dict[@"headUrl"] ?: dict[@"icon"];
-        id rawGroupId = dict[@"groupId"] ?: dict[@"gid"];
-        id rawGroupNo = dict[@"groupNo"];
-        id rawRank    = dict[@"rank"] ?: dict[@"ranking"];
-        
-        // 如果是群聊字典 (含 groupNo)
-        if (rawGroupNo && rawNick) {
-            NSString *gNo = ExtractValidHaiouAccount([NSString stringWithFormat:@"%@", rawGroupNo]);
-            NSString *gId = [NSString stringWithFormat:@"%@", rawUserId ?: gNo];
-            NSString *gName = [NSString stringWithFormat:@"%@", rawNick];
-            if (gNo.length >= 4 && gName.length > 0) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    HOModelItem *item = self.joinedGroupsMap[gNo] ?: [[HOModelItem alloc] init];
-                    item.userId = gId;
-                    item.account = gNo;
-                    item.name = gName;
-                    if ([rawAvatar isKindOfClass:[NSString class]]) item.avatarUrl = rawAvatar;
-                    item.source = @"我的群聊";
-                    item.isGroup = YES;
-                    self.joinedGroupsMap[gNo] = item;
-                });
+        if (dict[@"appUserExperienceList"] || dict[@"realityValue"]) return;
+
+        if ([dict[@"objectId"] isKindOfClass:[NSString class]]) {
+            NSString *objStr = dict[@"objectId"];
+            if ([objStr hasPrefix:@"会话："]) {
+                __currentChatPeerId = [objStr substringFromIndex:3];
             }
         }
-        // 如果是人物字典 (必须有合法的海鸥号 account，绝不把 19 位 userId 串码当海鸥号！)
-        else if (rawAccount && rawNick) {
-            NSString *validAcc = ExtractValidHaiouAccount([NSString stringWithFormat:@"%@", rawAccount]);
-            NSString *uidStr   = rawUserId ? [NSString stringWithFormat:@"%@", rawUserId] : @"";
-            NSString *nameStr  = [NSString stringWithFormat:@"%@", rawNick];
-            NSString *avaStr   = [rawAvatar isKindOfClass:[NSString class]] ? (NSString *)rawAvatar : @"";
-            
-            if (validAcc.length >= 4 && !IsInternalSnowflakeId(validAcc) && !IsLevelOrNoiseText(nameStr) && ![uidStr isEqualToString:g_myLoginUserId]) {
-                BOOL isFromGroup = (rawGroupId != nil);
-                BOOL isFromRank  = (rawRank != nil || dict[@"exp"] != nil || dict[@"grade"] != nil || dict[@"level"] != nil);
-                
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    NSMutableDictionary *targetMap = isFromGroup ? self.groupMembersMap : (isFromRank ? self.rankUsersMap : self.rankUsersMap);
-                    HOModelItem *item = targetMap[validAcc];
-                    if (!item) {
-                        item = [[HOModelItem alloc] init];
-                        item.collectSeq = ++self.seqCounter;
-                    }
-                    if (uidStr.length > 0) item.userId = uidStr;
-                    item.account = validAcc;
-                    item.name = nameStr;
-                    if (avaStr.length > 0) item.avatarUrl = avaStr;
-                    if (isFromGroup) {
-                        item.source = [NSString stringWithFormat:@"群成员(群:%@)", rawGroupId];
-                    } else if (rawRank) {
-                        item.source = [NSString stringWithFormat:@"排行榜·第%@名", rawRank];
-                    } else if (!item.source) {
-                        item.source = @"接口全量提取";
-                    }
-                    item.isGroup = NO;
-                    targetMap[validAcc] = item;
-                });
+
+        if (dict[@"clientUserNickName"] && dict[@"id"] && dict[@"chatMeType"] && ![dict[@"chatMeType"] isKindOfClass:[NSNull class]]) {
+            NSString *uid = [NSString stringWithFormat:@"%@", dict[@"id"]];
+            NSString *nick = [NSString stringWithFormat:@"%@", dict[@"clientUserNickName"]];
+            NSInteger cmType = [[NSString stringWithFormat:@"%@", dict[@"chatMeType"]] integerValue];
+            [self addFriendWithId:uid name:nick tag:(cmType == 0 ? @"开放私聊(必达)" : @"限制非好友(chatMe=1)") chatMeType:cmType];
+            if (self.groupMemberMap[uid]) {
+                self.groupMemberMap[uid].chatMeType = cmType;
+                self.groupMemberMap[uid].name = nick;
             }
         }
-        
-        // 递归遍历字典子节点 (如 data / list / records / rows / members)
+
+        if ([dict[@"cloudCustomData"] isKindOfClass:[NSDictionary class]]) {
+            NSString *v2Token = dict[@"cloudCustomData"][@"client_typeV2"];
+            if (v2Token && [v2Token isKindOfClass:[NSString class]] && v2Token.length > 10) {
+                self.capturedClientTypeV2 = v2Token;
+            }
+        }
+
+        NSString *directId = [NSString stringWithFormat:@"%@", dict[@"id"] ?: @""];
+        if ([directId hasPrefix:@"@TGS#"] && dict[@"name"]) {
+            BOOL isBan = [[NSString stringWithFormat:@"%@", dict[@"ban"] ?: @"false"] isEqualToString:@"true"];
+            [self addGroupWithId:directId name:[NSString stringWithFormat:@"%@", dict[@"name"]] ban:isBan];
+            if (dict[@"owner"]) {
+                [self addGroupMemberWithId:[NSString stringWithFormat:@"%@", dict[@"owner"]] name:@"群主" groupId:directId role:@"群主" chatMeType:0];
+            }
+        }
+
+        NSString *groupId = [NSString stringWithFormat:@"%@", dict[@"groupId"] ?: @""];
+        if ([groupId hasPrefix:@"@TGS#"]) {
+            BOOL isBan = [[NSString stringWithFormat:@"%@", dict[@"ban"] ?: @"false"] isEqualToString:@"true"];
+            [self addGroupWithId:groupId name:dict[@"groupName"] ban:isBan];
+            if (dict[@"userId"] && [dict[@"userInfo"] isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *uInfo = dict[@"userInfo"];
+                NSInteger cmType = [[NSString stringWithFormat:@"%@", uInfo[@"chatMeType"] ?: @"0"] integerValue];
+                [self addGroupMemberWithId:[NSString stringWithFormat:@"%@", dict[@"userId"]]
+                                      name:uInfo[@"clientUserNickName"] ?: dict[@"customName"]
+                                   groupId:groupId
+                                      role:dict[@"customName"] ?: dict[@"role"] ?: @"群管"
+                                chatMeType:cmType];
+            }
+            if (dict[@"createUser"] && [dict[@"appUserInfo"] isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *uInfo = dict[@"appUserInfo"];
+                NSInteger cmType = [[NSString stringWithFormat:@"%@", uInfo[@"chatMeType"] ?: @"0"] integerValue];
+                [self addGroupMemberWithId:[NSString stringWithFormat:@"%@", uInfo[@"id"] ?: dict[@"createUser"]]
+                                      name:uInfo[@"clientUserNickName"]
+                                   groupId:groupId
+                                      role:@"群活跃"
+                                chatMeType:cmType];
+            }
+        }
+
         for (id key in dict) {
             id val = dict[key];
-            if ([val isKindOfClass:[NSArray class]] || [val isKindOfClass:[NSDictionary class]]) {
-                [self consumeDecryptedJSONObject:val];
+            if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
+                [self parseJSONWithContext:val];
             }
         }
     } else if ([jsonObj isKindOfClass:[NSArray class]]) {
         for (id sub in (NSArray *)jsonObj) {
-            if ([sub isKindOfClass:[NSDictionary class]] || [sub isKindOfClass:[NSArray class]]) {
-                [self consumeDecryptedJSONObject:sub];
-            }
+            [self parseJSONWithContext:sub];
         }
     }
 }
 
-#pragma mark - 3. 模型与 Cell 精准提取 (严格过滤19位串码与等级)
+#pragma mark - 2.3 群成员拉取
 
-- (void)harvestUserObject:(id)userObj source:(NSString *)source {
-    if (!userObj) return;
-    NSString *clsName = NSStringFromClass([userObj class]);
-    if (![clsName containsString:@"ZDUser"] || [clsName containsString:@"Controller"] || [clsName containsString:@"Cell"] || [clsName containsString:@"Manager"]) return;
-    
-    NSString *uid      = ReadSwiftStringByIvar(userObj, "id") ?: ReadSwiftStringByIvar(userObj, "userId");
-    NSString *rawAcc   = ReadSwiftStringByIvar(userObj, "account") ?: ReadSwiftStringByIvar(userObj, "username");
-    NSString *nickName = ReadSwiftStringByIvar(userObj, "nickName") ?: ReadSwiftStringByIvar(userObj, "name");
-    NSString *portrait = ReadSwiftStringByIvar(userObj, "portrait") ?: ReadSwiftStringByIvar(userObj, "avatar");
-    
-    NSString *validAcc = ExtractValidHaiouAccount(rawAcc);
-    if (!validAcc || IsInternalSnowflakeId(validAcc) || [uid isEqualToString:g_myLoginUserId]) return;
-    if (IsLevelOrNoiseText(nickName)) return;
-    
-    HOModelItem *item = _rankUsersMap[validAcc];
-    if (!item) {
-        item = [[HOModelItem alloc] init];
-        item.collectSeq = ++_seqCounter;
-    }
-    if (uid.length > 0) item.userId = uid;
-    item.account = validAcc;
-    item.name = nickName;
-    if (portrait.length > 0) item.avatarUrl = portrait;
-    if (!item.source) item.source = source ?: @"排行榜提取";
-    item.isGroup = NO;
-    _rankUsersMap[validAcc] = item;
-}
-
-- (void)harvestRankCell:(UICollectionViewCell *)cell indexPath:(NSIndexPath *)ip rankVC:(UIViewController *)rankVC {
-    if (!cell) return;
-    UILabel *accLab   = SafeCallObj(cell, @"zd_account");
-    UILabel *nameLab  = SafeCallObj(cell, @"zd_name");
-    UIView  *avatarV  = SafeCallObj(cell, @"zd_personAvatar");
-    UILabel *levelLab = SafeCallObj(cell, @"zd_level");
-    UILabel *rankLab  = SafeCallObj(cell, @"zd_rankLab");
-    UILabel *expLab   = SafeCallObj(cell, @"zd_exp");
-    UILabel *rateLab  = SafeCallObj(cell, @"zd_expUpgradeRate");
-    UILabel *meLab    = SafeCallObj(cell, @"zd_meLab");
-    UIView  *lvColl   = SafeCallObj(cell, @"zd_levelCollect");
-    
-    NSString *rawAcc = [accLab isKindOfClass:[UILabel class]] ? accLab.text : nil;
-    NSString *validAcc = ExtractValidHaiouAccount(rawAcc);
-    
-    NSString *realName = [nameLab isKindOfClass:[UILabel class]] ? [nameLab.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : nil;
-    if (IsLevelOrNoiseText(realName)) realName = nil;
-    
-    if (!realName || !validAcc) {
-        NSSet *excludeSet = [NSSet setWithArray:@[
-            accLab ?: [NSNull null], levelLab ?: [NSNull null], rankLab ?: [NSNull null],
-            expLab ?: [NSNull null], rateLab ?: [NSNull null], meLab ?: [NSNull null], lvColl ?: [NSNull null]
-        ]];
-        NSMutableArray<UILabel *> *otherLabels = [NSMutableArray array];
-        [self findValidLabelsInView:cell exclude:excludeSet outArr:otherLabels];
-        for (UILabel *lb in otherLabels) {
-            NSString *t = [lb.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if ([t containsString:@"海鸥号"] || [t containsString:@"ID"]) {
-                if (!validAcc) validAcc = ExtractValidHaiouAccount(t);
-                continue;
-            }
-            if (!realName && !IsLevelOrNoiseText(t) && ![t isEqualToString:validAcc]) {
-                realName = t;
-            }
-        }
-    }
-    
-    if (!validAcc || IsInternalSnowflakeId(validAcc) || !realName) return;
-    UIImage *avatarImg = ExtractAvatarImage(avatarV ?: cell);
-    
-    HOModelItem *item = _rankUsersMap[validAcc];
-    if (!item) {
-        item = [[HOModelItem alloc] init];
-        item.collectSeq = ++_seqCounter;
-    }
-    item.account = validAcc;
-    item.name = realName;
-    
-    NSString *rankTypeStr = @"排行榜";
-    if (rankVC) {
-        ptrdiff_t typeOff = GetRealIvarOffset([rankVC class], "zd_type");
-        if (typeOff > 0) {
-            uint8_t tVal = *((uint8_t *)(__bridge void *)rankVC + typeOff);
-            if (tVal == 1) rankTypeStr = @"日榜";
-            else if (tVal == 2) rankTypeStr = @"周榜";
-            else if (tVal == 3) rankTypeStr = @"总榜";
-        }
-    }
-    NSString *rkNum = ([rankLab isKindOfClass:[UILabel class]] && rankLab.text.length > 0) ? rankLab.text : [NSString stringWithFormat:@"%ld", (long)(ip ? ip.item + 1 : 0)];
-    item.source = [NSString stringWithFormat:@"%@·第%@名", rankTypeStr, rkNum];
-    item.isGroup = NO;
-    
-    if (avatarImg && !item.avatarData) {
-        item.avatarData = UIImagePNGRepresentation(avatarImg);
-    }
-    _rankUsersMap[validAcc] = item;
-}
-
-- (void)findValidLabelsInView:(UIView *)view exclude:(NSSet *)exclude outArr:(NSMutableArray<UILabel *> *)outArr {
-    if (!view || view.hidden || view.alpha < 0.01 || [exclude containsObject:view]) return;
-    if ([view isKindOfClass:[UILabel class]]) {
-        [outArr addObject:(UILabel *)view];
+- (void)crawlGroupMembersPageForGroup:(NSString *)gid
+                              nextSeq:(uint64_t)seq
+                            pageIndex:(NSInteger)pageIdx
+                             progress:(void(^)(NSString *msg))progressBlock
+                           completion:(void(^)(void))completion {
+    Class v2Cls = NSClassFromString(@"V2TIMManager");
+    if (!v2Cls || ![v2Cls respondsToSelector:@selector(sharedInstance)]) {
+        if (completion) completion();
         return;
     }
-    for (UIView *sub in view.subviews) {
-        [self findValidLabelsInView:sub exclude:exclude outArr:outArr];
-    }
-}
-
-- (void)harvestGroupObject:(id)groupObj {
-    if (!groupObj) return;
-    Class cls = [groupObj class];
-    if (![NSStringFromClass(cls) containsString:@"ZDGroup"] || [NSStringFromClass(cls) containsString:@"Member"] || [NSStringFromClass(cls) containsString:@"Controller"] || [NSStringFromClass(cls) containsString:@"Cell"]) return;
-    
-    [self unlockGroupOwnerPrivilege:groupObj];
-    
-    NSString *gid   = ReadSwiftStringByIvar(groupObj, "id");
-    NSString *gNo   = ReadSwiftStringByIvar(groupObj, "groupNo");
-    NSString *cover = ReadSwiftStringByIvar(groupObj, "cover");
-    NSString *gName = ReadSwiftStringByIvar(groupObj, "name");
-    
-    NSString *validNo = ExtractValidHaiouAccount(gNo) ?: gid;
-    if (validNo.length >= 4 && gName.length > 0) {
-        HOModelItem *item = _joinedGroupsMap[validNo] ?: [[HOModelItem alloc] init];
-        item.userId = gid ?: validNo;
-        item.account = ExtractValidHaiouAccount(gNo) ?: validNo;
-        item.name = gName;
-        item.avatarUrl = cover;
-        item.source = @"我的群聊(已开启群主权限)";
-        item.isGroup = YES;
-        _joinedGroupsMap[validNo] = item;
-    }
-    
-    // 检查 ZDGroup 内部的 members 数组
-    ptrdiff_t memOff = GetRealIvarOffset(cls, "members");
-    if (memOff > 0) {
-        @try {
-            id memArr = *(id __unsafe_unretained *)(void *)((uint8_t *)(__bridge void *)groupObj + memOff);
-            if ([memArr isKindOfClass:[NSArray class]]) {
-                for (id m in (NSArray *)memArr) {
-                    [self harvestGroupMemberObject:m];
-                }
-            }
-        } @catch (NSException *e) {}
-    }
-}
-
-- (void)harvestGroupMemberObject:(id)memberObj {
-    if (!memberObj) return;
-    Class cls = [memberObj class];
-    if (![NSStringFromClass(cls) containsString:@"ZDGroupMember"]) return;
-    
-    NSString *userId   = ReadSwiftStringByIvar(memberObj, "userId");
-    NSString *portrait = ReadSwiftStringByIvar(memberObj, "portrait");
-    NSString *rawAcc   = ReadSwiftStringByIvar(memberObj, "account");
-    NSString *nickName = ReadSwiftStringByIvar(memberObj, "nickName");
-    NSString *showName = ReadSwiftStringByIvar(memberObj, "showName");
-    NSString *groupId  = ReadSwiftStringByIvar(memberObj, "groupId");
-    
-    if ([userId isEqualToString:g_myLoginUserId]) {
-        [self unlockMemberOwnerPrivilege:memberObj];
+    id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
+    SEL getMemSel = NSSelectorFromString(@"getGroupMemberList:filter:nextSeq:succ:fail:");
+    if (![mgr respondsToSelector:getMemSel]) {
+        if (completion) completion();
         return;
     }
-    
-    // 严格要求必须有真实海鸥号 account，绝不把 19 位 userId 串码当成海鸥号！
-    NSString *validAcc = ExtractValidHaiouAccount(rawAcc);
-    if (!validAcc || IsInternalSnowflakeId(validAcc)) return;
-    
-    NSString *realName = (!IsLevelOrNoiseText(nickName)) ? nickName : showName;
-    if (IsLevelOrNoiseText(realName)) realName = validAcc;
-    
-    HOModelItem *item = _groupMembersMap[validAcc];
-    if (!item) {
-        item = [[HOModelItem alloc] init];
-        item.collectSeq = ++_seqCounter;
-    }
-    if (userId.length > 0) item.userId = userId;
-    item.account = validAcc;
-    item.name = realName;
-    if (portrait.length > 0) item.avatarUrl = portrait;
-    item.source = groupId.length > 0 ? [NSString stringWithFormat:@"群成员(群:%@)", [groupId substringToIndex:MIN(6, groupId.length)]] : @"群成员自动提取";
-    item.isGroup = NO;
-    _groupMembersMap[validAcc] = item;
-}
 
-- (void)harvestContactCell:(UITableViewCell *)cell {
-    if (!cell || ![NSStringFromClass([cell class]) containsString:@"ZDContactCell"]) return;
-    NSMutableArray<UILabel *> *lbs = [NSMutableArray array];
-    [self findValidLabelsInView:cell exclude:[NSSet set] outArr:lbs];
-    NSString *name = nil;
-    NSString *acc = nil;
-    for (UILabel *lb in lbs) {
-        NSString *t = [lb.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if ([t isEqualToString:@"新的朋友"] || [t isEqualToString:@"群聊"] || [t isEqualToString:@"我的群聊"] || [t isEqualToString:@"好友分组"] || [t isEqualToString:@"黑名单"]) return;
-        if ([t containsString:@"海鸥号"] || [t containsString:@"账号"]) {
-            acc = ExtractValidHaiouAccount(t);
-        } else if (!name && !IsLevelOrNoiseText(t) && ![t containsString:@"在线"] && ![t containsString:@"离线"]) {
-            name = t;
-        }
-    }
-    if (name.length > 0) {
-        NSString *key = acc.length >= 4 ? acc : name;
-        HOModelItem *item = _contactFriendsMap[key] ?: [[HOModelItem alloc] init];
-        item.account = acc ?: @"好友";
-        item.name = name;
-        item.source = @"通讯录好友";
-        item.isGroup = NO;
-        UIImage *img = ExtractAvatarImage(cell);
-        if (img && !item.avatarData) item.avatarData = UIImagePNGRepresentation(img);
-        _contactFriendsMap[key] = item;
-    }
-}
-
-#pragma mark - 4. 后台全自动静默获取所有群成员 (无需手动点进群设置)
-
-- (void)autoSilentFetchAllGroupMembersInBackground {
-    // 从根控制器找到 ZDMessageListController1，读取其 zd_groups 数组中的所有 ZDGroup 对象
-    UIWindow *win = [UIApplication sharedApplication].keyWindow;
-    if (!win) return;
-    UIViewController *root = win.rootViewController;
-    NSMutableArray<UIViewController *> *vcs = [NSMutableArray array];
-    if ([root isKindOfClass:[UITabBarController class]]) {
-        for (UIViewController *c in [(UITabBarController *)root viewControllers]) {
-            if ([c isKindOfClass:[UINavigationController class]]) [vcs addObjectsFromArray:[(UINavigationController *)c viewControllers]];
-            else [vcs addObject:c];
-        }
-    } else if ([root isKindOfClass:[UINavigationController class]]) {
-        [vcs addObjectsFromArray:[(UINavigationController *)root viewControllers]];
-    }
-    
-    NSMutableArray *allGroupObjs = [NSMutableArray array];
-    for (UIViewController *vc in vcs) {
-        if ([NSStringFromClass([vc class]) containsString:@"ZDMessageListController1"]) {
-            ptrdiff_t grpOff = GetRealIvarOffset([vc class], "zd_groups");
-            if (grpOff > 0) {
+    __weak typeof(self) weakSelf = self;
+    void (^succBlock)(uint64_t, NSArray *) = ^(uint64_t nextSeq, NSArray *memberList) {
+        if ([memberList isKindOfClass:[NSArray class]]) {
+            for (id mem in memberList) {
                 @try {
-                    id arr = *(id __unsafe_unretained *)(void *)((uint8_t *)(__bridge void *)vc + grpOff);
-                    if ([arr isKindOfClass:[NSArray class]]) {
-                        for (id g in (NSArray *)arr) {
-                            [self harvestGroupObject:g];
-                            [allGroupObjs addObject:g];
-                        }
-                    }
+                    NSString *uid = [mem valueForKey:@"userID"];
+                    NSString *nick = [mem valueForKey:@"nickName"];
+                    if (!nick || nick.length == 0) nick = [mem valueForKey:@"nameCard"];
+                    if (!nick || nick.length == 0) nick = [mem valueForKey:@"friendRemark"];
+                    [weakSelf addGroupMemberWithId:uid name:nick groupId:gid role:@"群成员" chatMeType:0];
                 } @catch (NSException *e) {}
             }
         }
-    }
-    
-    // 对每个尚未静默拉取过成员的 ZDGroup，在后台隐式实例化 ZDConversationGroupMemberListController 触发成员请求！
-    Class memListVCCls = objc_getClass("_TtC7ZhengDu37ZDConversationGroupMemberListController");
-    if (!memListVCCls || allGroupObjs.count == 0) return;
-    
-    [_hiddenMemberVCs removeAllObjects];
-    NSInteger delayIdx = 0;
-    for (id groupObj in allGroupObjs) {
-        NSString *gid = ReadSwiftStringByIvar(groupObj, "id");
-        if (!gid || [_autoFetchedGroupIds containsObject:gid]) continue;
-        [_autoFetchedGroupIds addObject:gid];
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((delayIdx * 1.2) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            @try {
-                UIViewController *mvc = [[memListVCCls alloc] init];
-                if (mvc) {
-                    // 将 groupObj 赋给 ZDConversationGroupMemberListController 的 group 类型 Ivar
-                    unsigned int ic = 0;
-                    Ivar *ivars = class_copyIvarList(memListVCCls, &ic);
-                    uint8_t *mBase = (uint8_t *)(__bridge void *)mvc;
-                    if (ivars) {
-                        for (unsigned int k = 0; k < ic; k++) {
-                            const char *iname = ivar_getName(ivars[k]);
-                            ptrdiff_t ioff = ivar_getOffset(ivars[k]);
-                            if (iname && ioff > 0) {
-                                NSString *ns = [[NSString stringWithUTF8String:iname] lowercaseString];
-                                if ([ns containsString:@"group"] && ![ns containsString:@"member"] && ![ns containsString:@"id"]) {
-                                    *(id __strong *)(void *)(mBase + ioff) = groupObj;
-                                }
-                            }
-                        }
-                        free(ivars);
-                    }
-                    // 触发 viewDidLoad 让其在后台向服务端请求该群的 ZDGroupMember 列表！
-                    mvc.view.frame = CGRectMake(-3000, -3000, 320, 480);
-                    [self.hiddenMemberVCs addObject:mvc];
-                }
-            } @catch (NSException *e) {}
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (progressBlock) {
+                progressBlock([NSString stringWithFormat:@"⏳ 定向采集(第%ld页)：已获 %lu 人...",
+                               (long)(pageIdx + 1), (unsigned long)weakSelf.groupMemberList.count]);
+            }
         });
-        delayIdx++;
-        if (delayIdx >= 8) break; // 每次最多并发静默拉取 8 个群，防限流
-    }
-}
 
-#pragma mark - 5. 排行榜突破 200 人限制：多榜 (type=1,2,3) + 自动递增页码 (zd_page=1..20)
+        if (pageIdx % 5 == 0) [weakSelf saveLocalPermanentCache];
 
-- (void)toggleMultiPageRankFetch:(void (^)(NSString *))statusBlock {
-    _onStatusChanged = statusBlock;
-    if (_isFetchingRank) {
-        [self stopMultiPageRankFetch];
-        return;
-    }
-    _isFetchingRank = YES;
-    _currentRankPage = 1;
-    [_hiddenRankVCs removeAllObjects];
-    
-    // 1. 先检查当前界面是否已经打开了 ZDGlobalTopController，将其子控制器纳入采集
-    Class rankItemCls = objc_getClass("_TtC7ZhengDu25ZDGlobalTopItemController");
-    if (rankItemCls) {
-        UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
-        // 逆向报告与抓包 (source: 17) 显示 type=1(日榜), type=2(周榜), type=3(总榜)
-        for (uint8_t t = 1; t <= 3; t++) {
-            UIViewController *vc = [[rankItemCls alloc] init];
-            if (vc) {
-                ptrdiff_t typeOff = GetRealIvarOffset(rankItemCls, "zd_type");
-                if (typeOff > 0) *((uint8_t *)(__bridge void *)vc + typeOff) = t;
-                
-                ptrdiff_t pageOff = GetRealIvarOffset(rankItemCls, "zd_page");
-                if (pageOff > 0) *(NSInteger *)((uint8_t *)(__bridge void *)vc + pageOff) = 1;
-                
-                ptrdiff_t sizeOff = GetRealIvarOffset(rankItemCls, "zd_size");
-                if (sizeOff > 0) *(NSInteger *)((uint8_t *)(__bridge void *)vc + sizeOff) = 100;
-                
-                vc.view.frame = CGRectMake(-2000, -2000, 390, 844);
-                [keyWin addSubview:vc.view];
-                if ([vc respondsToSelector:NSSelectorFromString(@"zd_willShowVC")]) {
-                    ((void (*)(id, SEL))objc_msgSend)(vc, NSSelectorFromString(@"zd_willShowVC"));
-                }
-                [_hiddenRankVCs addObject:vc];
-            }
+        if (nextSeq != 0 && nextSeq != seq && memberList.count > 0 && pageIdx < 800) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [weakSelf crawlGroupMembersPageForGroup:gid nextSeq:nextSeq pageIndex:pageIdx + 1 progress:progressBlock completion:completion];
+            });
+        } else {
+            if (completion) completion();
         }
-    }
-    
-    if (_onStatusChanged) {
-        _onStatusChanged([NSString stringWithFormat:@"🚀 正在同步拉取日榜/周榜/总榜 (第1页 | 已获%lu人)...", (unsigned long)_rankUsersMap.count]);
-    }
-    _rankTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(stepMultiPageRankFetch) userInfo:nil repeats:YES];
+    };
+
+    void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) { if (completion) completion(); };
+
+    NSMethodSignature *sig = [mgr methodSignatureForSelector:getMemSel];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:mgr];
+    [inv setSelector:getMemSel];
+    uint32_t filter = 0;
+    uint64_t currentSeq = seq;
+    [inv setArgument:&gid atIndex:2];
+    [inv setArgument:&filter atIndex:3];
+    [inv setArgument:&currentSeq atIndex:4];
+    [inv setArgument:&succBlock atIndex:5];
+    [inv setArgument:&failBlock atIndex:6];
+    [inv invoke];
 }
 
-- (void)stopMultiPageRankFetch {
-    _isFetchingRank = NO;
-    if (_rankTimer) {
-        [_rankTimer invalidate];
-        _rankTimer = nil;
-    }
-    for (UIViewController *vc in _hiddenRankVCs) {
-        [vc.view removeFromSuperview];
-    }
-    [_hiddenRankVCs removeAllObjects];
-    [self saveToDisk];
-    if (_onStatusChanged) {
-        _onStatusChanged([NSString stringWithFormat:@"✅ 排行榜采集已暂停 (累计获取 %lu 名真实海鸥号用户)", (unsigned long)_rankUsersMap.count]);
-    }
-}
-
-- (void)stepMultiPageRankFetch {
-    if (!_isFetchingRank || _hiddenRankVCs.count == 0) {
-        [self stopMultiPageRankFetch];
+- (void)crawlGroupHistoryMessages:(NSString *)gid
+                          lastMsg:(id)lastMsg
+                        pageIndex:(NSInteger)pageIdx
+                       completion:(void(^)(void))completion {
+    Class v2Cls = NSClassFromString(@"V2TIMManager");
+    if (!v2Cls || ![v2Cls respondsToSelector:@selector(sharedInstance)]) {
+        if (completion) completion();
         return;
     }
-    
-    _currentRankPage++;
-    Class rankItemCls = objc_getClass("_TtC7ZhengDu25ZDGlobalTopItemController");
-    ptrdiff_t collectOff = GetRealIvarOffset(rankItemCls, "$__lazy_storage_$_zd_collect");
-    ptrdiff_t pageOff    = GetRealIvarOffset(rankItemCls, "zd_page");
-    ptrdiff_t datasOff   = GetRealIvarOffset(rankItemCls, "zd_datas");
-    
-    for (UIViewController *vc in _hiddenRankVCs) {
-        uint8_t *base = (uint8_t *)(__bridge void *)vc;
-        
-        // 1. 直接尝试读取 zd_datas Swift Array 缓冲区中的模型对象！
-        if (datasOff > 0) {
+    id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
+    SEL getHistSel = NSSelectorFromString(@"getGroupHistoryMessageList:count:lastMsg:succ:fail:");
+    if (![mgr respondsToSelector:getHistSel]) {
+        if (completion) completion();
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    void (^succBlock)(NSArray *) = ^(NSArray *msgs) {
+        if (![msgs isKindOfClass:[NSArray class]] || msgs.count == 0) {
+            if (completion) completion();
+            return;
+        }
+        for (id msg in msgs) {
             @try {
-                uintptr_t storagePtr = *(uintptr_t *)(base + datasOff);
-                if (storagePtr > 0x100000000ULL && (storagePtr & 0x7) == 0) {
-                    // Swift ContiguousArrayStorage: +16 是 count, +32 起是元素指针数组
-                    NSInteger count = *(NSInteger *)((uint8_t *)storagePtr + 16);
-                    if (count > 0 && count <= 2000) {
-                        id __unsafe_unretained *items = (id __unsafe_unretained *)(void *)((uint8_t *)storagePtr + 32);
-                        for (NSInteger i = 0; i < count; i++) {
-                            id elem = items[i];
-                            if (elem) [self harvestUserObject:elem source:@"排行榜内存直读"];
-                        }
-                    }
-                }
+                NSString *sender = [msg valueForKey:@"sender"];
+                NSString *nick = [msg valueForKey:@"nickName"] ?: [msg valueForKey:@"nameCard"];
+                [weakSelf addGroupMemberWithId:sender name:nick groupId:gid role:@"群发言" chatMeType:0];
             } @catch (NSException *e) {}
         }
-        
-        // 2. 提取可见 Cell 并推进滚动 + 递增页码触发 mj_footer 加载下一页 (offset=2, 3, 4...)
-        UICollectionView *cv = (collectOff > 0) ? *(UICollectionView * __unsafe_unretained *)(void *)(base + collectOff) : nil;
-        if ([cv isKindOfClass:[UICollectionView class]]) {
-            for (UICollectionViewCell *cell in cv.visibleCells) {
-                NSIndexPath *ip = [cv indexPathForCell:cell];
-                [self harvestRankCell:cell indexPath:ip rankVC:vc];
-            }
-            CGFloat nextY = cv.contentOffset.y + cv.bounds.size.height * 1.5;
-            CGFloat maxY  = MAX(0, cv.contentSize.height - cv.bounds.size.height);
-            if (nextY < maxY) {
-                [cv setContentOffset:CGPointMake(0, nextY) animated:NO];
-                [cv layoutIfNeeded];
-            } else {
-                // 已滚到底部，递增 zd_page 并触发 mj_footer 上拉加载更多
-                if (pageOff > 0) {
-                    *(NSInteger *)(base + pageOff) = _currentRankPage;
-                }
-                @try {
-                    id footer = [cv valueForKey:@"mj_footer"];
-                    if (footer) {
-                        if ([footer respondsToSelector:NSSelectorFromString(@"resetNoMoreData")]) {
-                            ((void (*)(id, SEL))objc_msgSend)(footer, NSSelectorFromString(@"resetNoMoreData"));
-                        }
-                        if ([footer respondsToSelector:NSSelectorFromString(@"beginRefreshing")]) {
-                            ((void (*)(id, SEL))objc_msgSend)(footer, NSSelectorFromString(@"beginRefreshing"));
-                        } else if ([footer respondsToSelector:NSSelectorFromString(@"executeRefreshingCallback")]) {
-                            ((void (*)(id, SEL))objc_msgSend)(footer, NSSelectorFromString(@"executeRefreshingCallback"));
-                        }
-                    }
-                } @catch (NSException *e) {}
-            }
+        if (msgs.count >= 50 && pageIdx < 25) {
+            id oldestMsg = [msgs lastObject];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [weakSelf crawlGroupHistoryMessages:gid lastMsg:oldestMsg pageIndex:pageIdx + 1 completion:completion];
+            });
+        } else {
+            if (completion) completion();
         }
-    }
-    
-    [self saveToDisk];
-    if (_onStatusChanged) {
-        _onStatusChanged([NSString stringWithFormat:@"🔥 正在深度拉取日榜/周榜/总榜 (第%ld轮 | 已获 %lu 人)", (long)_currentRankPage, (unsigned long)_rankUsersMap.count]);
-    }
+    };
+    void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) { if (completion) completion(); };
+
+    NSMethodSignature *sig = [mgr methodSignatureForSelector:getHistSel];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:mgr];
+    [inv setSelector:getHistSel];
+    int count = 100;
+    id lastM = lastMsg;
+    [inv setArgument:&gid atIndex:2];
+    [inv setArgument:&count atIndex:3];
+    [inv setArgument:&lastM atIndex:4];
+    [inv setArgument:&succBlock atIndex:5];
+    [inv setArgument:&failBlock atIndex:6];
+    [inv invoke];
 }
 
-#pragma mark - 6. 点击任意用户 -> 直接进入该用户的个人主页 (无需手动输入搜索)
+- (void)scanLocalDatabases {
+    NSString *home = NSHomeDirectory();
+    NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:home];
+    NSString *relPath;
+    while ((relPath = [enumerator nextObject])) {
+        NSString *lower = relPath.lowercaseString;
+        if ([lower containsString:@"ranking"]) continue;
+        if ([lower hasSuffix:@".db"] || [lower hasSuffix:@".sqlite"] || [lower hasSuffix:@".sqlite3"]) {
+            NSString *fullPath = [home stringByAppendingPathComponent:relPath];
+            sqlite3 *db = NULL;
+            if (sqlite3_open_v2([fullPath UTF8String], &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                sqlite3_stmt *tableStmt = NULL;
+                if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table';", -1, &tableStmt, NULL) == SQLITE_OK) {
+                    NSMutableArray<NSString *> *tables = [NSMutableArray array];
+                    while (sqlite3_step(tableStmt) == SQLITE_ROW) {
+                        const char *tName = (const char *)sqlite3_column_text(tableStmt, 0);
+                        if (tName) [tables addObject:[NSString stringWithUTF8String:tName]];
+                    }
+                    sqlite3_finalize(tableStmt);
 
-- (void)openDirectUserHomePageForItem:(HOModelItem *)item fromVC:(UIViewController *)fromVC {
-    if (!item || !fromVC) return;
-    UINavigationController *nav = fromVC.navigationController;
-    if (!nav && [fromVC isKindOfClass:[UINavigationController class]]) nav = (UINavigationController *)fromVC;
-    if (!nav) return;
-    
-    // 复制纯海鸥号备用
-    NSString *pureAcc = ExtractValidHaiouAccount(item.account);
-    if (pureAcc) [UIPasteboard generalPasteboard].string = pureAcc;
-    
-    // 方案 A：如果该条目已经有内部 19 位 userId，尝试直接构造 ZDUser 并推入原生个人主页 ZDNewUserInfoController
-    Class userCls = objc_getClass("_TtC7ZhengDu6ZDUser");
-    Class newUserInfoVCCls = objc_getClass("_TtC7ZhengDu21ZDNewUserInfoController");
-    if (item.userId.length >= 10 && userCls && newUserInfoVCCls) {
-        @try {
-            id userObj = [[userCls alloc] init];
-            if (userObj) {
-                WriteSwiftStringByIvar(userObj, "id", item.userId);
-                WriteSwiftStringByIvar(userObj, "userId", item.userId);
-                if (pureAcc) WriteSwiftStringByIvar(userObj, "account", pureAcc);
-                if (item.name) WriteSwiftStringByIvar(userObj, "nickName", item.name);
-                
-                UIViewController *infoVC = [[newUserInfoVCCls alloc] init];
-                if (infoVC) {
-                    // 将 userObj 写入 ZDNewUserInfoController 的 user Ivar
-                    unsigned int ic = 0;
-                    Ivar *ivars = class_copyIvarList(newUserInfoVCCls, &ic);
-                    uint8_t *vcBase = (uint8_t *)(__bridge void *)infoVC;
-                    BOOL injected = NO;
-                    if (ivars) {
-                        for (unsigned int i = 0; i < ic; i++) {
-                            const char *n = ivar_getName(ivars[i]);
-                            ptrdiff_t off = ivar_getOffset(ivars[i]);
-                            if (n && off > 0) {
-                                NSString *ns = [NSString stringWithUTF8String:n];
-                                if ([ns isEqualToString:@"zd_user"] || [ns isEqualToString:@"user"]) {
-                                    *(id __strong *)(void *)(vcBase + off) = userObj;
-                                    injected = YES;
-                                } else if ([ns isEqualToString:@"zd_userId"] || [ns isEqualToString:@"userId"]) {
-                                    WriteSwiftStringByIvar(infoVC, n, item.userId);
-                                    injected = YES;
+                    for (NSString *t in tables) {
+                        NSString *sql = [NSString stringWithFormat:@"SELECT * FROM \"%@\" LIMIT 50000;", t];
+                        sqlite3_stmt *rowStmt = NULL;
+                        if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &rowStmt, NULL) == SQLITE_OK) {
+                            int colCount = sqlite3_column_count(rowStmt);
+                            while (sqlite3_step(rowStmt) == SQLITE_ROW) {
+                                for (int c = 0; c < colCount; c++) {
+                                    const char *colText = (const char *)sqlite3_column_text(rowStmt, c);
+                                    if (!colText) continue;
+                                    NSString *v = [NSString stringWithUTF8String:colText];
+                                    if ([v hasPrefix:@"{"] || [v hasPrefix:@"["]) {
+                                        NSData *d = [v dataUsingEncoding:NSUTF8StringEncoding];
+                                        id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                                        if (j) [self parseJSONWithContext:j];
+                                    }
                                 }
                             }
+                            sqlite3_finalize(rowStmt);
                         }
-                        free(ivars);
-                    }
-                    if (injected) {
-                        infoVC.hidesBottomBarWhenPushed = YES;
-                        [nav pushViewController:infoVC animated:YES];
-                        return;
                     }
                 }
+                sqlite3_close(db);
             }
-        } @catch (NSException *e) {}
-    }
-    
-    // 方案 B：对于只有纯海鸥号 (如 8666688) 的用户，调起 ZDAddFriendOrGroupController 并在后台自动执行搜索跳转到该人主页！
-    Class addVCCls = objc_getClass("_TtC7ZhengDu28ZDAddFriendOrGroupController");
-    if (addVCCls && pureAcc.length >= 4) {
-        UIViewController *addVC = [[addVCCls alloc] init];
-        if (addVC) {
-            addVC.hidesBottomBarWhenPushed = YES;
-            [nav pushViewController:addVC animated:YES];
-            
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                UITextField *tf = [self findTextFieldInView:addVC.view];
-                if (tf) {
-                    tf.text = pureAcc;
-                    [tf sendActionsForControlEvents:UIControlEventEditingChanged];
-                    // 自动触发回车搜索代理，海鸥将直接发起 GET /api/sys/open?username=xxx 并自动跳转到该用户的主页！
-                    if (tf.delegate && [tf.delegate respondsToSelector:@selector(textFieldShouldReturn:)]) {
-                        [tf.delegate textFieldShouldReturn:tf];
-                    }
-                    [tf resignFirstResponder];
-                }
-            });
         }
     }
 }
 
-- (UITextField *)findTextFieldInView:(UIView *)view {
-    if (!view) return nil;
-    if ([view isKindOfClass:[UITextField class]]) return (UITextField *)view;
+- (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
+                        progress:(void(^)(NSString *progressMsg))progressBlock
+                      completion:(void(^)(NSString *finalMsg))completion {
+    [self setupIMGroupWelcomeListener];
+    [self scanLocalDatabases];
+
+    if (!targetGroupIds || targetGroupIds.count == 0) {
+        if (completion) completion(@"❌ 请先在「群聊」面板勾选要采集的群！");
+        return;
+    }
+
+    dispatch_group_t memberCrawlGroup = dispatch_group_create();
+    for (NSString *gid in targetGroupIds) {
+        if (![gid hasPrefix:@"@TGS#"]) continue;
+
+        dispatch_group_enter(memberCrawlGroup);
+        [self crawlGroupMembersPageForGroup:gid nextSeq:0 pageIndex:0 progress:progressBlock completion:^{
+            dispatch_group_leave(memberCrawlGroup);
+        }];
+
+        dispatch_group_enter(memberCrawlGroup);
+        [self crawlGroupHistoryMessages:gid lastMsg:nil pageIndex:0 completion:^{
+            dispatch_group_leave(memberCrawlGroup);
+        }];
+    }
+
+    dispatch_group_notify(memberCrawlGroup, dispatch_get_main_queue(), ^{
+        [self saveLocalPermanentCache];
+        [self saveWelcomeSettings];
+        NSString *finalStr = [NSString stringWithFormat:@"✅ 指定群采集完成：共有 %lu 个群成员", (unsigned long)self.groupMemberList.count];
+        if (completion) completion(finalStr);
+    });
+}
+
+- (void)reloadAllDataWithProgress:(void(^)(NSString *progressMsg))progressBlock
+                       completion:(void(^)(NSString *finalMsg))completion {
+    [self setupIMGroupWelcomeListener];
+    [self scanLocalDatabases];
+
+    Class v2Cls = NSClassFromString(@"V2TIMManager");
+    if (!v2Cls || ![v2Cls respondsToSelector:@selector(sharedInstance)]) {
+        [self saveLocalPermanentCache];
+        if (completion) completion(@"IM未就绪，已加载本地永久缓存");
+        return;
+    }
+
+    id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
+    dispatch_group_t baseGroup = dispatch_group_create();
+
+    SEL getGroupsSel = NSSelectorFromString(@"getJoinedGroupList:fail:");
+    if ([mgr respondsToSelector:getGroupsSel]) {
+        dispatch_group_enter(baseGroup);
+        void (^succBlock)(NSArray *) = ^(NSArray *groupInfos) {
+            for (id gInfo in groupInfos) {
+                @try {
+                    NSString *gid = [gInfo valueForKey:@"groupID"];
+                    NSString *gName = [gInfo valueForKey:@"groupName"];
+                    [self addGroupWithId:gid name:gName ban:NO];
+                } @catch (NSException *e) {}
+            }
+            dispatch_group_leave(baseGroup);
+        };
+        void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) { dispatch_group_leave(baseGroup); };
+        ((void (*)(id, SEL, id, id))objc_msgSend)(mgr, getGroupsSel, succBlock, failBlock);
+    }
+
+    dispatch_group_notify(baseGroup, dispatch_get_main_queue(), ^{
+        NSArray<ACContactItem *> *allGroups = [self.groupList copy];
+        if (allGroups.count == 0) {
+            [self saveLocalPermanentCache];
+            if (completion) completion([NSString stringWithFormat:@"已就绪：%lu 好友 | %lu 群成员 | %lu 群聊",
+                                        (unsigned long)self.friendList.count,
+                                        (unsigned long)self.groupMemberList.count,
+                                        (unsigned long)self.groupList.count]);
+            return;
+        }
+
+        dispatch_group_t memberCrawlGroup = dispatch_group_create();
+        for (ACContactItem *grp in allGroups) {
+            NSString *gid = grp.targetId;
+            if (![gid hasPrefix:@"@TGS#"]) continue;
+
+            dispatch_group_enter(memberCrawlGroup);
+            [self crawlGroupMembersPageForGroup:gid nextSeq:0 pageIndex:0 progress:progressBlock completion:^{
+                dispatch_group_leave(memberCrawlGroup);
+            }];
+
+            dispatch_group_enter(memberCrawlGroup);
+            [self crawlGroupHistoryMessages:gid lastMsg:nil pageIndex:0 completion:^{
+                dispatch_group_leave(memberCrawlGroup);
+            }];
+        }
+
+        dispatch_group_notify(memberCrawlGroup, dispatch_get_main_queue(), ^{
+            [self saveLocalPermanentCache];
+            [self saveWelcomeSettings];
+            NSString *finalStr = [NSString stringWithFormat:@"✅ 已永久保存：%lu 好友 | %lu 群成员 | %lu 群聊",
+                                  (unsigned long)self.friendList.count,
+                                  (unsigned long)self.groupMemberList.count,
+                                  (unsigned long)self.groupList.count];
+            if (completion) completion(finalStr);
+        });
+    });
+}
+
+#pragma mark - 3. 防封号文本动态混淆包装
+
+- (NSString *)obfuscateMessageText:(NSString *)originalText {
+    if (!originalText || originalText.length == 0) return @"";
+    NSArray *tails = @[@"~", @" ✨", @" 👍", @" 😊", @" ~", @" 💡"];
+    NSString *randomTail = tails[arc4random_uniform((uint32_t)tails.count)];
+    return [originalText stringByAppendingString:randomTail];
+}
+
+#pragma mark - 4. 破盾发送引擎（已移除手掌表情模拟，直接后端加好友加单聊）
+
+- (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
+    if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
+        if (completion) completion();
+        return;
+    }
+    dispatch_group_t apiGroup = dispatch_group_create();
+
+    dispatch_group_enter(apiGroup);
+    NSMutableURLRequest *req1 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/userfriends/add"]];
+    req1.HTTPMethod = @"POST";
+    [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+        [req1 setValue:v forHTTPHeaderField:k];
+    }];
+    [req1 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    req1.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"friendId": targetUserId} options:0 error:nil];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req1 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        dispatch_group_leave(apiGroup);
+    }] resume];
+
+    dispatch_group_enter(apiGroup);
+    NSMutableURLRequest *req2 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/useronechat/add"]];
+    req2.HTTPMethod = @"POST";
+    [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+        [req2 setValue:v forHTTPHeaderField:k];
+    }];
+    [req2 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    req2.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"chatWithHimId": targetUserId, @"id": targetUserId, @"userId": self.selfUserId} options:0 error:nil];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req2 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        dispatch_group_leave(apiGroup);
+    }] resume];
+
+    dispatch_group_notify(apiGroup, dispatch_get_main_queue(), ^{
+        if (completion) completion();
+    });
+}
+
+- (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
+    Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+    Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
+    if (v2MgrCls && reqCls) {
+        id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+        SEL addFriendSel = NSSelectorFromString(@"addFriend:succ:fail:");
+        if ([manager respondsToSelector:addFriendSel]) {
+            id req = [[reqCls alloc] init];
+            @try {
+                [req setValue:userId forKey:@"userID"];
+                [req setValue:@"你好" forKey:@"addWording"];
+                [req setValue:@(2) forKey:@"addType"];
+            } @catch (NSException *e) {}
+            void (^succ)(id) = ^(id res) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
+            void (^fail)(int, NSString *) = ^(int c, NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
+            ((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, addFriendSel, req, succ, fail);
+            return;
+        }
+    }
+    if (completion) completion();
+}
+
+- (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
+    Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+    id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+    SEL sendMsgSel = NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:");
+
+    if (!v2Msg || ![manager respondsToSelector:sendMsgSel]) {
+        if (completion) completion(NO, -1, @"构造消息失败");
+        return;
+    }
+
+    @try {
+        if (self.capturedCloudCustomData) {
+            [v2Msg setValue:self.capturedCloudCustomData forKey:@"cloudCustomData"];
+        } else {
+            NSDictionary *nativeCustom = @{
+                @"client_typeV2": self.capturedClientTypeV2 ?: @"79b3h7aOxJurSbzVhPK2Wal1cKQzfppVutid7[d]gEtuxYU87uiCm3l2gMp7d5Eo3KZS3hFxBn8Db[d]yag55Ev1I3W[a]7xF6oF0FSXM[s]",
+                @"client_type": @"iOS"
+            };
+            NSData *customData = [NSJSONSerialization dataWithJSONObject:nativeCustom options:0 error:nil];
+            if (customData) [v2Msg setValue:customData forKey:@"cloudCustomData"];
+        }
+    } @catch (NSException *e) {}
+
+    BOOL isGroup = (item.sourceType == 2);
+    NSString *receiver = isGroup ? nil : item.targetId;
+    NSString *groupID = isGroup ? item.targetId : nil;
+
+    void (^succBlock)(void) = ^{
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, 0, nil); });
+    };
+    void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, code, desc); });
+    };
+
+    NSMethodSignature *sig = [manager methodSignatureForSelector:sendMsgSel];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:manager];
+    [inv setSelector:sendMsgSel];
+    [inv setArgument:&v2Msg atIndex:2];
+    [inv setArgument:&receiver atIndex:3];
+    [inv setArgument:&groupID atIndex:4];
+    NSInteger priority = 1;
+    BOOL onlineOnly = NO;
+    id nilObj = nil;
+    [inv setArgument:&priority atIndex:5];
+    [inv setArgument:&onlineOnly atIndex:6];
+    [inv setArgument:&nilObj atIndex:7];
+    [inv setArgument:&nilObj atIndex:8];
+    [inv setArgument:&succBlock atIndex:9];
+    [inv setArgument:&failBlock atIndex:10];
+    [inv invoke];
+}
+
+- (void)sendCurrentMediaAndText:(NSString *)text
+                         toItem:(ACContactItem *)item
+                     completion:(void(^)(BOOL ok, NSString *detail))completion {
+    Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+    if (!v2MgrCls || ![v2MgrCls respondsToSelector:@selector(sharedInstance)]) {
+        if (completion) completion(NO, @"IM未初始化");
+        return;
+    }
+    id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    id v2MediaMsg = nil;
+    if (self.savedMediaType == 1 && [fm fileExistsAtPath:[self permanentImagePath]]) {
+        SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
+        if ([manager respondsToSelector:createImgSel]) {
+            v2MediaMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createImgSel, [self permanentImagePath]);
+        }
+    } else if (self.savedMediaType == 2 && [fm fileExistsAtPath:[self permanentVideoPath]]) {
+        SEL createVidSel = NSSelectorFromString(@"createVideoMessage:type:duration:snapshotPath:");
+        if ([manager respondsToSelector:createVidSel]) {
+            NSString *vPath = [self permanentVideoPath];
+            NSString *vType = @"mp4";
+            int dur = self.savedVideoDuration > 0 ? self.savedVideoDuration : 5;
+            NSString *sPath = [fm fileExistsAtPath:[self permanentVideoThumbPath]] ? [self permanentVideoThumbPath] : @"";
+
+            NSMethodSignature *sig = [manager methodSignatureForSelector:createVidSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            [inv setTarget:manager];
+            [inv setSelector:createVidSel];
+            [inv setArgument:&vPath atIndex:2];
+            [inv setArgument:&vType atIndex:3];
+            [inv setArgument:&dur atIndex:4];
+            [inv setArgument:&sPath atIndex:5];
+            [inv invoke];
+            __unsafe_unretained id tempVideoMsg = nil;
+            [inv getReturnValue:&tempVideoMsg];
+            v2MediaMsg = tempVideoMsg;
+        }
+    }
+
+    NSString *cleanText = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *obfuscatedText = cleanText.length > 0 ? [self obfuscateMessageText:cleanText] : @"";
+    id v2TextMsg = nil;
+    if (obfuscatedText.length > 0) {
+        SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
+        if ([manager respondsToSelector:createTextSel]) {
+            v2TextMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, obfuscatedText);
+        }
+    }
+
+    id primaryMsg = v2MediaMsg ?: v2TextMsg;
+    if (!primaryMsg) {
+        if (completion) completion(NO, @"内容为空");
+        return;
+    }
+
+    [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok, int code, NSString *desc) {
+        if (ok) {
+            item.chatMeType = 0;
+            if (v2MediaMsg && v2TextMsg) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [self rawSendV2Message:v2TextMsg toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
+                        if (completion) completion(YES, self.savedMediaType == 2 ? @"视频+文送达" : @"图+文送达");
+                    }];
+                });
+            } else {
+                if (completion) completion(YES, self.savedMediaType == 2 ? @"视频送达" : (self.savedMediaType == 1 ? @"图片送达" : @"文本送达"));
+            }
+            return;
+        }
+
+        if (item.sourceType != 2) {
+            item.chatMeType = 1;
+            [self callAirChatBackendAddFriendAndUnlock:item.targetId completion:^{
+                [self autoAddIMFriend:item.targetId completion:^{
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
+                            if (ok2) {
+                                if (v2MediaMsg && v2TextMsg) {
+                                    [self rawSendV2Message:v2TextMsg toItem:item completion:nil];
+                                }
+                                if (completion) completion(YES, @"破盾成功");
+                            } else {
+                                if (completion) completion(NO, @"(120001)已自动申请加好友");
+                            }
+                        }];
+                    });
+                }];
+            }];
+        } else {
+            if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"群禁言"]);
+        }
+    }];
+}
+
+@end
+
+#pragma mark - 4. 转发助手弹窗控制器
+
+@interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource, UINavigationControllerDelegate, UIImagePickerControllerDelegate, UITextViewDelegate>
+@property (nonatomic, strong) UIView *headerContainer;
+@property (nonatomic, strong) UITextView *contentTextView;
+@property (nonatomic, strong) UIImageView *previewImageView;
+@property (nonatomic, strong) UIButton *pickMediaBtn;
+@property (nonatomic, strong) UIButton *clearMediaBtn;
+@property (nonatomic, strong) UILabel *mediaBadgeLabel;
+@property (nonatomic, strong) UISegmentedControl *tabControl;
+@property (nonatomic, strong) UIView *actionBar;
+@property (nonatomic, strong) UIView *welcomeControlBar;
+@property (nonatomic, strong) UISwitch *welcomeSwitch;
+@property (nonatomic, strong) UILabel *welcomeSwitchLabel;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) UIButton *floatingSendBtn;
+@end
+
+@implementation ACForwardAssistantVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"转发与迎新助手";
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    self.edgesForExtendedLayout = UIRectEdgeNone;
+    self.extendedLayoutIncludesOpaqueBars = NO;
+
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain target:self action:@selector(dismissSelf)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"全量刷新" style:UIBarButtonItemStyleDone target:self action:@selector(refreshData)];
+
+    [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onWelcomeStatusUpdate) name:@"ACWelcomeStatusUpdated" object:nil];
+
+    [self setupCleanUI];
+    [self refreshMediaPreviewUI];
+    [self updateUI];
+
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    if (mgr.friendList.count > 0 || mgr.groupMemberList.count > 0) {
+        self.statusLabel.text = [NSString stringWithFormat:@"📁 本地永久缓存：%lu 好友 | %lu 群成员 | %lu 群聊",
+                                 (unsigned long)mgr.friendList.count,
+                                 (unsigned long)mgr.groupMemberList.count,
+                                 (unsigned long)mgr.groupList.count];
+    } else {
+        [self refreshData];
+    }
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)onWelcomeStatusUpdate {
+    if (self.tabControl.selectedSegmentIndex == 3) {
+        self.statusLabel.textColor = [UIColor systemGreenColor];
+        self.statusLabel.text = [ACForwardHelperManager shared].lastGreetLog;
+        [self updateUI];
+    }
+}
+
+- (void)setupCleanUI {
+    CGFloat width = self.view.bounds.size.width;
+
+    self.headerContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 236)];
+    self.headerContainer.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    [self.view addSubview:self.headerContainer];
+
+    CGFloat imgBoxW = 86.0;
+    self.contentTextView = [[UITextView alloc] initWithFrame:CGRectMake(16, 18, width - 32 - imgBoxW - 10, 84)];
+    self.contentTextView.font = [UIFont systemFontOfSize:15];
+    self.contentTextView.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
+    self.contentTextView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    self.contentTextView.layer.cornerRadius = 12;
+    self.contentTextView.layer.borderColor = [UIColor separatorColor].CGColor;
+    self.contentTextView.layer.borderWidth = 0.5;
+    self.contentTextView.delegate = self;
+    if (__pendingForwardText && __pendingForwardText.length > 0) {
+        self.contentTextView.text = __pendingForwardText;
+    } else {
+        self.contentTextView.text = [ACForwardHelperManager shared].welcomeMessageText ?: @"您好，认识一下！";
+    }
+    [self.headerContainer addSubview:self.contentTextView];
+
+    self.previewImageView = [[UIImageView alloc] initWithFrame:CGRectMake(width - 16 - imgBoxW, 18, imgBoxW, 84)];
+    self.previewImageView.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    self.previewImageView.layer.cornerRadius = 12;
+    self.previewImageView.layer.borderColor = [UIColor separatorColor].CGColor;
+    self.previewImageView.layer.borderWidth = 0.5;
+    self.previewImageView.contentMode = UIViewContentModeScaleAspectFill;
+    self.previewImageView.clipsToBounds = YES;
+    self.previewImageView.userInteractionEnabled = YES;
+    [self.headerContainer addSubview:self.previewImageView];
+
+    self.pickMediaBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.pickMediaBtn.frame = self.previewImageView.bounds;
+    self.pickMediaBtn.titleLabel.numberOfLines = 2;
+    self.pickMediaBtn.titleLabel.textAlignment = NSTextAlignmentCenter;
+    self.pickMediaBtn.titleLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightSemibold];
+    [self.pickMediaBtn addTarget:self action:@selector(chooseMediaFromAlbum) forControlEvents:UIControlEventTouchUpInside];
+    [self.previewImageView addSubview:self.pickMediaBtn];
+
+    self.mediaBadgeLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 62, imgBoxW, 22)];
+    self.mediaBadgeLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.65];
+    self.mediaBadgeLabel.textColor = [UIColor whiteColor];
+    self.mediaBadgeLabel.font = [UIFont boldSystemFontOfSize:10];
+    self.mediaBadgeLabel.textAlignment = NSTextAlignmentCenter;
+    self.mediaBadgeLabel.hidden = YES;
+    [self.previewImageView addSubview:self.mediaBadgeLabel];
+
+    self.clearMediaBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.clearMediaBtn.frame = CGRectMake(imgBoxW - 24, 2, 22, 22);
+    self.clearMediaBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.65];
+    self.clearMediaBtn.layer.cornerRadius = 11;
+    [self.clearMediaBtn setTitle:@"✕" forState:UIControlStateNormal];
+    self.clearMediaBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    self.clearMediaBtn.hidden = YES;
+    [self.clearMediaBtn addTarget:self action:@selector(clearSelectedMedia) forControlEvents:UIControlEventTouchUpInside];
+    [self.previewImageView addSubview:self.clearMediaBtn];
+
+    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友(0)", @"群成员(0)", @"群聊(0)", @"🤖迎新"]];
+    self.tabControl.frame = CGRectMake(16, 114, width - 32, 34);
+    self.tabControl.selectedSegmentIndex = 1;
+    [self.tabControl addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
+    [self.headerContainer addSubview:self.tabControl];
+
+    self.actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 158, width - 32, 34)];
+    NSArray *btnTitles = @[@"🟢只选必达", @"🗑️清群成员", @"🎯定向采集", @"清空已选"];
+    CGFloat btnW = (width - 32 - 24) / 4.0;
+    for (int i = 0; i < 4; i++) {
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+        btn.frame = CGRectMake(i * (btnW + 8), 0, btnW, 34);
+        [btn setTitle:btnTitles[i] forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold];
+        btn.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+        btn.layer.cornerRadius = 8;
+        btn.tag = 600 + i;
+        [btn addTarget:self action:@selector(quickSelectAction:) forControlEvents:UIControlEventTouchUpInside];
+        [self.actionBar addSubview:btn];
+    }
+    [self.headerContainer addSubview:self.actionBar];
+
+    self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 156, width - 32, 38)];
+    self.welcomeControlBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    self.welcomeControlBar.layer.cornerRadius = 10;
+    self.welcomeControlBar.hidden = YES;
+
+    self.welcomeSwitchLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, width - 190, 38)];
+    self.welcomeSwitchLabel.font = [UIFont boldSystemFontOfSize:12.5];
+    self.welcomeSwitchLabel.text = @"🤖 迎新(8-15秒随机 | 自动带图/视频)";
+    [self.welcomeControlBar addSubview:self.welcomeSwitchLabel];
+
+    UIButton *allWelcomeGrpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    allWelcomeGrpBtn.frame = CGRectMake(width - 32 - 118, 5, 56, 28);
+    [allWelcomeGrpBtn setTitle:@"全选群" forState:UIControlStateNormal];
+    allWelcomeGrpBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    allWelcomeGrpBtn.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    allWelcomeGrpBtn.layer.cornerRadius = 6;
+    [allWelcomeGrpBtn addTarget:self action:@selector(selectAllWelcomeGroups) forControlEvents:UIControlEventTouchUpInside];
+    [self.welcomeControlBar addSubview:allWelcomeGrpBtn];
+
+    self.welcomeSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(width - 32 - 56, 3.5, 51, 31)];
+    self.welcomeSwitch.on = [ACForwardHelperManager shared].autoWelcomeEnabled;
+    [self.welcomeSwitch addTarget:self action:@selector(welcomeSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.welcomeControlBar addSubview:self.welcomeSwitch];
+    [self.headerContainer addSubview:self.welcomeControlBar];
+
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 200, width - 32, 24)];
+    self.statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    self.statusLabel.textColor = [UIColor secondaryLabelColor];
+    self.statusLabel.textAlignment = NSTextAlignmentCenter;
+    self.statusLabel.adjustsFontSizeToFitWidth = YES;
+    [self.headerContainer addSubview:self.statusLabel];
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.tableView.delegate = self;
+    self.tableView.dataSource = self;
+    self.tableView.rowHeight = 56.0;
+    self.tableView.contentInset = UIEdgeInsetsMake(4, 0, 100, 0);
+    [self.view addSubview:self.tableView];
+
+    [self setupFloatingButton];
+}
+
+- (void)refreshMediaPreviewUI {
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    if (mgr.savedMediaType == 1 && mgr.savedImage) {
+        self.previewImageView.image = mgr.savedImage;
+        [self.pickMediaBtn setTitle:@"" forState:UIControlStateNormal];
+        self.clearMediaBtn.hidden = NO;
+        self.mediaBadgeLabel.hidden = NO;
+        self.mediaBadgeLabel.text = @"🖼️ 永久图片";
+    } else if (mgr.savedMediaType == 2 && mgr.savedImage) {
+        self.previewImageView.image = mgr.savedImage;
+        [self.pickMediaBtn setTitle:@"" forState:UIControlStateNormal];
+        self.clearMediaBtn.hidden = NO;
+        self.mediaBadgeLabel.hidden = NO;
+        self.mediaBadgeLabel.text = [NSString stringWithFormat:@"🎬 视频(%ds)", mgr.savedVideoDuration];
+    } else {
+        self.previewImageView.image = nil;
+        [self.pickMediaBtn setTitle:@"🖼️/🎬\n选图或视频" forState:UIControlStateNormal];
+        self.clearMediaBtn.hidden = YES;
+        self.mediaBadgeLabel.hidden = YES;
+    }
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat width = self.view.bounds.size.width;
+    CGFloat height = self.view.bounds.size.height;
+    CGFloat topOffset = self.view.safeAreaInsets.top;
+
+    CGFloat headerH = 232.0;
+    self.headerContainer.frame = CGRectMake(0, topOffset, width, headerH);
+
+    CGFloat tableY = topOffset + headerH;
+    self.tableView.frame = CGRectMake(0, tableY, width, height - tableY);
+
+    if (self.floatingSendBtn && self.floatingSendBtn.tag != 999) {
+        CGFloat btnW = 138.0;
+        CGFloat btnH = 50.0;
+        CGFloat x = width - btnW - 20.0;
+        CGFloat y = height - btnH - MAX(28.0, self.view.safeAreaInsets.bottom + 12.0);
+        self.floatingSendBtn.frame = CGRectMake(x, y, btnW, btnH);
+    }
+    [self.view bringSubviewToFront:self.headerContainer];
+    [self.view bringSubviewToFront:self.floatingSendBtn];
+}
+
+- (void)setupFloatingButton {
+    self.floatingSendBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.floatingSendBtn.backgroundColor = [UIColor systemBlueColor];
+    [self.floatingSendBtn setTitle:@"🚀 发送 (0)" forState:UIControlStateNormal];
+    [self.floatingSendBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.floatingSendBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    self.floatingSendBtn.layer.cornerRadius = 25.0;
+    self.floatingSendBtn.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.floatingSendBtn.layer.shadowOffset = CGSizeMake(0, 4);
+    self.floatingSendBtn.layer.shadowOpacity = 0.3;
+    self.floatingSendBtn.layer.shadowRadius = 8.0;
+    [self.floatingSendBtn addTarget:self action:@selector(startBatchSend) forControlEvents:UIControlEventTouchUpInside];
+
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [self.floatingSendBtn addGestureRecognizer:pan];
+    [self.view addSubview:self.floatingSendBtn];
+}
+
+- (void)handlePan:(UIPanGestureRecognizer * _Nonnull)pan {
+    UIView *btn = pan.view;
+    btn.tag = 999;
+    CGPoint translation = [pan translationInView:self.view];
+    btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
+    [pan setTranslation:CGPointZero inView:self.view];
+}
+
+- (void)textViewDidChange:(UITextView * _Nonnull)textView {
+    if (self.tabControl.selectedSegmentIndex == 3) {
+        [ACForwardHelperManager shared].welcomeMessageText = textView.text;
+        [[ACForwardHelperManager shared] saveWelcomeSettings];
+    }
+}
+
+- (void)welcomeSwitchChanged:(UISwitch * _Nonnull)sw {
+    [self.view endEditing:YES];
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    mgr.autoWelcomeEnabled = sw.isOn;
+    mgr.welcomeMessageText = self.contentTextView.text;
+    [mgr saveWelcomeSettings];
+    [mgr setupIMGroupWelcomeListener];
+
+    if (sw.isOn) {
+        NSString *mediaTip = mgr.savedMediaType == 2 ? @"+永久视频" : (mgr.savedMediaType == 1 ? @"+永久图片" : @"纯文本");
+        self.statusLabel.textColor = [UIColor systemGreenColor];
+        self.statusLabel.text = [NSString stringWithFormat:@"🟢 迎新已开启(8-15秒随机|%@) | 监控 %lu 群", mediaTip, (unsigned long)mgr.welcomeGroupIds.count];
+    } else {
+        self.statusLabel.textColor = [UIColor secondaryLabelColor];
+        self.statusLabel.text = @"⚪ 迎新已关闭";
+    }
+    [self updateUI];
+}
+
+- (void)selectAllWelcomeGroups {
+    [self.view endEditing:YES];
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    if (mgr.welcomeGroupIds.count < mgr.groupList.count) {
+        for (ACContactItem *g in mgr.groupList) {
+            [mgr.welcomeGroupIds addObject:g.targetId];
+        }
+    } else {
+        [mgr.welcomeGroupIds removeAllObjects];
+    }
+    [mgr saveWelcomeSettings];
+    [self updateUI];
+    [self.tableView reloadData];
+}
+
+- (void)chooseMediaFromAlbum {
+    [self.view endEditing:YES];
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.mediaTypes = @[@"public.image", @"public.movie"];
+    picker.videoQuality = UIImagePickerControllerQualityTypeMedium;
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)imagePickerController:(UIImagePickerController * _Nonnull)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> * _Nonnull)info {
+    NSString *mediaType = info[UIImagePickerControllerMediaType];
+    if ([mediaType isEqualToString:@"public.movie"]) {
+        NSURL *videoURL = info[UIImagePickerControllerMediaURL];
+        if (videoURL) {
+            [[ACForwardHelperManager shared] savePermanentVideoAtURL:videoURL];
+            self.statusLabel.textColor = [UIColor systemGreenColor];
+            self.statusLabel.text = [NSString stringWithFormat:@"🎬 视频已永久保存(%d秒)，群发与迎新均自动携带！", [ACForwardHelperManager shared].savedVideoDuration];
+        }
+    } else {
+        UIImage *img = info[UIImagePickerControllerOriginalImage];
+        if (img) {
+            [[ACForwardHelperManager shared] savePermanentImage:img];
+            self.statusLabel.textColor = [UIColor systemGreenColor];
+            self.statusLabel.text = @"🖼️ 图片已永久保存到本地，关闭弹窗或迎新均不会掉图！";
+        }
+    }
+    [self refreshMediaPreviewUI];
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)clearSelectedMedia {
+    [[ACForwardHelperManager shared] clearPermanentMedia];
+    [self refreshMediaPreviewUI];
+    self.statusLabel.textColor = [UIColor secondaryLabelColor];
+    self.statusLabel.text = @"已清除永久图片/视频";
+}
+
+- (void)refreshData {
+    [self.view endEditing:YES];
+    self.statusLabel.textColor = [UIColor systemBlueColor];
+    self.statusLabel.text = @"⏳ 正在全量递归拉取...";
+    __weak typeof(self) weakSelf = self;
+    [[ACForwardHelperManager shared] reloadAllDataWithProgress:^(NSString *progressMsg) {
+        weakSelf.statusLabel.text = progressMsg;
+        [weakSelf updateUI];
+        [weakSelf.tableView reloadData];
+    } completion:^(NSString *finalMsg) {
+        weakSelf.statusLabel.textColor = [UIColor secondaryLabelColor];
+        weakSelf.statusLabel.text = finalMsg;
+        [weakSelf updateUI];
+        [weakSelf.tableView reloadData];
+    }];
+}
+
+- (NSArray<ACContactItem *> *)currentItems {
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    if (self.tabControl.selectedSegmentIndex == 0) return mgr.friendList;
+    if (self.tabControl.selectedSegmentIndex == 1) return mgr.groupMemberList;
+    return mgr.groupList;
+}
+
+- (void)quickSelectAction:(UIButton * _Nonnull)sender {
+    [self.view endEditing:YES];
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    
+    if (sender.tag == 600) {
+        for (ACContactItem *i in [self currentItems]) {
+            i.isSelected = (i.chatMeType == 0);
+        }
+    } else if (sender.tag == 601) {
+        [mgr clearAllGroupMembersCache];
+        self.statusLabel.textColor = [UIColor systemOrangeColor];
+        self.statusLabel.text = @"🗑️ 已清空本地群成员缓存";
+        [self updateUI];
+        [self.tableView reloadData];
+        return;
+    } else if (sender.tag == 602) {
+        if (self.tabControl.selectedSegmentIndex == 2) {
+            NSMutableArray<NSString *> *selectedGids = [NSMutableArray array];
+            for (ACContactItem *g in mgr.groupList) {
+                if (g.isSelected) [selectedGids addObject:g.targetId];
+            }
+            if (selectedGids.count == 0) {
+                self.statusLabel.textColor = [UIColor systemRedColor];
+                self.statusLabel.text = @"❌ 请先在群聊列表中勾选要采集的群！";
+                return;
+            }
+            self.statusLabel.textColor = [UIColor systemBlueColor];
+            self.statusLabel.text = @"⏳ 正在定向采集勾选群的成员...";
+            __weak typeof(self) weakSelf = self;
+            [mgr reloadSelectedGroupsData:selectedGids progress:^(NSString *msg) {
+                weakSelf.statusLabel.text = msg;
+                [weakSelf updateUI];
+                [weakSelf.tableView reloadData];
+            } completion:^(NSString *finalMsg) {
+                weakSelf.statusLabel.textColor = [UIColor systemGreenColor];
+                weakSelf.statusLabel.text = finalMsg;
+                [weakSelf updateUI];
+                [weakSelf.tableView reloadData];
+            }];
+            return;
+        } else {
+            self.statusLabel.textColor = [UIColor systemRedColor];
+            self.statusLabel.text = @"💡 请先切换到【群聊】面板勾选群，再点定向采集！";
+            return;
+        }
+    } else if (sender.tag == 603) {
+        for (ACContactItem *i in mgr.friendList) i.isSelected = NO;
+        for (ACContactItem *i in mgr.groupMemberList) i.isSelected = NO;
+        for (ACContactItem *i in mgr.groupList) i.isSelected = NO;
+    }
+    [self updateUI];
+    [self.tableView reloadData];
+}
+
+- (void)tabChanged {
+    [self.view endEditing:YES];
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    BOOL isWelcomeTab = (self.tabControl.selectedSegmentIndex == 3);
+
+    self.actionBar.hidden = isWelcomeTab;
+    self.welcomeControlBar.hidden = !isWelcomeTab;
+    self.floatingSendBtn.hidden = isWelcomeTab;
+
+    if (isWelcomeTab) {
+        self.contentTextView.text = mgr.welcomeMessageText ?: @"您w好 {name}，欢迎进群！认识一下~";
+        NSString *mediaDesc = mgr.savedMediaType == 2 ? @"🎬带视频" : (mgr.savedMediaType == 1 ? @"🖼️带图片" : @"纯文字");
+        self.statusLabel.textColor = mgr.autoWelcomeEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+        self.statusLabel.text = [NSString stringWithFormat:@"%@(%@) | 勾选要监听新人的群 (已选%lu个)",
+                                 mgr.autoWelcomeEnabled ? @"🟢 8-15s迎新中" : @"⚪ 迎新未开启",
+                                 mediaDesc,
+                                 (unsigned long)mgr.welcomeGroupIds.count];
+    }
+
+    [self updateUI];
+    [self.tableView reloadData];
+}
+
+- (void)updateUI {
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    [self.tabControl setTitle:[NSString stringWithFormat:@"好友(%lu)", (unsigned long)mgr.friendList.count] forSegmentAtIndex:0];
+    [self.tabControl setTitle:[NSString stringWithFormat:@"群成员(%lu)", (unsigned long)mgr.groupMemberList.count] forSegmentAtIndex:1];
+    [self.tabControl setTitle:[NSString stringWithFormat:@"群聊(%lu)", (unsigned long)mgr.groupList.count] forSegmentAtIndex:2];
+    [self.tabControl setTitle:[NSString stringWithFormat:@"🤖迎新(%@)", mgr.autoWelcomeEnabled ? @"开" : @"关"] forSegmentAtIndex:3];
+
+    NSInteger selCount = 0;
+    for (ACContactItem *i in mgr.friendList) if (i.isSelected) selCount++;
+    for (ACContactItem *i in mgr.groupMemberList) if (i.isSelected) selCount++;
+    for (ACContactItem *i in mgr.groupList) if (i.isSelected) selCount++;
+
+    [self.floatingSendBtn setTitle:[NSString stringWithFormat:@"🚀 发送 (%ld)", (long)selCount] forState:UIControlStateNormal];
+}
+
+- (NSInteger)tableView:(UITableView * _Nonnull)tableView numberOfRowsInSection:(NSInteger)section {
+    return [self currentItems].count;
+}
+
+- (UITableViewCell * _Nonnull)tableView:(UITableView * _Nonnull)tableView cellForRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
+    static NSString *cid = @"ACContactCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cid];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
+        cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
+        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+    }
+    ACContactItem *item = [self currentItems][indexPath.row];
+
+    if (self.tabControl.selectedSegmentIndex == 3) {
+        BOOL isMonitored = [[ACForwardHelperManager shared].welcomeGroupIds containsObject:item.targetId];
+        cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", isMonitored ? @"📡 [监控迎新中]" : @"👥 [未监控]", item.name];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"群ID: %@ (点击切换是否监控新人进群)", item.targetId];
+        cell.accessoryType = isMonitored ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+        return cell;
+    }
+
+    NSString *badge = @"";
+    if (item.sourceType == 2) {
+        BOOL banned = [ACForwardHelperManager shared].groupBanStatusMap[item.targetId].boolValue;
+        badge = banned ? @"🔒 [禁言群]" : @"🟢 [开放群]";
+    } else if (item.chatMeType == 0) {
+        badge = [NSString stringWithFormat:@"🟢 [%@]", item.roleDesc ?: @"可直聊"];
+    } else {
+        badge = @"🔒 [仅好友可聊]";
+    }
+    cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", badge, item.name];
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"ID: %@ %@", item.targetId, item.fromGroupId.length > 0 ? [NSString stringWithFormat:@"| 群:%@", item.fromGroupId] : @""];
+    cell.accessoryType = item.isSelected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    return cell;
+}
+
+- (void)tableView:(UITableView * _Nonnull)tableView didSelectRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    [self.view endEditing:YES];
+    ACContactItem *item = [self currentItems][indexPath.row];
+
+    if (self.tabControl.selectedSegmentIndex == 3) {
+        ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+        if ([mgr.welcomeGroupIds containsObject:item.targetId]) {
+            [mgr.welcomeGroupIds removeObject:item.targetId];
+        } else {
+            [mgr.welcomeGroupIds addObject:item.targetId];
+        }
+        [mgr saveWelcomeSettings];
+        self.statusLabel.text = [NSString stringWithFormat:@"%@ | 已勾选监控 %lu 个群",
+                                 mgr.autoWelcomeEnabled ? @"🟢 迎新监听中" : @"⚪ 迎新未开启",
+                                 (unsigned long)mgr.welcomeGroupIds.count];
+        [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+        return;
+    }
+
+    item.isSelected = !item.isSelected;
+    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+    [self updateUI];
+}
+
+- (void)startBatchSend {
+    [self.view endEditing:YES];
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    NSString *text = [self.contentTextView.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (text.length == 0 && mgr.savedMediaType == 0) {
+        self.statusLabel.textColor = [UIColor systemRedColor];
+        self.statusLabel.text = @"❌ 请输入文字，或选择一张图片/视频！";
+        return;
+    }
+
+    NSMutableArray<ACContactItem *> *targets = [NSMutableArray array];
+    for (ACContactItem *i in mgr.friendList) if (i.isSelected) [targets addObject:i];
+    for (ACContactItem *i in mgr.groupMemberList) if (i.isSelected) [targets addObject:i];
+    for (ACContactItem *i in mgr.groupList) if (i.isSelected) [targets addObject:i];
+
+    if (targets.count == 0) {
+        self.statusLabel.textColor = [UIColor systemRedColor];
+        self.statusLabel.text = @"❌ 请先勾选好友、群成员或群聊！";
+        return;
+    }
+
+    self.floatingSendBtn.enabled = NO;
+    __block NSInteger okCount = 0;
+    __block NSInteger failCount = 0;
+    __block NSString *lastFail = @"";
+    __block NSInteger idx = 0;
+    NSInteger total = targets.count;
+    __weak typeof(self) weakSelf = self;
+
+    __block void (^nextStep)(void) = ^{
+        if (idx >= total) {
+            weakSelf.floatingSendBtn.enabled = YES;
+            weakSelf.statusLabel.textColor = okCount > 0 ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
+            weakSelf.statusLabel.text = [NSString stringWithFormat:@"✅ 发送完成：成功送达 %ld | 受限已处理 %ld %@", (long)okCount, (long)failCount, lastFail];
+            [weakSelf.tableView reloadData];
+            return;
+        }
+        ACContactItem *cur = targets[idx];
+        weakSelf.statusLabel.textColor = [UIColor systemBlueColor];
+        weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在发送 (%ld/%ld): %@", (long)(idx + 1), (long)total, cur.name];
+
+        [[ACForwardHelperManager shared] sendCurrentMediaAndText:text toItem:cur completion:^(BOOL ok, NSString *detail) {
+            if (ok) okCount++;
+            else { failCount++; lastFail = detail ?: @""; }
+            idx++;
+            NSTimeInterval randDelay = 3.5 + (arc4random_uniform(31) / 10.0);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                nextStep();
+            });
+        }];
+    };
+    nextStep();
+}
+
+- (void)dismissSelf {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+@end
+
+#pragma mark - 5. 视图树提取工具
+
+static UIImage *ACFindLargestImageInView(UIView *view) {
+    if (!view || view.hidden || view.alpha < 0.05) return nil;
+    UIImage *bestImg = nil;
+    CGFloat maxArea = 0;
+
+    if ([view isKindOfClass:[UIImageView class]]) {
+        UIImageView *iv = (UIImageView *)view;
+        if (iv.image && iv.bounds.size.width > 45 && iv.bounds.size.height > 45) {
+            bestImg = iv.image;
+            maxArea = iv.bounds.size.width * iv.bounds.size.height;
+        }
+    }
     for (UIView *sub in view.subviews) {
-        UITextField *tf = [self findTextFieldInView:sub];
-        if (tf) return tf;
+        UIImage *subImg = ACFindLargestImageInView(sub);
+        if (subImg && (sub.bounds.size.width * sub.bounds.size.height >= maxArea)) {
+            bestImg = subImg;
+            maxArea = sub.bounds.size.width * sub.bounds.size.height;
+        }
+    }
+    return bestImg;
+}
+
+static NSString *ACFindChatTextInView(UIView *view) {
+    if (!view || view.hidden) return nil;
+    if ([view isKindOfClass:[UITextView class]]) {
+        NSString *t = ((UITextView *)view).text;
+        if (t.length > 0) return t;
+    }
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)view).text;
+        if (t.length > 0 && ![t hasSuffix:@"✓"] && t.length > 2) {
+            return t;
+        }
+    }
+    for (UIView *sub in view.subviews) {
+        NSString *subText = ACFindChatTextInView(sub);
+        if (subText.length > 0) return subText;
     }
     return nil;
 }
 
-@end
-
-#pragma mark - ==================== 6. 群发与拓客助手 UI 面板 ====================
-
-@interface HOMassHelperViewController : UIViewController <UITableViewDelegate, UITableViewDataSource>
-@property (nonatomic, strong) UISegmentedControl *tabSegment;
-@property (nonatomic, strong) UIButton *rankFetchBtn;
-@property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UITableView *tableView;
-@property (nonatomic, strong) NSArray<HOModelItem *> *currentList;
-@end
-
-@implementation HOMassHelperViewController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"海鸥全自动拓客与群发中心";
-    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
-    
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"返回" style:UIBarButtonItemStylePlain target:self action:@selector(closeSelf)];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"清空缓存" style:UIBarButtonItemStylePlain target:self action:@selector(clearAllConfirm)];
-    
-    [self buildUI];
-    
-    // 打开面板时，自动在后台静默拉取所有已加入群的群成员！
-    [[HOMassEngine shared] autoSilentFetchAllGroupMembersInBackground];
-    [self refreshTableList];
-}
-
-- (void)viewWillDisappear:(BOOL)animated {
-    [super viewWillDisappear:animated];
-    [[HOMassEngine shared] stopMultiPageRankFetch];
-}
-
-- (void)closeSelf {
-    if (self.navigationController && self.navigationController.viewControllers.firstObject != self) {
-        [self.navigationController popViewControllerAnimated:YES];
-    } else {
-        [self dismissViewControllerAnimated:YES completion:nil];
+static UITextView *ACFindInputTextViewInView(UIView *view) {
+    if (!view || view.hidden) return nil;
+    if ([view isKindOfClass:[UITextView class]] && view.frame.size.height >= 28 && view.frame.size.height <= 120) {
+        return (UITextView *)view;
     }
-}
-
-- (void)buildUI {
-    CGFloat y = 94;
-    CGFloat w = self.view.bounds.size.width;
-    
-    UIButton *nativeSendBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    nativeSendBtn.frame = CGRectMake(12, y, (w - 32) * 0.46, 40);
-    [nativeSendBtn setTitle:@"📨 官方原生群发" forState:UIControlStateNormal];
-    nativeSendBtn.backgroundColor = [UIColor systemBlueColor];
-    [nativeSendBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    nativeSendBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    nativeSendBtn.layer.cornerRadius = 8;
-    [nativeSendBtn addTarget:self action:@selector(onTapNativeSend) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:nativeSendBtn];
-    
-    _rankFetchBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    _rankFetchBtn.frame = CGRectMake(12 + (w - 32) * 0.46 + 8, y, (w - 32) * 0.54, 40);
-    [_rankFetchBtn setTitle:@"🏆 全榜多页突破抓取" forState:UIControlStateNormal];
-    _rankFetchBtn.backgroundColor = [UIColor systemIndigoColor];
-    [_rankFetchBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    _rankFetchBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    _rankFetchBtn.layer.cornerRadius = 8;
-    [_rankFetchBtn addTarget:self action:@selector(onTapMultiPageRankFetch) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:_rankFetchBtn];
-    y += 48;
-    
-    _tabSegment = [[UISegmentedControl alloc] initWithItems:@[@"🏆排行榜", @"👥群成员(自动)", @"🏠我的群", @"📒通讯录"]];
-    _tabSegment.frame = CGRectMake(12, y, w - 24, 34);
-    _tabSegment.selectedSegmentIndex = 0;
-    [_tabSegment addTarget:self action:@selector(refreshTableList) forControlEvents:UIControlEventValueChanged];
-    [self.view addSubview:_tabSegment];
-    y += 42;
-    
-    CGFloat bw = (w - 34) / 3.0;
-    NSArray *bTitles = @[@"🔄后台静默抓群员", @"📊去原生排行榜", @"📋复制纯海鸥号"];
-    SEL bSels[] = {@selector(triggerSilentGroupMemberFetch), @selector(goNativeRankPage), @selector(copyCurrentAccounts)};
-    for (int i = 0; i < 3; i++) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(12 + i * (bw + 5), y, bw, 30);
-        [b setTitle:bTitles[i] forState:UIControlStateNormal];
-        b.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-        [b setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-        b.layer.cornerRadius = 6;
-        [b addTarget:self action:bSels[i] forControlEvents:UIControlEventTouchUpInside];
-        [self.view addSubview:b];
+    for (UIView *sub in view.subviews) {
+        UITextView *found = ACFindInputTextViewInView(sub);
+        if (found) return found;
     }
-    y += 36;
-    
-    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, y, w - 28, 20)];
-    _statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    _statusLabel.textColor = [UIColor systemOrangeColor];
-    [self.view addSubview:_statusLabel];
-    y += 22;
-    
-    _tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, y, w, self.view.bounds.size.height - y) style:UITableViewStylePlain];
-    _tableView.delegate = self;
-    _tableView.dataSource = self;
-    _tableView.rowHeight = 62;
-    [self.view addSubview:_tableView];
+    return nil;
 }
 
-- (void)onTapMultiPageRankFetch {
-    _tabSegment.selectedSegmentIndex = 0;
-    __weak typeof(self) weakSelf = self;
-    [[HOMassEngine shared] toggleMultiPageRankFetch:^(NSString *status) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            weakSelf.statusLabel.text = status;
-            BOOL running = [HOMassEngine shared].isFetchingRank;
-            weakSelf.rankFetchBtn.backgroundColor = running ? [UIColor systemRedColor] : [UIColor systemIndigoColor];
-            [weakSelf.rankFetchBtn setTitle:running ? @"🛑 停止抓取(实时入库)" : @"🏆 全榜多页突破抓取" forState:UIControlStateNormal];
-            [weakSelf refreshTableList];
-        });
-    }];
-}
-
-- (void)triggerSilentGroupMemberFetch {
-    _tabSegment.selectedSegmentIndex = 1;
-    [[HOMassEngine shared].autoFetchedGroupIds removeAllObjects];
-    [[HOMassEngine shared] autoSilentFetchAllGroupMembersInBackground];
-    _statusLabel.text = @"🔄 正在后台自动遍历你加入的所有群聊并静默提取群成员...";
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self refreshTableList];
-    });
-}
-
-- (void)onTapNativeSend {
-    Class cls = objc_getClass("_TtC7ZhengDu28ZDGroupSendMessageController");
-    if (cls && self.navigationController) {
-        UIViewController *vc = [[cls alloc] init];
-        vc.hidesBottomBarWhenPushed = YES;
-        [self.navigationController pushViewController:vc animated:YES];
-    }
-}
-
-- (void)goNativeRankPage {
-    Class cls = objc_getClass("_TtC7ZhengDu21ZDGlobalTopController");
-    if (cls && self.navigationController) {
-        UIViewController *vc = [[cls alloc] init];
-        vc.hidesBottomBarWhenPushed = YES;
-        [self.navigationController pushViewController:vc animated:YES];
-    }
-}
-
-- (void)copyCurrentAccounts {
-    if (_currentList.count == 0) return;
-    NSMutableString *s = [NSMutableString string];
-    for (HOModelItem *item in _currentList) {
-        if (item.account.length > 0) [s appendFormat:@"%@\n", item.account];
-    }
-    [UIPasteboard generalPasteboard].string = s;
-    _statusLabel.text = [NSString stringWithFormat:@"✅ 已复制 %lu 个纯海鸥号到剪贴板！", (unsigned long)_currentList.count];
-}
-
-- (void)clearAllConfirm {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"清空全部采集数据" message:@"确定清空所有缓存重新采集吗？" preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"确定清空" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [[HOMassEngine shared] clearAllData];
-        [self refreshTableList];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)refreshTableList {
-    HOMassEngine *eng = [HOMassEngine shared];
-    NSInteger idx = _tabSegment.selectedSegmentIndex;
-    if (idx == 0) {
-        _currentList = [eng.rankUsersMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
-            return a.collectSeq > b.collectSeq ? NSOrderedAscending : NSOrderedDescending;
-        }];
-        if (!eng.isFetchingRank) {
-            _statusLabel.text = [NSString stringWithFormat:@"🏆【排行榜用户】共 %lu 人 (已过滤串码与等级，点人名直达主页加好友)", (unsigned long)_currentList.count];
+static void ACPresentForwardAssistantFromTopVC(void) {
+    UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+    if (!keyWin) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow) { keyWin = w; break; }
         }
-    } else if (idx == 1) {
-        _currentList = [eng.groupMembersMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
-            return a.collectSeq > b.collectSeq ? NSOrderedAscending : NSOrderedDescending;
-        }];
-        _statusLabel.text = [NSString stringWithFormat:@"👥【群聊成员】共 %lu 人 (后台自动静默提取，点人名直达主页加好友)", (unsigned long)_currentList.count];
-    } else if (idx == 2) {
-        _currentList = [eng.joinedGroupsMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
-            return [a.name compare:b.name];
-        }];
-        _statusLabel.text = [NSString stringWithFormat:@"🏠【我的群聊】共 %lu 个群 (已全部自动开启群主查看权限)", (unsigned long)_currentList.count];
-    } else {
-        _currentList = [eng.contactFriendsMap.allValues sortedArrayUsingComparator:^NSComparisonResult(HOModelItem *a, HOModelItem *b) {
-            return [a.name compare:b.name];
-        }];
-        _statusLabel.text = [NSString stringWithFormat:@"📒【通讯录好友】共 %lu 人", (unsigned long)_currentList.count];
     }
-    [_tableView reloadData];
+    UIViewController *topVC = keyWin.rootViewController;
+    while (topVC.presentedViewController) {
+        topVC = topVC.presentedViewController;
+    }
+    if ([NSStringFromClass([topVC class]) containsString:@"ACForwardAssistantVC"]) return;
+
+    ACForwardAssistantVC *vc = [[ACForwardAssistantVC alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [topVC presentViewController:nav animated:YES completion:nil];
 }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return _currentList.count;
+#pragma mark - 6. 核心突破：伪装官方标识 com.flight.airchat + 25年老号高权重 + 解除搜索SVIP限制 + 换绑拦截
+
+%hook NSBundle
+
+- (NSString *)bundleIdentifier {
+    NSString *orig = %orig;
+    if ([orig containsString:@"airchat"] || [orig containsString:@"flight"]) {
+        return @"com.flight.airchat";
+    }
+    return orig;
 }
 
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    static NSString *cid = @"HOAvatarCellV8";
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cid];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        cell.imageView.layer.cornerRadius = 22;
-        cell.imageView.layer.masksToBounds = YES;
-    }
-    HOModelItem *item = _currentList[indexPath.row];
-    cell.textLabel.text = [NSString stringWithFormat:@"%ld. %@", (long)(indexPath.row + 1), item.name];
-    cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"海鸥号: %@   |   %@   👉直达主页", item.account, item.source];
-    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-    
-    UIImage *avatarImg = item.avatarData ? [UIImage imageWithData:item.avatarData] : nil;
-    if (!avatarImg) {
-        if (@available(iOS 13.0, *)) {
-            avatarImg = [UIImage systemImageNamed:item.isGroup ? @"person.3.fill" : @"person.crop.circle.fill"];
+%end
+
+%hook NSURLSession
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    NSString *urlStr = request.URL.absoluteString;
+    NSMutableURLRequest *mutableReq = [request mutableCopy];
+
+    if ([urlStr containsString:@"userInfo/op"] && mutableReq.HTTPBody) {
+        NSString *bodyStr = [[NSString alloc] initWithData:mutableReq.HTTPBody encoding:NSUTF8StringEncoding];
+        if (bodyStr && [bodyStr containsString:@"bundleId="]) {
+            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"bundleId=com\\.flight\\.airchat[^ |]+" options:0 error:nil];
+            NSString *cleanBody = [regex stringByReplacingMatchesInString:bodyStr options:0 range:NSMakeRange(0, bodyStr.length) withTemplate:@"bundleId=com.flight.airchat"];
+            mutableReq.HTTPBody = [cleanBody dataUsingEncoding:NSUTF8StringEncoding];
         }
-        if (item.avatarUrl.length > 8 && [item.avatarUrl hasPrefix:@"http"]) {
-            NSURL *u = [NSURL URLWithString:item.avatarUrl];
-            if (u) {
-                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                    NSData *d = [NSData dataWithContentsOfURL:u];
-                    if (d) {
-                        item.avatarData = d;
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
-                        });
+    }
+
+    if ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] || [urlStr containsString:@"validate"]) {
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSDictionary *successDict = @{@"code": @200, @"msg": @"操作成功", @"data": @YES};
+            NSData *newData = [NSJSONSerialization dataWithJSONObject:successDict options:0 error:nil];
+            completionHandler(newData, response, error);
+        };
+        return %orig(mutableReq, wrappedHandler);
+    }
+
+    // 核心：解除搜索栏及高级搜索的 SVIP 权限限制（无论接口返回什么，直接强制解锁、允许展开完整搜索与扩大搜索范围）
+    if ([urlStr containsString:@"search"] || [urlStr containsString:@"business/landing"] || [urlStr containsString:@"vipLevel"]) {
+        void (^searchUnlockHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (data && !error) {
+                NSMutableDictionary *rootDict = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+                if ([rootDict isKindOfClass:[NSDictionary class]]) {
+                    if ([rootDict[@"data"] isKindOfClass:[NSDictionary class]]) {
+                        NSMutableDictionary *dataDict = [rootDict[@"data"] mutableCopy];
+                        dataDict[@"isVip"] = @YES;
+                        dataDict[@"vipLevel"] = @(9);
+                        dataDict[@"isCurrentUserBusinessMember"] = @YES;
+                        dataDict[@"isTargetUserBusinessMember"] = @YES;
+                        dataDict[@"hasMore"] = @YES;
+                        dataDict[@"limit"] = @(9999);
+                        rootDict[@"data"] = dataDict;
+                    } else if ([rootDict[@"data"] isKindOfClass:[NSArray class]]) {
+                        // 搜索列表直接放行所有结果，不截断
                     }
-                });
+                    rootDict[@"code"] = @200;
+                    NSData *unlockedData = [NSJSONSerialization dataWithJSONObject:rootDict options:0 error:nil];
+                    completionHandler(unlockedData, response, error);
+                    return;
+                }
+            }
+            completionHandler(data, response, error);
+        };
+        return %orig(mutableReq, searchUnlockHandler);
+    }
+
+    // 核心：将新号身份伪装为 2025年注册 + 5280经验 + 18级老号
+    if ([urlStr containsString:@"userinfo/detail"]) {
+        void (^userinfoDetailHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (data && !error) {
+                NSMutableDictionary *rootDict = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+                if ([rootDict isKindOfClass:[NSDictionary class]] && [rootDict[@"data"] isKindOfClass:[NSDictionary class]]) {
+                    NSMutableDictionary *dataDict = [rootDict[@"data"] mutableCopy];
+                    dataDict[@"createTime"] = @"2025-05-18 10:22:30";
+                    dataDict[@"accountLevel"] = @(18);
+                    dataDict[@"experienceValue"] = @(5280.0);
+                    dataDict[@"muted"] = @"0";
+                    dataDict[@"mutedTime"] = [NSNull null];
+                    dataDict[@"disable"] = @"0";
+
+                    rootDict[@"data"] = dataDict;
+                    NSData *spoofedData = [NSJSONSerialization dataWithJSONObject:rootDict options:0 error:nil];
+                    completionHandler(spoofedData, response, error);
+                    return;
+                }
+            }
+            completionHandler(data, response, error);
+        };
+        return %orig(mutableReq, userinfoDetailHandler);
+    }
+
+    return %orig(mutableReq, completionHandler);
+}
+
+%end
+
+%hook NSMutableURLRequest
+
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString * _Nullable)field {
+    %orig;
+    if (field && value) {
+        NSString *lowerField = field.lowercaseString;
+        if ([lowerField isEqualToString:@"token"] ||
+            [lowerField isEqualToString:@"x-userid"] ||
+            [lowerField isEqualToString:@"x-lts-id"] ||
+            [lowerField isEqualToString:@"channel"]) {
+            [ACForwardHelperManager shared].latestHTTPHeaders[field] = value;
+            if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
+                [ACForwardHelperManager shared].selfUserId = value;
             }
         }
     }
-    
-    CGSize sz = CGSizeMake(44, 44);
-    UIGraphicsBeginImageContextWithOptions(sz, NO, UIScreen.mainScreen.scale);
-    [avatarImg drawInRect:CGRectMake(0, 0, sz.width, sz.height)];
-    cell.imageView.image = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    
-    return cell;
 }
 
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    HOModelItem *item = _currentList[indexPath.row];
-    [[HOMassEngine shared] openDirectUserHomePageForItem:item fromVC:self];
-}
+%end
 
-@end
+%hook NSJSONSerialization
 
-#pragma mark - ==================== 7. Hook 挂载区 (JSON解密层 + 视图模型层) ====================
-
-// 1. 拦截 +[NSJSONSerialization JSONObjectWithData:options:error:] —— 海鸥把 AES 密文解密成明文 JSON 后必调此方法！
-static IMP orig_json_objectWithData = NULL;
-static id hook_json_objectWithData(id self, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **error) {
-    id res = ((id (*)(id, SEL, NSData *, NSJSONReadingOptions, NSError **))orig_json_objectWithData)(self, _cmd, data, opt, error);
-    if (res && ([res isKindOfClass:[NSDictionary class]] || [res isKindOfClass:[NSArray class]])) {
-        [[HOMassEngine shared] consumeDecryptedJSONObject:res];
++ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError * _Nullable *)error {
+    id res = %orig;
+    if ([res isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)res;
+        if (dict[@"code"] && dict[@"data"]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [[ACForwardHelperManager shared] parseJSONWithContext:dict[@"data"]];
+                [[ACForwardHelperManager shared] saveLocalPermanentCache];
+                [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
+            });
+        }
     }
     return res;
 }
 
-// 2. 「我的」页面入口
-static void ho_mine_onTapEmbeddedMassBtn(id self, SEL _cmd, UIButton *sender) {
-    UIViewController *mineVC = (UIViewController *)self;
-    HOMassHelperViewController *vc = [[HOMassHelperViewController alloc] init];
-    vc.hidesBottomBarWhenPushed = YES;
-    if (mineVC.navigationController) {
-        [mineVC.navigationController pushViewController:vc animated:YES];
-    } else {
-        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-        [mineVC presentViewController:nav animated:YES completion:nil];
-    }
-}
+%end
 
-static IMP orig_mine_cellForRow = NULL;
-static UITableViewCell *hook_mine_cellForRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
-    UITableViewCell *cell = ((UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))orig_mine_cellForRow)(self, _cmd, tableView, indexPath);
-    if (cell) {
-        BOOL isHaiouHelperRow = NO;
-        for (UIView *sub in cell.contentView.subviews) {
-            if ([sub isKindOfClass:[UILabel class]] && [[(UILabel *)sub text] containsString:@"海鸥助手"]) {
-                isHaiouHelperRow = YES;
-                break;
-            }
+%hook UILongPressGestureRecognizer
+
+- (void)setState:(UIGestureRecognizerState)state {
+    %orig;
+    if (state == UIGestureRecognizerStateBegan) {
+        UIView *v = self.view;
+        if (!v) return;
+
+        UIView *cellView = v;
+        while (cellView && ![cellView isKindOfClass:[UITableViewCell class]] && cellView.superview) {
+            cellView = cellView.superview;
         }
-        UIButton *embedBtn = [cell.contentView viewWithTag:99881];
-        if (isHaiouHelperRow) {
-            if (!embedBtn) {
-                embedBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-                embedBtn.tag = 99881;
-                embedBtn.frame = CGRectMake(UIScreen.mainScreen.bounds.size.width - 135, 10, 96, 32);
-                embedBtn.backgroundColor = [UIColor systemBlueColor];
-                [embedBtn setTitle:@"🚀群发助手" forState:UIControlStateNormal];
-                [embedBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                embedBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-                embedBtn.layer.cornerRadius = 16;
-                [embedBtn addTarget:self action:NSSelectorFromString(@"ho_mine_onTapEmbeddedMassBtn:") forControlEvents:UIControlEventTouchUpInside];
-                [cell.contentView addSubview:embedBtn];
+        NSString *cellCls = NSStringFromClass([cellView class]);
+        if ([cellCls containsString:@"Chat"] || [cellCls containsString:@"Bubble"] || [cellCls containsString:@"Message"]) {
+            __lastLongPressedView = cellView;
+            UIImage *extractedImg = ACFindLargestImageInView(cellView);
+            if (extractedImg) {
+                [[ACForwardHelperManager shared] savePermanentImage:extractedImg];
             }
-            embedBtn.hidden = NO;
-            [cell.contentView bringSubviewToFront:embedBtn];
-        } else {
-            if (embedBtn) embedBtn.hidden = YES;
-        }
-        
-        if (!tableView.tableFooterView || tableView.tableFooterView.tag != 99882) {
-            UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, UIScreen.mainScreen.bounds.size.width, 60)];
-            footer.tag = 99882;
-            UIButton *fBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            fBtn.frame = CGRectMake(16, 8, UIScreen.mainScreen.bounds.size.width - 32, 44);
-            fBtn.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-            [fBtn setTitle:@"✈️ 打开【海鸥全自动拓客与群发中心】" forState:UIControlStateNormal];
-            [fBtn setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
-            fBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-            fBtn.layer.cornerRadius = 10;
-            [fBtn addTarget:self action:NSSelectorFromString(@"ho_mine_onTapEmbeddedMassBtn:") forControlEvents:UIControlEventTouchUpInside];
-            [footer addSubview:fBtn];
-            tableView.tableFooterView = footer;
-        }
-    }
-    return cell;
-}
+            __pendingForwardText = ACFindChatTextInView(cellView);
 
-// 3. 聊天页与群设置页自动解锁群主权限
-static IMP orig_chat_viewWillAppear = NULL;
-static void hook_chat_viewWillAppear(id self, SEL _cmd, BOOL animated) {
-    [[HOMassEngine shared] applyGroupOwnerOnVC:(UIViewController *)self];
-    if (orig_chat_viewWillAppear) ((void (*)(id, SEL, BOOL))orig_chat_viewWillAppear)(self, _cmd, animated);
-    [[HOMassEngine shared] applyGroupOwnerOnVC:(UIViewController *)self];
-}
+            UIWindow *win = v.window ?: [UIApplication sharedApplication].keyWindow;
+            UIView *oldBar = [win viewWithTag:778899];
+            [oldBar removeFromSuperview];
 
-static IMP orig_groupSet_viewWillAppear = NULL;
-static void hook_groupSet_viewWillAppear(id self, SEL _cmd, BOOL animated) {
-    [[HOMassEngine shared] applyGroupOwnerOnVC:(UIViewController *)self];
-    if (orig_groupSet_viewWillAppear) ((void (*)(id, SEL, BOOL))orig_groupSet_viewWillAppear)(self, _cmd, animated);
-    [[HOMassEngine shared] applyGroupOwnerOnVC:(UIViewController *)self];
-}
+            UIButton *quickForwardPill = [UIButton buttonWithType:UIButtonTypeCustom];
+            quickForwardPill.tag = 778899;
+            CGFloat pillW = 210.0;
+            CGFloat pillH = 42.0;
+            CGPoint touchPt = [self locationInView:win];
+            CGFloat pillX = MIN(MAX(16.0, touchPt.x - pillW / 2.0), win.bounds.size.width - pillW - 16.0);
+            CGFloat pillY = MAX(64.0, touchPt.y - 95.0);
+            quickForwardPill.frame = CGRectMake(pillX, pillY, pillW, pillH);
+            quickForwardPill.backgroundColor = [UIColor systemBlueColor];
+            quickForwardPill.layer.cornerRadius = 21.0;
+            quickForwardPill.layer.shadowColor = [UIColor blackColor].CGColor;
+            quickForwardPill.layer.shadowOpacity = 0.35;
+            quickForwardPill.layer.shadowOffset = CGSizeMake(0, 4);
+            quickForwardPill.layer.shadowRadius = 6.0;
 
-// 4. 排行榜 Cell 与模型提取
-static IMP orig_rank_cellForItem = NULL;
-static UICollectionViewCell *hook_rank_cellForItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
-    UICollectionViewCell *cell = ((UICollectionViewCell *(*)(id, SEL, UICollectionView *, NSIndexPath *))orig_rank_cellForItem)(self, _cmd, cv, indexPath);
-    if (cell) {
-        UIViewController *vc = (UIViewController *)self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] harvestRankCell:cell indexPath:indexPath rankVC:vc];
-        });
-    }
-    return cell;
-}
+            NSString *typeTag = extractedImg ? @"🖼️已存此图并群发" : @"📝群发此消息";
+            [quickForwardPill setTitle:[NSString stringWithFormat:@"🚀 转发助手 (%@)", typeTag] forState:UIControlStateNormal];
+            [quickForwardPill setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            quickForwardPill.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+            [quickForwardPill addTarget:win action:@selector(ac_onQuickPillTap:) forControlEvents:UIControlEventTouchUpInside];
+            [win addSubview:quickForwardPill];
 
-static IMP orig_tv_dequeue = NULL;
-static UITableViewCell *hook_tv_dequeue(UITableView *self, SEL _cmd, NSString *identifier, NSIndexPath *indexPath) {
-    UITableViewCell *cell = ((UITableViewCell *(*)(UITableView *, SEL, NSString *, NSIndexPath *))orig_tv_dequeue)(self, _cmd, identifier, indexPath);
-    if (cell && [NSStringFromClass([cell class]) containsString:@"ZDContactCell"]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] harvestContactCell:cell];
-        });
-    }
-    return cell;
-}
-
-static IMP orig_group_init = NULL;
-static id hook_group_init(id self, SEL _cmd) {
-    id ins = ((id (*)(id, SEL))orig_group_init)(self, _cmd);
-    if (ins) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] harvestGroupObject:ins];
-        });
-    }
-    return ins;
-}
-
-static IMP orig_member_init = NULL;
-static id hook_member_init(id self, SEL _cmd) {
-    id ins = ((id (*)(id, SEL))orig_member_init)(self, _cmd);
-    if (ins) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] harvestGroupMemberObject:ins];
-        });
-    }
-    return ins;
-}
-
-static IMP orig_user_init = NULL;
-static id hook_user_init(id self, SEL _cmd) {
-    id ins = ((id (*)(id, SEL))orig_user_init)(self, _cmd);
-    if (ins) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [[HOMassEngine shared] harvestUserObject:ins source:@"用户模型提取"];
-        });
-    }
-    return ins;
-}
-
-#pragma mark - ==================== 8. Dylib 构造函数入口 ====================
-
-__attribute__((constructor))
-static void HaiouMassHelperV8Init(void) {
-    // 1. 挂载 JSON 明文解析出口拦截器（海鸥 AES 解密后转字典必经之路）
-    SafeHookClassMethodOnce([NSJSONSerialization class], @selector(JSONObjectWithData:options:error:), (IMP)hook_json_objectWithData, &orig_json_objectWithData);
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            // 2. 彻底屏蔽开屏广告
-            SetupAdBlockerOnce();
-            
-            // 3. 挂载「我的」页面入口
-            Class mineCls = objc_getClass("_TtC7ZhengDu16ZDMineController");
-            if (mineCls) {
-                class_addMethod(mineCls, NSSelectorFromString(@"ho_mine_onTapEmbeddedMassBtn:"), (IMP)ho_mine_onTapEmbeddedMassBtn, "v@:@");
-                SafeHookInstanceMethodOnce(mineCls, @selector(tableView:cellForRowAtIndexPath:), (IMP)hook_mine_cellForRow, &orig_mine_cellForRow);
-            }
-            
-            // 4. 挂载聊天页与群设置页
-            Class chatCls = objc_getClass("_TtC7ZhengDu25ZDConversationController1");
-            if (chatCls) {
-                SafeHookInstanceMethodOnce(chatCls, @selector(viewWillAppear:), (IMP)hook_chat_viewWillAppear, &orig_chat_viewWillAppear);
-            }
-            Class groupSetCls = objc_getClass("_TtC7ZhengDu30ZDConversationGroupSetController");
-            if (groupSetCls) {
-                SafeHookInstanceMethodOnce(groupSetCls, @selector(viewWillAppear:), (IMP)hook_groupSet_viewWillAppear, &orig_groupSet_viewWillAppear);
-            }
-            
-            // 5. 挂载排行榜 ZDGlobalTopItemController
-            Class rankItemCls = objc_getClass("_TtC7ZhengDu25ZDGlobalTopItemController");
-            if (rankItemCls) {
-                DisableMethodWithNoop(rankItemCls, NSSelectorFromString(@"zd_clickUpgrade"), (IMP)ad_noop_0);
-                SafeHookInstanceMethodOnce(rankItemCls, @selector(collectionView:cellForItemAtIndexPath:), (IMP)hook_rank_cellForItem, &orig_rank_cellForItem);
-            }
-            
-            // 6. 挂载通讯录 Cell 与三大核心模型 (ZDGroup / ZDGroupMember / ZDUser)
-            SafeHookInstanceMethodOnce([UITableView class], @selector(dequeueReusableCellWithIdentifier:forIndexPath:), (IMP)hook_tv_dequeue, &orig_tv_dequeue);
-            
-            Class grpCls = objc_getClass("_TtC7ZhengDu7ZDGroup");
-            if (grpCls) SafeHookInstanceMethodOnce(grpCls, @selector(init), (IMP)hook_group_init, &orig_group_init);
-            
-            Class memCls = objc_getClass("_TtC7ZhengDu13ZDGroupMember");
-            if (memCls) SafeHookInstanceMethodOnce(memCls, @selector(init), (IMP)hook_member_init, &orig_member_init);
-            
-            Class usrCls = objc_getClass("_TtC7ZhengDu6ZDUser");
-            if (usrCls) SafeHookInstanceMethodOnce(usrCls, @selector(init), (IMP)hook_user_init, &orig_user_init);
-            
-            // 7. 启动 4 秒后自动在后台静默拉取所有群的群成员！
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [[HOMassEngine shared] autoSilentFetchAllGroupMembersInBackground];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (quickForwardPill.superview) [quickForwardPill removeFromSuperview];
             });
-        });
-    });
+        }
+    }
 }
+
+%end
+
+%hook UIWindow
+
+%new
+- (void)ac_onQuickPillTap:(UIButton * _Nonnull)sender {
+    [sender removeFromSuperview];
+    ACPresentForwardAssistantFromTopVC();
+}
+
+%end
+
+%hook UIViewController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
+    NSString *clsName = NSStringFromClass([self class]);
+    if ([clsName containsString:@"HelpAboutViewController"]) {
+        if (self.navigationItem) {
+            UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"🚀 转发助手"
+                                                                    style:UIBarButtonItemStyleDone
+                                                                   target:self
+                                                                   action:@selector(ac_openFromAbout)];
+            btn.tintColor = [UIColor systemBlueColor];
+            self.navigationItem.rightBarButtonItem = btn;
+        }
+    }
+
+    if ([clsName containsString:@"ChatC2CViewController"]) {
+        UIView *existingForceBtn = [self.view viewWithTag:665544];
+        if (!existingForceBtn) {
+            UIButton *forceBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+            forceBtn.tag = 665544;
+            forceBtn.frame = CGRectMake(self.view.bounds.size.width - 88, 54, 76, 32);
+            forceBtn.backgroundColor = [UIColor systemOrangeColor];
+            forceBtn.layer.cornerRadius = 16;
+            [forceBtn setTitle:@"⚡破盾发" forState:UIControlStateNormal];
+            [forceBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            forceBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+            [forceBtn addTarget:self action:@selector(ac_forceSendInCurrentChat) forControlEvents:UIControlEventTouchUpInside];
+            [self.view addSubview:forceBtn];
+        }
+    }
+}
+
+%new
+- (void)ac_openFromAbout {
+    __pendingForwardText = nil;
+    ACPresentForwardAssistantFromTopVC();
+}
+
+%new
+- (void)ac_forceSendInCurrentChat {
+    UITextView *inputTV = ACFindInputTextViewInView(self.view);
+    NSString *text = inputTV ? [inputTV.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : @"";
+    if (text.length == 0 && [ACForwardHelperManager shared].savedMediaType == 0) text = @"你好";
+    if (!__currentChatPeerId || __currentChatPeerId.length < 5) return;
+
+    ACContactItem *peer = [[ACContactItem alloc] init];
+    peer.targetId = __currentChatPeerId;
+    peer.name = self.title ?: __currentChatPeerId;
+    peer.sourceType = 0;
+
+    [[ACForwardHelperManager shared] sendCurrentMediaAndText:text toItem:peer completion:^(BOOL ok, NSString *detail) {
+        if (ok && inputTV) inputTV.text = @"";
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 强发成功" : @"⚠️ 发送结果")
+                                                                       message:detail
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+    }];
+}
+
+%end
