@@ -16,6 +16,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 需要历史版本用来还原被富文本破坏的方法符号（- / +）
+          fetch-depth: 0
 
       - name: Normalize source filename
         run: |
@@ -34,6 +37,89 @@ jobs:
           fi
           echo "--- after ---"
           ls -la Tweak.xm
+
+      - name: Repair Markdown-mangled source
+        run: |
+          # 代码若从富文本/Markdown 视图复制，会出现系统性损坏（幂等修复）：
+          #  1) 行首的 "- " / "+ " 被渲染成列表圆点 -> U+FFFC 字符，导致方法声明非法
+          #     （进而报 "%orig does not make sense outside a method"）。
+          #     这里用 git 历史里同名方法的符号还原；查不到的按实例方法 "-" 处理。
+          #  2) 部分 "*" 丢失，导致 "String (NSDictionary )foo"、"NSString kw ="、
+          #     "((id ()(id, SEL))objc_msgSend)" 等非法写法。
+          #  3) 字符串里的 \" 被去掉反斜杠，导致引号错配。
+          python3 - <<'PY'
+          import re, pathlib, subprocess
+
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+
+          # ---- 1) 用 git 历史推断每个 selector 的正确符号 ----
+          sig2sign = {}
+          try:
+              revs = subprocess.run(
+                  ["git", "log", "--format=%H", "-50", "--", "Tweak.xm", "Tweak.x", "tweak.xm"],
+                  capture_output=True, text=True).stdout.split()
+              for rev in revs:
+                  for name in ("Tweak.xm", "Tweak.x", "tweak.xm"):
+                      r = subprocess.run(["git", "show", "%s:%s" % (rev, name)],
+                                         capture_output=True, text=True)
+                      if r.returncode != 0:
+                          continue
+                      for ln in r.stdout.split("\n"):
+                          m = re.match(r'^[ \t]*([\-\+])\s*\(([^)]*)\)\s*([A-Za-z_]\w*)', ln)
+                          if m:
+                              sig2sign.setdefault(m.group(3), m.group(1))
+          except Exception as e:
+              print("history lookup failed:", e)
+
+          CLASS_METHODS = {"shared", "defaultManager", "standardUserDefaults",
+                           "currentUser", "fromDict", "alloc", "new", "class", "instance"}
+
+          def fix_fffc(m):
+              indent, rest = m.group(1), m.group(2)
+              sm = re.match(r'([^)]*?)\)\s*([A-Za-z_]\w*)?', rest)
+              sel = sm.group(2) if (sm and sm.group(2)) else ""
+              sign = sig2sign.get(sel) or ("+" if sel in CLASS_METHODS else "-")
+              return "%s%s (%s" % (indent, sign, rest)
+
+          s, n_fffc = re.subn(r'(?m)^([ \t]*)\ufffc[ \t]*\((.*)$', fix_fffc, s)
+
+          # ---- 2) 还原被吞掉的 "*" ----
+          classes = set(re.findall(r'@interface\s+(\w+)', s)) | {
+              "NSString", "NSArray", "NSMutableArray", "NSDictionary", "NSMutableDictionary",
+              "NSData", "NSMutableData", "NSNumber", "NSError", "NSURL", "NSURLRequest",
+              "NSURLResponse", "NSURLSession", "NSURLSessionDataTask", "NSURLSessionTask",
+              "UIImage", "UIView", "UILabel", "UIButton", "UITableView", "UITableViewCell",
+              "UICollectionView", "UIViewController", "UISwitch", "UITextField", "UITextView",
+              "UISegmentedControl", "UIColor", "UIWindow", "UIFont", "NSAttributedString",
+              "NSDate", "NSTimer", "NSObject", "NSMutableString", "NSIndexPath",
+          }
+          n_star = 0
+          def sub(pat, fn):
+              global s, n_star
+              s, k = re.subn(pat, fn, s)
+              n_star += k
+          # (Type )            -> (Type *)
+          sub(r'\(([A-Za-z_]\w*) \)', lambda m: '(%s *)' % m.group(1) if m.group(1) in classes else m.group(0))
+          # ((Type ()(args))   -> ((Type (*)(args))
+          sub(r'\(\(([A-Za-z_]\w*) \(\)\(',
+              lambda m: '((%s (*)(' % m.group(1) if (m.group(1) in classes or m.group(1) in ("id", "void")) else m.group(0))
+          # (Type name) / , Type name)  -> Type *name
+          sub(r'(?<![\w*])([A-Za-z_]\w*) ([A-Za-z_]\w*)(?=\s*[,)])',
+              lambda m: ' %s *%s' % (m.group(1), m.group(2)) if m.group(1) in classes else m.group(0))
+          # 行首局部变量声明: Type name =
+          sub(r'(?m)^([ \t]*)([A-Za-z_]\w*) ([A-Za-z_]\w*) =',
+              lambda m: m.group(1) + m.group(2) + ' *' + m.group(3) + ' ='
+                        if (m.group(2) in classes and m.group(3) not in ("alloc", "init")) else m.group(0))
+
+          # ---- 3) 还原被去掉反斜杠的转义引号 ----
+          s = s.replace('@"SELECT * FROM "%@" LIMIT 10000;"',
+                        '@"SELECT * FROM \\"%@\\" LIMIT 10000;"')
+
+          if n_fffc or n_star:
+              p.write_text(s)
+          print("repaired leading U+FFFC:", n_fffc, "| restored '*':", n_star)
+          PY
 
       - name: Fix Swift 'String' type leaks
         run: |

@@ -40,11 +40,11 @@ ACMediaSlotMoment    = 3  // 槽位3：📝发动态专属媒体
 @property (nonatomic, assign) NSInteger chatMeType; // 0: 开放私聊, 1: 仅双向好友
 @property (nonatomic, assign) BOOL isGroupBanned;
 @property (nonatomic, assign) BOOL isSelected;
-￼ (NSDictionary *)toDict;
-￼ (instancetype)fromDict:(NSDictionary *)dict;
+- (NSDictionary *)toDict;
++ (instancetype)fromDict:(NSDictionary *)dict;
 @end
 @implementation ACContactItem
-￼ (NSDictionary *)toDict {
+- (NSDictionary *)toDict {
 return @{
 @"targetId": self.targetId ?: @"",
 @"name": self.name ?: @"",
@@ -55,7 +55,7 @@ return @{
 @"isGroupBanned": @(self.isGroupBanned)
 };
 }
-￼ (instancetype)fromDict:(NSDictionary *)d {
++ (instancetype)fromDict:(NSDictionary *)d {
 NSDictionary *dict = ACSafeDict(d);
 if (!dict) return nil;
 ACContactItem *item = [[ACContactItem alloc] init];
@@ -81,11 +81,11 @@ return item;
 @property (nonatomic, copy) NSString *customMediaPath;
 @property (nonatomic, copy) NSString *customThumbPath;
 @property (nonatomic, assign) int customVideoDuration;
-￼ (NSDictionary *)toDict;
-￼ (instancetype)fromDict:(NSDictionary *)dict;
+- (NSDictionary *)toDict;
++ (instancetype)fromDict:(NSDictionary *)dict;
 @end
 @implementation ACAutoReplyRule
-￼ (NSDictionary )toDict {
+- (NSDictionary *)toDict {
 return @{
 @"ruleId": self.ruleId ?: @"",
 @"keyword": self.keyword ?: @"",
@@ -98,7 +98,7 @@ return @{
 @"customVideoDuration": @(self.customVideoDuration)
 };
 }
-￼ (instancetype)fromDict:(NSDictionary *)d {
++ (instancetype)fromDict:(NSDictionary *)d {
 NSDictionary *dict = ACSafeDict(d);
 if (!dict) return nil;
 ACAutoReplyRule *r = [[ACAutoReplyRule alloc] init];
@@ -124,11 +124,11 @@ return r;
 @property (nonatomic, assign) BOOL enabled;
 @property (nonatomic, assign) NSInteger sentCount;
 @property (nonatomic, copy) NSString *lastSentTimeStr;
-￼ (NSDictionary *)toDict;
-￼ (instancetype)fromDict:(NSDictionary *)dict;
+- (NSDictionary *)toDict;
++ (instancetype)fromDict:(NSDictionary *)dict;
 @end
 @implementation ACMomentTaskItem
-￼ (NSDictionary *)toDict {
+- (NSDictionary *)toDict {
 NSMutableDictionary *md = [NSMutableDictionary dictionary];
 md[@"taskId"] = self.taskId ?: @"";
 md[@"contentText"] = self.contentText ?: @"";
@@ -140,7 +140,7 @@ md[@"localMediaPath"] = self.localMediaPath ?: @"",
 md[@"capturedMediaList"] = ACSafeArray(self.capturedMediaList) ?: @[];
 return md;
 }
-￼ (instancetype)fromDict:(NSDictionary *)d {
++ (instancetype)fromDict:(NSDictionary *)d {
 NSDictionary *dict = ACSafeDict(d);
 if (!dict) return nil;
 ACMomentTaskItem *t = [[ACMomentTaskItem alloc] init];
@@ -195,47 +195,47 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, strong) NSArray *latestCapturedMomentMediaList;
 @property (nonatomic, copy) NSString *lastMomentLog;
 @property (nonatomic, assign) BOOL listenerRegistered;
-￼ (instancetype)shared;
++ (instancetype)shared;
 // 四槽位独立媒体管理 API（0:群发, 1:迎新, 2:自动回复, 3:发动态）
-￼ (NSInteger)mediaTypeForSlot:(ACMediaSlot)slot; // 0:无, 1:图片, 2:视频
-￼ (UIImage *)previewImageForSlot:(ACMediaSlot)slot;
-￼ (int)videoDurationForSlot:(ACMediaSlot)slot;
-￼ (NSString *)imagePathForSlot:(ACMediaSlot)slot;
-￼ (NSString *)videoPathForSlot:(ACMediaSlot)slot;
-￼ (NSString *)videoThumbPathForSlot:(ACMediaSlot)slot;
-￼ (void)saveImage:(UIImage *)img forSlot:(ACMediaSlot)slot;
-￼ (void)saveVideoAtURL:(NSURL *)videoURL forSlot:(ACMediaSlot)slot;
-￼ (void)clearMediaForSlot:(ACMediaSlot)slot;
-￼ (void)setupIMGroupWelcomeListener;
-￼ (void)loadLocalPermanentCache;
-￼ (void)saveLocalPermanentCache;
-￼ (void)clearAllGroupMembersCache;
-￼ (void)saveAllCustomSettings;
-￼ (void)parseJSONWithContext:(id)jsonObj;
-￼ (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
+- (NSInteger)mediaTypeForSlot:(ACMediaSlot)slot; // 0:无, 1:图片, 2:视频
+- (UIImage *)previewImageForSlot:(ACMediaSlot)slot;
+- (int)videoDurationForSlot:(ACMediaSlot)slot;
+- (NSString *)imagePathForSlot:(ACMediaSlot)slot;
+- (NSString *)videoPathForSlot:(ACMediaSlot)slot;
+- (NSString *)videoThumbPathForSlot:(ACMediaSlot)slot;
+- (void)saveImage:(UIImage *)img forSlot:(ACMediaSlot)slot;
+- (void)saveVideoAtURL:(NSURL *)videoURL forSlot:(ACMediaSlot)slot;
+- (void)clearMediaForSlot:(ACMediaSlot)slot;
+- (void)setupIMGroupWelcomeListener;
+- (void)loadLocalPermanentCache;
+- (void)saveLocalPermanentCache;
+- (void)clearAllGroupMembersCache;
+- (void)saveAllCustomSettings;
+- (void)parseJSONWithContext:(id)jsonObj;
+- (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
 progress:(void(^)(NSString *progressMsg))progressBlock
 completion:(void(^)(NSString *finalMsg))completion;
-￼ (void)reloadAllDataWithProgress:(void(^)(NSString *progressMsg))progressBlock
+- (void)reloadAllDataWithProgress:(void(^)(NSString *progressMsg))progressBlock
 completion:(void(^)(NSString *finalMsg))completion;
 // 支持指定独立媒体槽位或独立文件路径的发送引擎
-￼ (void)sendText:(NSString *)text
+- (void)sendText:(NSString *)text
 mediaSlot:(ACMediaSlot)slot
 attachMedia:(BOOL)attachMedia
 toItem:(ACContactItem *)item
 completion:(void(^)(BOOL ok, NSString *detail))completion;
-￼ (void)sendText:(NSString *)text
+- (void)sendText:(NSString *)text
 customMediaType:(NSInteger)mType
 customMediaPath:(NSString *)mPath
 customThumbPath:(NSString *)tPath
 customVideoDuration:(int)vDur
 toItem:(ACContactItem *)item
 completion:(void(^)(BOOL ok, NSString *detail))completion;
-￼ (void)restartMomentScheduler;
-￼ (void)onMomentTimerTick;
-￼ (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion;
+- (void)restartMomentScheduler;
+- (void)onMomentTimerTick;
+- (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion;
 @end
 @implementation ACForwardHelperManager
-￼ (instancetype)shared {
++ (instancetype)shared {
 static ACForwardHelperManager *instance = nil;
 static dispatch_once_t onceToken;
 dispatch_once(&onceToken, ^{
@@ -266,19 +266,19 @@ instance.lastMomentLog = @"等待定时发布动态...";
 return instance;
 }
 #pragma mark - 2.0 四槽位彻底隔离的永久媒体存储引擎
-￼ (NSString *)imagePathForSlot:(ACMediaSlot)slot {
+- (NSString *)imagePathForSlot:(ACMediaSlot)slot {
 NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Image.jpg", (long)slot]];
 }
-￼ (NSString *)videoPathForSlot:(ACMediaSlot)slot {
+- (NSString *)videoPathForSlot:(ACMediaSlot)slot {
 NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Video.mp4", (long)slot]];
 }
-￼ (NSString *)videoThumbPathForSlot:(ACMediaSlot)slot {
+- (NSString *)videoThumbPathForSlot:(ACMediaSlot)slot {
 NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Thumb.jpg", (long)slot]];
 }
-￼ (NSInteger)mediaTypeForSlot:(ACMediaSlot)slot {
+- (NSInteger)mediaTypeForSlot:(ACMediaSlot)slot {
 NSString *key = [NSString stringWithFormat:@"AC_Slot_%ld_MediaType", (long)slot];
 NSInteger t = [[NSUserDefaults standardUserDefaults] integerForKey:key];
 NSFileManager *fm = [NSFileManager defaultManager];
@@ -286,12 +286,12 @@ if (t == 1 && [fm fileExistsAtPath:[self imagePathForSlot:slot]]) return 1;
 if (t == 2 && [fm fileExistsAtPath:[self videoPathForSlot:slot]]) return 2;
 return 0;
 }
-￼ (int)videoDurationForSlot:(ACMediaSlot)slot {
+- (int)videoDurationForSlot:(ACMediaSlot)slot {
 NSString *key = [NSString stringWithFormat:@"AC_Slot_%ld_VideoDur", (long)slot];
 int d = (int)[[NSUserDefaults standardUserDefaults] integerForKey:key];
 return d > 0 ? d : 5;
 }
-￼ (UIImage *)previewImageForSlot:(ACMediaSlot)slot {
+- (UIImage *)previewImageForSlot:(ACMediaSlot)slot {
 NSInteger t = [self mediaTypeForSlot:slot];
 if (t == 1) {
 return [UIImage imageWithContentsOfFile:[self imagePathForSlot:slot]];
@@ -300,7 +300,7 @@ return [UIImage imageWithContentsOfFile:[self videoThumbPathForSlot:slot]];
 }
 return nil;
 }
-￼ (void)saveImage:(UIImage *)img forSlot:(ACMediaSlot)slot {
+- (void)saveImage:(UIImage *)img forSlot:(ACMediaSlot)slot {
 if (!img) return;
 @try {
 NSData *jpgData = UIImageJPEGRepresentation(img, 0.88);
@@ -314,7 +314,7 @@ NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 }
 } @catch (NSException *e) {}
 }
-￼ (void)saveVideoAtURL:(NSURL *)videoURL forSlot:(ACMediaSlot)slot {
+- (void)saveVideoAtURL:(NSURL *)videoURL forSlot:(ACMediaSlot)slot {
 if (!videoURL) return;
 @try {
 NSFileManager *fm = [NSFileManager defaultManager];
@@ -358,7 +358,7 @@ NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 [ud synchronize];
 } @catch (NSException *e) {}
 }
-￼ (void)clearMediaForSlot:(ACMediaSlot)slot {
+- (void)clearMediaForSlot:(ACMediaSlot)slot {
 @try {
 NSFileManager *fm = [NSFileManager defaultManager];
 [fm removeItemAtPath:[self imagePathForSlot:slot] error:nil];
@@ -370,11 +370,11 @@ NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 [ud synchronize];
 } @catch (NSException *e) {}
 }
-￼ (NSString *)cacheFilePath:(NSString *)type {
+- (NSString *)cacheFilePath:(NSString *)type {
 NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_SafeCache_%@.plist", type]];
 }
-￼ (void)clearAllGroupMembersCache {
+- (void)clearAllGroupMembersCache {
 @synchronized (self) {
 [self.groupMemberList removeAllObjects];
 [self.groupMemberMap removeAllObjects];
@@ -382,7 +382,7 @@ return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Sa
 [self saveLocalPermanentCache];
 }
 }
-￼ (void)saveAllCustomSettings {
+- (void)saveAllCustomSettings {
 @try {
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 [ud setBool:self.autoWelcomeEnabled forKey:@"AC_AutoWelcome_Enabled"];
@@ -413,7 +413,7 @@ for (ACMomentTaskItem *t in self.momentTasks) {
 [ud synchronize];
 } @catch (NSException *e) {}
 }
-￼ (void)loadAllCustomSettings {
+- (void)loadAllCustomSettings {
 @try {
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 self.autoWelcomeEnabled = [ud boolForKey:@"AC_AutoWelcome_Enabled"];
@@ -447,7 +447,7 @@ if (r) [self.autoReplyRules addObject:r];
 }
 }
 if (self.autoReplyRules.count == 0) {
-ACAutoReplyRule defRule = [[ACAutoReplyRule alloc] init];
+ACAutoReplyRule *defRule = [[ACAutoReplyRule alloc] init];
 defRule.ruleId = @"default_1";
 defRule.keyword = @"";
 defRule.replyText = @"您好 {name}，消息已收到，稍后第一时间回复您！";
@@ -481,7 +481,7 @@ t2.lastSentTimeStr = @"待发布";
 }
 } @catch (NSException *e) {}
 }
-￼ (void)saveLocalPermanentCache {
+- (void)saveLocalPermanentCache {
 dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
 @synchronized (self) {
 @try {
@@ -498,7 +498,7 @@ for (ACContactItem *i in self.groupList) [gArr addObject:[i toDict]];
 }
 });
 }
-￼ (void)loadLocalPermanentCache {
+- (void)loadLocalPermanentCache {
 @synchronized (self) {
 @try {
 NSArray *fArr = [NSArray arrayWithContentsOfFile:[self cacheFilePath:@"friends"]];
@@ -535,7 +535,7 @@ self.groupMap[item.targetId] = item;
 }
 }
 #pragma mark - 2.1 腾讯云 IM 实时监听（迎新使用槽位1，自动回复使用规则专属媒体或槽位2）
-￼ (void)setupIMGroupWelcomeListener {
+- (void)setupIMGroupWelcomeListener {
 if (self.listenerRegistered) return;
 @try {
 Class v2Cls = NSClassFromString(@"V2TIMManager");
@@ -554,13 +554,13 @@ self.listenerRegistered = YES;
 }
 } @catch (NSException *e) {}
 }
-￼ (void)onMemberEnter:(NSString *)groupID memberList:(NSArray *)memberList {
+- (void)onMemberEnter:(NSString *)groupID memberList:(NSArray *)memberList {
 [self handleNewMembersJoinedGroup:groupID memberList:memberList];
 }
-￼ (void)onMemberInvited:(NSString *)groupID opUser:(id)opUser memberList:(NSArray *)memberList {
+- (void)onMemberInvited:(NSString *)groupID opUser:(id)opUser memberList:(NSArray *)memberList {
 [self handleNewMembersJoinedGroup:groupID memberList:memberList];
 }
-￼ (void)onRecvNewMessage:(id)msg {
+- (void)onRecvNewMessage:(id)msg {
 if (!msg) return;
 @try {
 NSData *cData = [msg valueForKey:@"cloudCustomData"];
@@ -612,7 +612,7 @@ if (memberList.count > 0) {
 }
 } @catch (NSException *e) {}
 }
-￼ (void)handleIncomingPrivateMessageFrom:(NSString *)senderId nickName:(NSString *)nick text:(NSString *)incomingText {
+- (void)handleIncomingPrivateMessageFrom:(NSString *)senderId nickName:(NSString *)nick text:(NSString *)incomingText {
 @try {
 NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
 NSNumber *lastTimeNum = self.autoReplyCooldownMap[senderId];
@@ -623,7 +623,7 @@ ACAutoReplyRule *matchedRule = nil;
 ACAutoReplyRule *fallbackRule = nil;
 for (ACAutoReplyRule *rule in self.autoReplyRules) {
 if (!rule.enabled || rule.replyText.length == 0) continue;
-NSString kw = [rule.keyword stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+NSString *kw = [rule.keyword stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 if (kw.length == 0 || [kw isEqualToString:@""] || [kw isEqualToString:@"全部"]) {
 if (!fallbackRule) fallbackRule = rule;
 } else if (incomingText.length > 0 && [incomingText localizedCaseInsensitiveContainsString:kw]) {
@@ -686,7 +686,7 @@ weakSelf.lastAutoReplyLog = [NSString stringWithFormat:@"⚠️ 自动回复 %@ 
 } @catch (NSException *e) {}
 }
 #pragma mark - 2.1.2 多任务定时自动发动态（严格还原抓包报文结构 + 独立媒体上传）
-￼ (void)restartMomentScheduler {
+- (void)restartMomentScheduler {
 dispatch_async(dispatch_get_main_queue(), ^{
 if (self.momentTimer) {
 [self.momentTimer invalidate];
@@ -701,7 +701,7 @@ userInfo:nil
 repeats:YES];
 });
 }
-￼ (void)onMomentTimerTick {
+- (void)onMomentTimerTick {
 if (!self.autoMomentEnabled || self.momentTasks.count == 0) return;
 NSMutableArray<ACMomentTaskItem *> *activeTasks = [NSMutableArray array];
 for (ACMomentTaskItem *t in self.momentTasks) {
@@ -718,7 +718,7 @@ self.currentMomentRotationIdx = (self.currentMomentRotationIdx + 1) % activeTask
 [self publishMomentTask:taskToPublish completion:nil];
 }
 // 严格按照 StormSniffer 抓包 (04:36:23.102Z) 还原动态发布请求头与请求体
-￼ (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
+- (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
 if (!task || task.contentText.length == 0) {
 if (completion) completion(NO, @"动态内容为空");
 return;
@@ -809,7 +809,7 @@ if (completion) completion(NO, @"构造动态请求异常");
 }
 }
 #pragma mark - 2.1.3 新人进群迎新处理（严格使用槽位1：ACMediaSlotWelcome）
-￼ (void)handleNewMembersJoinedGroup:(NSString *)groupID memberList:(NSArray *)memberList {
+- (void)handleNewMembersJoinedGroup:(NSString *)groupID memberList:(NSArray *)memberList {
 NSString *cleanGid = ACSafeStr(groupID);
 NSArray *cleanList = ACSafeArray(memberList);
 if (cleanGid.length == 0 || cleanList.count == 0) return;
@@ -872,7 +872,7 @@ greetNext();
 });
 }
 #pragma mark - 2.2 联系人与群成员管理
-￼ (void)addFriendWithId:(NSString *)uid name:(NSString *)name tag:(NSString *)tag chatMeType:(NSInteger)chatMeType {
+- (void)addFriendWithId:(NSString *)uid name:(NSString *)name tag:(NSString *)tag chatMeType:(NSInteger)chatMeType {
 NSString *cleanId = [ACSafeStr(uid) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 if (cleanId.length < 5 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"-1"]) return;
 if ([cleanId isEqualToString:self.selfUserId] || [cleanId hasSuffix:@"_collection"] || [cleanId hasPrefix:@"@TGS#"]) return;
@@ -903,7 +903,7 @@ if (chatMeType == 0) {
 }
 }
 }
-￼ (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)name groupId:(NSString *)gid role:(NSString *)role chatMeType:(NSInteger)chatMeType {
+- (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)name groupId:(NSString *)gid role:(NSString *)role chatMeType:(NSInteger)chatMeType {
 NSString *cleanId = [ACSafeStr(uid) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 if (cleanId.length < 5 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"-1"] || [cleanId isEqualToString:@"0"]) return NO;
 if ([cleanId isEqualToString:self.selfUserId] || [cleanId hasPrefix:@"@TGS#"]) return NO;
@@ -938,7 +938,7 @@ if (chatMeType == 0) {
 return YES;
 }
 }
-￼ (void)addGroupWithId:(NSString *)gid name:(NSString *)name ban:(BOOL)ban {
+- (void)addGroupWithId:(NSString *)gid name:(NSString *)name ban:(BOOL)ban {
 NSString *cleanId = [ACSafeStr(gid) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 if (cleanId.length < 3 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"0"]) return;
 if (![cleanId hasPrefix:@"@TGS#"] && cleanId.length > 15) return;
@@ -963,7 +963,7 @@ self.groupMap[cleanId] = item;
 [self.groupList addObject:item];
 }
 }
-￼ (void)parseJSONWithContext:(id)jsonObj {
+- (void)parseJSONWithContext:(id)jsonObj {
 if (!jsonObj || [jsonObj isKindOfClass:[NSNull class]]) return;
 @try {
 NSDictionary *dict = ACSafeDict(jsonObj);
@@ -1061,10 +1061,10 @@ for (id sub in arr) {
 } @catch (NSException *e) {}
 }
 #pragma mark - 2.3 群成员拉取
-￼ (void)crawlGroupMembersPageForGroup:(NSString *)gid
+- (void)crawlGroupMembersPageForGroup:(NSString *)gid
 nextSeq:(uint64_t)seq
 pageIndex:(NSInteger)pageIdx
-progress:(void(^)(NSString msg))progressBlock
+progress:(void(^)( NSString *msg))progressBlock
 completion:(void(^)(void))completion {
 @try {
 Class v2Cls = NSClassFromString(@"V2TIMManager");
@@ -1072,7 +1072,7 @@ if (!v2Cls || ![v2Cls respondsToSelector:@selector(sharedInstance)]) {
 if (completion) completion();
 return;
 }
-id mgr = ((id ()(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
+id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
 SEL getMemSel = NSSelectorFromString(@"getGroupMemberList:filter:nextSeq:succ:fail:");
 if (![mgr respondsToSelector:getMemSel]) {
 if (completion) completion();
@@ -1125,7 +1125,7 @@ uint64_t currentSeq = seq;
 if (completion) completion();
 }
 }
-￼ (void)crawlGroupHistoryMessages:(NSString )gid
+- (void)crawlGroupHistoryMessages:(NSString *)gid
 lastMsg:(id)lastMsg
 pageIndex:(NSInteger)pageIdx
 completion:(void(^)(void))completion {
@@ -1135,7 +1135,7 @@ if (!v2Cls || ![v2Cls respondsToSelector:@selector(sharedInstance)]) {
 if (completion) completion();
 return;
 }
-id mgr = ((id ()(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
+id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
 SEL getHistSel = NSSelectorFromString(@"getGroupHistoryMessageList:count:lastMsg:succ:fail:");
 if (![mgr respondsToSelector:getHistSel]) {
 if (completion) completion();
@@ -1183,7 +1183,7 @@ id lastM = lastMsg;
 if (completion) completion();
 }
 }
-￼ (void)scanLocalDatabasesAsyncWithCompletion:(void(^)(void))doneBlock {
+- (void)scanLocalDatabasesAsyncWithCompletion:(void(^)(void))doneBlock {
 dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
 @try {
 NSString *home = NSHomeDirectory();
@@ -1205,7 +1205,7 @@ if (tName) [tables addObject:[NSString stringWithUTF8String:tName]];
 }
 sqlite3_finalize(tableStmt);
 for (NSString *t in tables) {
-NSString *sql = [NSString stringWithFormat:@"SELECT * FROM "%@" LIMIT 10000;", t];
+NSString *sql = [NSString stringWithFormat:@"SELECT * FROM \"%@\" LIMIT 10000;", t];
 sqlite3_stmt *rowStmt = NULL;
 if (sqlite3_prepare_v2(db, [sql UTF8String], -1, &rowStmt, NULL) == SQLITE_OK) {
 int colCount = sqlite3_column_count(rowStmt);
@@ -1235,7 +1235,7 @@ if (doneBlock) doneBlock();
 });
 });
 }
-￼ (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
+- (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
 progress:(void(^)(NSString *progressMsg))progressBlock
 completion:(void(^)(NSString *finalMsg))completion {
 [self setupIMGroupWelcomeListener];
@@ -1262,7 +1262,7 @@ NSString *finalStr = [NSString stringWithFormat:@"✅ 指定群采集完成：�
 if (completion) completion(finalStr);
 });
 }
-￼ (void)reloadAllDataWithProgress:(void(^)(NSString *progressMsg))progressBlock
+- (void)reloadAllDataWithProgress:(void(^)(NSString *progressMsg))progressBlock
 completion:(void(^)(NSString *finalMsg))completion {
 [self setupIMGroupWelcomeListener];
 [self scanLocalDatabasesAsyncWithCompletion:^{
@@ -1291,8 +1291,8 @@ NSString *gName = ACSafeStr([gInfo valueForKey:@"groupName"]);
 }
 dispatch_group_leave(baseGroup);
 };
-void (^failBlock)(int, NSString *) = ^(int code, NSString desc) { dispatch_group_leave(baseGroup); };
-((void ()(id, SEL, id, id))objc_msgSend)(mgr, getGroupsSel, succBlock, failBlock);
+void (^failBlock)(int, NSString *) = ^(int code,  NSString *desc) { dispatch_group_leave(baseGroup); };
+((void (*)(id, SEL, id, id))objc_msgSend)(mgr, getGroupsSel, succBlock, failBlock);
 }
 dispatch_group_notify(baseGroup, dispatch_get_main_queue(), ^{
 NSArray<ACContactItem *> *allGroups = [self.groupList copy];
@@ -1330,14 +1330,14 @@ if (completion) completion(finalStr);
 }];
 }
 #pragma mark - 3. 防封号文本动态混淆包装
-￼ (NSString *)obfuscateMessageText:(NSString *)originalText {
+- (NSString *)obfuscateMessageText:(NSString *)originalText {
 if (!originalText || originalText.length == 0) return @"";
 NSArray *tails = @[@"~", @" ✨", @" 👍", @" 😊", @" ~", @" 💡"];
 NSString *randomTail = tails[arc4random_uniform((uint32_t)tails.count)];
 return [originalText stringByAppendingString:randomTail];
 }
 #pragma mark - 4. 支持「四槽位独立图片 / 独立视频 / 文本」破盾发送引擎
-￼ (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
+- (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
 if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
 if (completion) completion();
 return;
@@ -1373,31 +1373,31 @@ if (completion) completion();
 if (completion) completion();
 }
 }
-￼ (void)simulateIncomingMessageFrom:(NSString )targetUserId completion:(void(^)(void))completion {
+- (void)simulateIncomingMessageFrom:(NSString *)targetUserId completion:(void(^)(void))completion {
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
 if (v2MgrCls && [v2MgrCls respondsToSelector:@selector(sharedInstance)]) {
-id manager = ((id ()(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
 SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
 SEL insertSel = NSSelectorFromString(@"insertC2CMessageToLocalStorage:to:sender:succ:fail:");
 if ([manager respondsToSelector:createTextSel] && [manager respondsToSelector:insertSel]) {
 id fakeMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, @"👋");
 NSString *myId = self.selfUserId ?: @"";
 void (^succ)(void) = ^{ if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-void (^fail)(int, NSString *) = ^(int c, NSString d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-((void ()(id, SEL, id, id, id, id, id))objc_msgSend)(manager, insertSel, fakeMsg, myId, targetUserId, succ, fail);
+void (^fail)(int, NSString *) = ^(int c,  NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
+((void (*)(id, SEL, id, id, id, id, id))objc_msgSend)(manager, insertSel, fakeMsg, myId, targetUserId, succ, fail);
 return;
 }
 }
 } @catch (NSException *e) {}
 if (completion) completion();
 }
-￼ (void)autoAddIMFriend:(NSString )userId completion:(void(^)(void))completion {
+- (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
 Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
 if (v2MgrCls && reqCls) {
-id manager = ((id ()(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
 SEL addFriendSel = NSSelectorFromString(@"addFriend:succ:fail:");
 if ([manager respondsToSelector:addFriendSel]) {
 id req = [[reqCls alloc] init];
@@ -1405,18 +1405,18 @@ id req = [[reqCls alloc] init];
 [req setValue:@"你好" forKey:@"addWording"];
 [req setValue:@(2) forKey:@"addType"];
 void (^succ)(id) = ^(id res) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-void (^fail)(int, NSString *) = ^(int c, NSString d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-((void ()(id, SEL, id, id, id))objc_msgSend)(manager, addFriendSel, req, succ, fail);
+void (^fail)(int, NSString *) = ^(int c,  NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
+((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, addFriendSel, req, succ, fail);
 return;
 }
 }
 } @catch (NSException *e) {}
 if (completion) completion();
 }
-￼ (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString desc))completion {
+- (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code,  NSString *desc))completion {
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-id manager = ((id ()(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
 SEL sendMsgSel = NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:");
 if (!v2Msg || ![manager respondsToSelector:sendMsgSel]) {
 if (completion) completion(NO, -1, @"构造消息失败");
@@ -1463,7 +1463,7 @@ if (completion) completion(NO, -1, @"发送异常");
 }
 }
 // 按指定槽位发送（0:群发槽, 1:迎新槽, 2:自动回复槽）
-￼ (void)sendText:(NSString *)text
+- (void)sendText:(NSString *)text
 mediaSlot:(ACMediaSlot)slot
 attachMedia:(BOOL)attachMedia
 toItem:(ACContactItem *)item
@@ -1481,20 +1481,20 @@ toItem:item
 completion:completion];
 }
 // 底层通用媒体+文字发送实现
-￼ (void)sendText:(NSString *)text
+- (void)sendText:(NSString *)text
 customMediaType:(NSInteger)mType
 customMediaPath:(NSString *)mPath
 customThumbPath:(NSString *)tPath
 customVideoDuration:(int)vDur
 toItem:(ACContactItem *)item
-completion:(void(^)(BOOL ok, NSString detail))completion {
+completion:(void(^)(BOOL ok,  NSString *detail))completion {
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
 if (!v2MgrCls || ![v2MgrCls respondsToSelector:@selector(sharedInstance)]) {
 if (completion) completion(NO, @"IM未初始化");
 return;
 }
-id manager = ((id ()(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
 NSFileManager *fm = [NSFileManager defaultManager];
 id v2MediaMsg = nil;
 if (mType == 1 && mPath.length > 0 && [fm fileExistsAtPath:mPath]) {
@@ -1523,12 +1523,12 @@ v2MediaMsg = tempVideoMsg;
 }
 }
 NSString *cleanText = [ACSafeStr(text) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-NSString obfuscatedText = cleanText.length > 0 ? [self obfuscateMessageText:cleanText] : @"";
+NSString *obfuscatedText = cleanText.length > 0 ? [self obfuscateMessageText:cleanText] : @"";
 id v2TextMsg = nil;
 if (obfuscatedText.length > 0) {
 SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
 if ([manager respondsToSelector:createTextSel]) {
-v2TextMsg = ((id ()(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, obfuscatedText);
+v2TextMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, obfuscatedText);
 }
 }
 id primaryMsg = v2MediaMsg ?: v2TextMsg;
@@ -1602,14 +1602,14 @@ if (completion) completion(NO, @"发送异常");
 @end
 @implementation ACForwardAssistantVC
 // 根据当前选中的 Tab 决定右上角图片/视频框操作的是哪一个独立媒体槽位
-￼ (ACMediaSlot)currentActiveMediaSlot {
+- (ACMediaSlot)currentActiveMediaSlot {
 NSInteger idx = self.tabControl ? self.tabControl.selectedSegmentIndex : 0;
 if (idx == 3) return ACMediaSlotWelcome;   // 🤖迎新专属图片/视频槽
 if (idx == 4) return ACMediaSlotAutoReply; // 💬自动回复专属图片/视频槽
 if (idx == 5) return ACMediaSlotMoment;    // 📝动态专属图片/视频槽
 return ACMediaSlotBatchSend;               // 好友/群员/群聊 群发专属图片/视频槽
 }
-￼ (NSString *)slotNameForSlot:(ACMediaSlot)slot {
+- (NSString *)slotNameForSlot:(ACMediaSlot)slot {
 switch (slot) {
 case ACMediaSlotWelcome:   return @"迎新专属";
 case ACMediaSlotAutoReply: return @"回复专属";
@@ -1617,7 +1617,7 @@ case ACMediaSlotMoment:    return @"动态专属";
 default:                   return @"群发专属";
 }
 }
-￼ (void)viewDidLoad {
+- (void)viewDidLoad {
 [super viewDidLoad];
 @try {
 self.title = @"全能助手 (四套媒体独立隔离)";
@@ -1642,10 +1642,10 @@ self.statusLabel.text = [NSString stringWithFormat:@"📁 本地缓存：%lu 好
 }
 } @catch (NSException *e) {}
 }
-￼ (void)dealloc {
+- (void)dealloc {
 [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
-￼ (void)onStatusUpdateNotification {
+- (void)onStatusUpdateNotification {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.tabControl.selectedSegmentIndex;
 if (idx == 3) {
@@ -1661,7 +1661,7 @@ self.statusLabel.text = mgr.lastMomentLog;
 }
 [self updateUI];
 }
-￼ (void)setupCleanUI {
+- (void)setupCleanUI {
 CGFloat width = self.view.bounds.size.width;
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 self.headerContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 236)];
@@ -1818,7 +1818,7 @@ self.tableView.contentInset = UIEdgeInsetsMake(4, 0, 100, 0);
 [self setupFloatingButton];
 }
 // 刷新右上角预览框：每个面板只显示自己独立槽位的图片/视频
-￼ (void)refreshMediaPreviewUI {
+- (void)refreshMediaPreviewUI {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 ACMediaSlot slot = [self currentActiveMediaSlot];
 NSString *slotTitle = [self slotNameForSlot:slot];
@@ -1843,7 +1843,7 @@ self.clearMediaBtn.hidden = YES;
 self.mediaBadgeLabel.hidden = YES;
 }
 }
-￼ (void)viewDidLayoutSubviews {
+- (void)viewDidLayoutSubviews {
 [super viewDidLayoutSubviews];
 CGFloat width = self.view.bounds.size.width;
 CGFloat height = self.view.bounds.size.height;
@@ -1862,7 +1862,7 @@ self.floatingSendBtn.frame = CGRectMake(x, y, btnW, btnH);
 [self.view bringSubviewToFront:self.headerContainer];
 [self.view bringSubviewToFront:self.floatingSendBtn];
 }
-￼ (void)setupFloatingButton {
+- (void)setupFloatingButton {
 self.floatingSendBtn = [UIButton buttonWithType:UIButtonTypeCustom];
 self.floatingSendBtn.backgroundColor = [UIColor systemBlueColor];
 [self.floatingSendBtn setTitle:@"🚀 发送 (0)" forState:UIControlStateNormal];
@@ -1878,21 +1878,21 @@ UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:sel
 [self.floatingSendBtn addGestureRecognizer:pan];
 [self.view addSubview:self.floatingSendBtn];
 }
-￼ (void)handlePan:(UIPanGestureRecognizer * _Nonnull)pan {
+- (void)handlePan:(UIPanGestureRecognizer * _Nonnull)pan {
 UIView *btn = pan.view;
 btn.tag = 999;
 CGPoint translation = [pan translationInView:self.view];
 btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
 [pan setTranslation:CGPointZero inView:self.view];
 }
-￼ (void)textViewDidChange:(UITextView * _Nonnull)textView {
+- (void)textViewDidChange:(UITextView * _Nonnull)textView {
 if (self.tabControl.selectedSegmentIndex == 3) {
 [ACForwardHelperManager shared].welcomeMessageText = textView.text;
 [[ACForwardHelperManager shared] saveAllCustomSettings];
 }
 }
 #pragma mark - 5.1 迎新 / 自动回复 / 定时发动态 按钮事件
-￼ (void)welcomeSwitchChanged:(UISwitch * _Nonnull)sw {
+- (void)welcomeSwitchChanged:(UISwitch * _Nonnull)sw {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 mgr.autoWelcomeEnabled = sw.isOn;
@@ -1910,7 +1910,7 @@ self.statusLabel.text = @"⚪ 迎新已关闭";
 }
 [self updateUI];
 }
-￼ (void)autoReplySwitchChanged:(UISwitch *)sw {
+- (void)autoReplySwitchChanged:(UISwitch *)sw {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 mgr.autoReplyEnabled = sw.isOn;
@@ -1926,7 +1926,7 @@ self.statusLabel.text = @"⚪ 自动回复已关闭";
 [self updateUI];
 }
 // 添加自动回复规则时，如果当前回复槽有选中的图片/视频，自动复制一份独立绑定给该条规则
-￼ (void)addAutoReplyRuleFromInput {
+- (void)addAutoReplyRuleFromInput {
 [self.view endEditing:YES];
 NSString *raw = [self.contentTextView.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 if (raw.length == 0) {
@@ -1977,7 +1977,7 @@ self.statusLabel.text = [NSString stringWithFormat:@"✅ 已添加自动回复�
 [self updateUI];
 [self.tableView reloadData];
 }
-￼ (void)momentSwitchChanged:(UISwitch *)sw {
+- (void)momentSwitchChanged:(UISwitch *)sw {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 mgr.autoMomentEnabled = sw.isOn;
@@ -1993,7 +1993,7 @@ self.statusLabel.text = @"⚪ 定时发动态已关闭";
 }
 [self updateUI];
 }
-￼ (void)cycleMomentInterval {
+- (void)cycleMomentInterval {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⏱ 设置自动发动态间隔时长"
@@ -2017,7 +2017,7 @@ self.statusLabel.text = [NSString stringWithFormat:@"✅ 已设置每 %ld 分钟
 }]];
 [self presentViewController:alert animated:YES completion:nil];
 }
-￼ (void)addMomentTaskFromInput {
+- (void)addMomentTaskFromInput {
 [self.view endEditing:YES];
 NSString *raw = [self.contentTextView.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 if (raw.length == 0) {
@@ -2041,7 +2041,7 @@ self.statusLabel.text = [NSString stringWithFormat:@"✅ 已添加第 %lu 条动
 [self updateUI];
 [self.tableView reloadData];
 }
-￼ (void)selectAllWelcomeGroups {
+- (void)selectAllWelcomeGroups {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (mgr.welcomeGroupIds.count < mgr.groupList.count) {
@@ -2055,7 +2055,7 @@ for (ACContactItem *g in mgr.groupList) {
 [self updateUI];
 [self.tableView reloadData];
 }
-￼ (void)chooseMediaFromAlbum {
+- (void)chooseMediaFromAlbum {
 [self.view endEditing:YES];
 UIImagePickerController *picker = [[UIImagePickerController alloc] init];
 picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
@@ -2065,7 +2065,7 @@ picker.delegate = self;
 [self presentViewController:picker animated:YES completion:nil];
 }
 // 选图或选视频时，严格保存到当前面板对应的独立槽位中，绝不串用！
-￼ (void)imagePickerController:(UIImagePickerController * _Nonnull)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> * _Nonnull)info {
+- (void)imagePickerController:(UIImagePickerController * _Nonnull)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> * _Nonnull)info {
 ACMediaSlot slot = [self currentActiveMediaSlot];
 NSString *slotTitle = [self slotNameForSlot:slot];
 NSString *mediaType = info[UIImagePickerControllerMediaType];
@@ -2087,14 +2087,14 @@ self.statusLabel.text = [NSString stringWithFormat:@"🖼️ 已保存【%@】�
 [self refreshMediaPreviewUI];
 [picker dismissViewControllerAnimated:YES completion:nil];
 }
-￼ (void)clearSelectedMedia {
+- (void)clearSelectedMedia {
 ACMediaSlot slot = [self currentActiveMediaSlot];
 [[ACForwardHelperManager shared] clearMediaForSlot:slot];
 [self refreshMediaPreviewUI];
 self.statusLabel.textColor = [UIColor secondaryLabelColor];
 self.statusLabel.text = [NSString stringWithFormat:@"已清除【%@】的独立图片/视频", [self slotNameForSlot:slot]];
 }
-￼ (void)refreshData {
+- (void)refreshData {
 [self.view endEditing:YES];
 self.statusLabel.textColor = [UIColor systemBlueColor];
 self.statusLabel.text = @"⏳ 正在后台递归拉取...";
@@ -2110,13 +2110,13 @@ weakSelf.statusLabel.text = finalMsg;
 [weakSelf.tableView reloadData];
 }];
 }
-￼ (NSArray<ACContactItem *> *)currentItems {
+- (NSArray<ACContactItem *> *)currentItems {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (self.tabControl.selectedSegmentIndex == 0) return mgr.friendList;
 if (self.tabControl.selectedSegmentIndex == 1) return mgr.groupMemberList;
 return mgr.groupList;
 }
-￼ (void)quickSelectAction:(UIButton * _Nonnull)sender {
+- (void)quickSelectAction:(UIButton * _Nonnull)sender {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (sender.tag == 600) {
@@ -2169,7 +2169,7 @@ for (ACContactItem *i in mgr.groupList) i.isSelected = NO;
 [self.tableView reloadData];
 }
 // 切换面板时，右上角的图片/视频预览框同步切换为该面板自己的独立槽位
-￼ (void)tabChanged {
+- (void)tabChanged {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.tabControl.selectedSegmentIndex;
@@ -2199,7 +2199,7 @@ self.statusLabel.text = @"💡 当前右上角为【群发专属图/视频】，
 [self updateUI];
 [self.tableView reloadData];
 }
-￼ (void)updateUI {
+- (void)updateUI {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 [self.tabControl setTitle:[NSString stringWithFormat:@"好友(%lu)", (unsigned long)mgr.friendList.count] forSegmentAtIndex:0];
 [self.tabControl setTitle:[NSString stringWithFormat:@"群员(%lu)", (unsigned long)mgr.groupMemberList.count] forSegmentAtIndex:1];
@@ -2214,14 +2214,14 @@ for (ACContactItem *i in mgr.groupList) if (i.isSelected) selCount++;
 [self.floatingSendBtn setTitle:[NSString stringWithFormat:@"🚀 发送 (%ld)", (long)selCount] forState:UIControlStateNormal];
 }
 #pragma mark - 5.2 列表数据源与交互
-￼ (NSInteger)tableView:(UITableView * _Nonnull)tableView numberOfRowsInSection:(NSInteger)section {
+- (NSInteger)tableView:(UITableView * _Nonnull)tableView numberOfRowsInSection:(NSInteger)section {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.tabControl.selectedSegmentIndex;
 if (idx == 4) return mgr.autoReplyRules.count;
 if (idx == 5) return mgr.momentTasks.count;
 return [self currentItems].count;
 }
-￼ (UITableViewCell * _Nonnull)tableView:(UITableView * _Nonnull)tableView cellForRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
+- (UITableViewCell * _Nonnull)tableView:(UITableView * _Nonnull)tableView cellForRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
 static NSString *cid = @"ACMultiFuncCell";
 UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cid];
 if (!cell) {
@@ -2234,7 +2234,7 @@ cell.accessoryView = nil;
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.tabControl.selectedSegmentIndex;
 if (idx == 4) {
-ACAutoReplyRule rule = mgr.autoReplyRules[indexPath.row];
+ACAutoReplyRule *rule = mgr.autoReplyRules[indexPath.row];
 BOOL isAll = (!rule.keyword || rule.keyword.length == 0 || [rule.keyword isEqualToString:@""]);
 NSString *kwBadge = isAll ? @"🌟 [匹配任意来信]" : [NSString stringWithFormat:@"🔑 [含词: %@]", rule.keyword];
 NSString *mediaDesc = @"默认带回复槽媒体";
@@ -2287,7 +2287,7 @@ cell.detailTextLabel.text = [NSString stringWithFormat:@"ID: %@ %@", item.target
 cell.accessoryType = item.isSelected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
 return cell;
 }
-￼ (void)publishSingleMomentTaskNow:(UIButton *)sender {
+- (void)publishSingleMomentTaskNow:(UIButton *)sender {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (sender.tag < 0 || sender.tag >= mgr.momentTasks.count) return;
 ACMomentTaskItem *task = mgr.momentTasks[sender.tag];
@@ -2295,7 +2295,7 @@ self.statusLabel.textColor = [UIColor systemBlueColor];
 self.statusLabel.text = @"⏳ 正在立即发布该条动态任务...";
 [mgr publishMomentTask:task completion:nil];
 }
-￼ (void)tableView:(UITableView * _Nonnull)tableView didSelectRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
+- (void)tableView:(UITableView * _Nonnull)tableView didSelectRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
 [tableView deselectRowAtIndexPath:indexPath animated:YES];
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
@@ -2332,11 +2332,11 @@ item.isSelected = !item.isSelected;
 [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
 [self updateUI];
 }
-￼ (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
 NSInteger idx = self.tabControl.selectedSegmentIndex;
 return (idx == 4 || idx == 5);
 }
-￼ (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
 if (editingStyle == UITableViewCellEditingStyleDelete) {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (self.tabControl.selectedSegmentIndex == 4 && indexPath.row < mgr.autoReplyRules.count) {
@@ -2358,7 +2358,7 @@ if (rule.customThumbPath.length > 0) {
 }
 }
 // 群发严格只使用槽位0（ACMediaSlotBatchSend），绝不会用到自动回复或迎新的图片/视频
-￼ (void)startBatchSend {
+- (void)startBatchSend {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSString *text = [self.contentTextView.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -2406,7 +2406,7 @@ nextStep();
 };
 nextStep();
 }
-￼ (void)dismissSelf {
+- (void)dismissSelf {
 [self dismissViewControllerAnimated:YES completion:nil];
 }
 @end
@@ -2481,7 +2481,7 @@ nav.modalPresentationStyle = UIModalPresentationPageSheet;
 }
 #pragma mark - 7. 换绑突破与全局请求头嗅探钩子
 %hook NSURLSession
-￼ (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
 NSString *urlStr = request.URL.absoluteString;
 // 自动捕获 apiv1.airchat.cc 请求中的全部真实 Header（用于动态发布鉴权）
 if ([urlStr containsString:@"apiv1.airchat.cc"] && request.allHTTPHeaderFields) {
@@ -2519,7 +2519,7 @@ return %orig;
 }
 %end
 %hook NSMutableURLRequest
-￼ (void)setValue:(NSString *)value forHTTPHeaderField:(NSString * _Nullable)field {
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString * _Nullable)field {
 %orig;
 if (field && value && [field isKindOfClass:[NSString class]] && [value isKindOfClass:[NSString class]]) {
 NSString *lowerField = field.lowercaseString;
@@ -2539,7 +2539,7 @@ if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
 }
 %end
 %hook NSJSONSerialization
-￼ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError * _Nullable *)error {
++ (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError * _Nullable *)error {
 id res = %orig;
 NSDictionary *dict = ACSafeDict(res);
 if (dict && dict[@"code"] && dict[@"data"]) {
@@ -2554,7 +2554,7 @@ return res;
 }
 %end
 %hook UILongPressGestureRecognizer
-￼ (void)setState:(UIGestureRecognizerState)state {
+- (void)setState:(UIGestureRecognizerState)state {
 %orig;
 if (state == UIGestureRecognizerStateBegan) {
 @try {
@@ -2606,13 +2606,13 @@ if (quickForwardPill.superview) [quickForwardPill removeFromSuperview];
 %end
 %hook UIWindow
 %new
-￼ (void)ac_onQuickPillTap:(UIButton * _Nonnull)sender {
+- (void)ac_onQuickPillTap:(UIButton * _Nonnull)sender {
 [sender removeFromSuperview];
 ACPresentForwardAssistantFromTopVC();
 }
 %end
 %hook UIViewController
-￼ (void)viewDidAppear:(BOOL)animated {
+- (void)viewDidAppear:(BOOL)animated {
 %orig;
 @try {
 [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
@@ -2645,12 +2645,12 @@ forceBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
 } @catch (NSException *e) {}
 }
 %new
-￼ (void)ac_openFromAbout {
+- (void)ac_openFromAbout {
 __pendingForwardText = nil;
 ACPresentForwardAssistantFromTopVC();
 }
 %new
-￼ (void)ac_forceSendInCurrentChat {
+- (void)ac_forceSendInCurrentChat {
 UITextView *inputTV = ACFindInputTextViewInView(self.view);
 NSString *text = inputTV ? [inputTV.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : @"";
 if (text.length == 0 && [[ACForwardHelperManager shared] mediaTypeForSlot:ACMediaSlotBatchSend] == 0) text = @"你好";
