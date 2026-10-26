@@ -1543,6 +1543,9 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, strong) UIButton *floatingSendBtn;
 @end
 
+@interface ACForwardAssistantVC (HOAutoProps)
+@property (nonatomic, strong) UILabel *welcomeSwitchLabel;
+@end
 @implementation ACForwardAssistantVC
 
 - (void)viewDidLoad {

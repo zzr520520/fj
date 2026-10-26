@@ -157,6 +157,72 @@ jobs:
           which ldid || true
           which dpkg-deb || true
 
+      - name: Ensure missing self.xxx properties are declared
+        run: |
+          # 源码里用了 self.xxx 却没有声明该属性时，会报
+          # "property 'xxx' not found on object of type 'YYY *'"。
+          # 这里按名字后缀推断类型（Label/Switch/Button/Bar/View/...），
+          # 在对应 @implementation 之前插入一个分类声明（幂等，已声明的会跳过）。
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("Tweak.xm")
+          s = p.read_text()
+
+          declared = set(re.findall(r'@property\s*\([^)]*\)[^;]*?\b(\w+)\s*;', s))
+          methods = set(re.findall(r'^[ \t]*[-+]\s*\([^)]*\)\s*(\w+)', s, re.M))
+          methods |= set(re.findall(r'@selector\(\s*(\w+)', s))
+
+          suffix = [('SegmentedControl', 'UISegmentedControl'), ('SegmentControl', 'UISegmentedControl'),
+                    ('TableView', 'UITableView'), ('TextView', 'UITextView'), ('ImageView', 'UIImageView'),
+                    ('Label', 'UILabel'), ('Switch', 'UISwitch'), ('Button', 'UIButton'),
+                    ('Btn', 'UIButton'), ('Field', 'UITextField'), ('Bar', 'UIView'),
+                    ('View', 'UIView'), ('Segment', 'UISegmentedControl')]
+
+          def ty(name):
+              for suf, t in suffix:
+                  if name.endswith(suf):
+                      return t
+              return None
+
+          lines = s.split("\n")
+
+          def enclosing_impl(k):
+              for t in range(k, -1, -1):
+                  m = re.match(r'^@implementation\s+([A-Za-z_]\w*)', lines[t])
+                  if m:
+                      return m.group(1)
+              return None
+
+          need = {}
+          for i, ln in enumerate(lines):
+              for m in re.finditer(r'self\.(\w+)', ln):
+                  n = m.group(1)
+                  if n in declared or n in methods:
+                      continue
+                  t = ty(n)
+                  if not t:
+                      continue
+                  cls = enclosing_impl(i)
+                  if cls:
+                      need.setdefault(cls, set()).add((n, t))
+
+          added = []
+          if need:
+              out, i = [], 0
+              while i < len(lines):
+                  mm = re.match(r'^@implementation\s+([A-Za-z_]\w*)', lines[i])
+                  if mm and mm.group(1) in need:
+                      out.append("@interface %s (HOAutoProps)" % mm.group(1))
+                      for n, t in sorted(need[mm.group(1)]):
+                          out.append("@property (nonatomic, strong) %s *%s;" % (t, n))
+                          added.append(n)
+                      out.append("@end")
+                  out.append(lines[i])
+                  i += 1
+              p.write_text("\n".join(out))
+          print("added property declaration(s):", added)
+          PY
+
       - name: Build dylib
         run: make -j"$(sysctl -n hw.ncpu)"
 
