@@ -24,6 +24,58 @@ if ([obj isKindOfClass:[NSNumber class]]) return [(NSNumber *)obj stringValue];
 return [NSString stringWithFormat:@"%@", obj];
 }
 // 媒体独立槽位枚举（彻底隔离 4 个功能的图片/视频，绝不互通串用）
+// 安全 KVC：任何字段名不存在时返回 nil，绝不让 NSUnknownKeyException 中断整条消息处理链
+static inline id ACSafeValue(id obj, NSString *key) {
+if (!obj || !key) return nil;
+@try { return [obj valueForKey:key]; } @catch (NSException *e) { return nil; }
+}
+// Header 大小写无关读取（抓包里 token / Token / X-Lts-Id 大小写并不统一）
+static inline NSString *ACHeaderValue(NSDictionary *headers, NSString *key) {
+if (!headers || key.length == 0) return nil;
+id v = headers[key];
+if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] > 0) return (NSString *)v;
+for (NSString *k in headers) {
+if ([k isKindOfClass:[NSString class]] && [k caseInsensitiveCompare:key] == NSOrderedSame) {
+id hv = headers[k];
+if ([hv isKindOfClass:[NSString class]] && [(NSString *)hv length] > 0) return (NSString *)hv;
+}
+}
+return nil;
+}
+// 触发词归一化：空串 / 全部 / 任意 / 所有 / * 都视为“匹配任意消息”
+static inline BOOL ACIsCatchAllKeyword(NSString *kw) {
+NSString *k = ACSafeStr(kw);
+k = [k stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+if (k.length == 0) return YES;
+NSString *lower = k.lowercaseString;
+return ([k isEqualToString:@"全部"] || [k isEqualToString:@"任意"] || [k isEqualToString:@"所有"] ||
+[k isEqualToString:@"*"] || [k isEqualToString:@"＊"] ||
+[lower isEqualToString:@"any"] || [lower isEqualToString:@"all"]);
+}
+// 递归清洗：去掉 NSNull 等不可 plist/JSON 序列化对象，避免 writeToFile / dataWithJSONObject 静默失败
+static inline id ACJSONSafeObject(id obj, NSInteger depth) {
+if (depth > 8 || !obj) return nil;
+if ([obj isKindOfClass:[NSNull class]]) return nil;
+if ([obj isKindOfClass:[NSString class]] || [obj isKindOfClass:[NSNumber class]]) return obj;
+if ([obj isKindOfClass:[NSArray class]]) {
+NSMutableArray *arr = [NSMutableArray array];
+for (id v in (NSArray *)obj) {
+id sv = ACJSONSafeObject(v, depth + 1);
+if (sv) [arr addObject:sv];
+}
+return arr;
+}
+if ([obj isKindOfClass:[NSDictionary class]]) {
+NSMutableDictionary *dic = [NSMutableDictionary dictionary];
+[(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+if (![k isKindOfClass:[NSString class]]) return;
+id sv = ACJSONSafeObject(v, depth + 1);
+if (sv) dic[k] = sv;
+}];
+return dic;
+}
+return nil;
+}
 typedef NS_ENUM(NSInteger, ACMediaSlot) {
 ACMediaSlotBatchSend = 0, // 槽位0：群发专属媒体（好友/群员/群聊）
 ACMediaSlotWelcome   = 1, // 槽位1：🤖迎新专属媒体
@@ -195,6 +247,11 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, strong) NSArray *latestCapturedMomentMediaList;
 @property (nonatomic, copy) NSString *lastMomentLog;
 @property (nonatomic, assign) BOOL listenerRegistered;
+@property (nonatomic, assign) BOOL groupListenerRegistered;
+@property (nonatomic, assign) BOOL msgListenerRegistered;
+@property (nonatomic, assign) BOOL listenerRetryScheduled;
+@property (nonatomic, assign) BOOL momentPublishing;
+@property (nonatomic, assign) BOOL momentRetryScheduled;
 + (instancetype)shared;
 // 四槽位独立媒体管理 API（0:群发, 1:迎新, 2:自动回复, 3:发动态）
 - (NSInteger)mediaTypeForSlot:(ACMediaSlot)slot; // 0:无, 1:图片, 2:视频
@@ -233,6 +290,13 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)restartMomentScheduler;
 - (void)onMomentTimerTick;
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion;
+// v2.1 新增：统一消息入口（TIM 监听代理与直接监听共用）、发动态节流/重试
+- (void)ac_handleIncomingMessage:(id)msg;
+- (void)ac_handleMembersJoined:(NSArray *)memberList groupID:(NSString *)groupID;
+- (void)ac_applyCapturedHeadersToRequest:(NSMutableURLRequest *)req;
+- (BOOL)ac_momentPublishAllowedNow;
+- (void)ac_markMomentPublishAttempt;
+- (void)ac_scheduleMomentRetryAfter:(NSTimeInterval)delay;
 @end
 @implementation ACForwardHelperManager
 + (instancetype)shared {
@@ -400,14 +464,14 @@ if (self.selfUserId.length > 5) {
 [ud setBool:self.autoReplyEnabled forKey:@"AC_AutoReply_Enabled"];
 NSMutableArray *rDicts = [NSMutableArray array];
 for (ACAutoReplyRule *r in self.autoReplyRules) {
-[rDicts addObject:[r toDict]];
+[rDicts addObject:(ACJSONSafeObject([r toDict], 0) ?: @{})];
 }
 [rDicts writeToFile:[self cacheFilePath:@"autoreply_rules"] atomically:YES];
 [ud setBool:self.autoMomentEnabled forKey:@"AC_AutoMoment_Enabled"];
-[ud setInteger:MAX(1, self.momentIntervalMinutes) forKey:@"AC_AutoMoment_Interval"];
+[ud setInteger:MAX(5, self.momentIntervalMinutes) forKey:@"AC_AutoMoment_Interval"];
 NSMutableArray *mDicts = [NSMutableArray array];
 for (ACMomentTaskItem *t in self.momentTasks) {
-[mDicts addObject:[t toDict]];
+[mDicts addObject:(ACJSONSafeObject([t toDict], 0) ?: @{})];
 }
 [mDicts writeToFile:[self cacheFilePath:@"moment_tasks"] atomically:YES];
 [ud synchronize];
@@ -433,6 +497,13 @@ self.capturedClientTypeV2 = savedV2;
 NSDictionary *savedHeaders = ACSafeDict([ud objectForKey:@"AC_Saved_HTTPHeaders"]);
 if (savedHeaders) {
 [self.latestHTTPHeaders addEntriesFromDictionary:savedHeaders];
+// 旧版本可能只存了原始大小写，统一补一份小写键
+for (NSString *k in savedHeaders) {
+if ([k isKindOfClass:[NSString class]]) {
+id v = savedHeaders[k];
+if ([v isKindOfClass:[NSString class]]) self.latestHTTPHeaders[k.lowercaseString] = v;
+}
+}
 }
 NSString *savedUid = ACSafeStr([ud objectForKey:@"AC_Saved_SelfUserId"]);
 if (savedUid.length > 5) {
@@ -536,57 +607,55 @@ self.groupMap[item.targetId] = item;
 }
 #pragma mark - 2.1 腾讯云 IM 实时监听（迎新使用槽位1，自动回复使用规则专属媒体或槽位2）
 - (void)setupIMGroupWelcomeListener {
-if (self.listenerRegistered) return;
 @try {
 Class v2Cls = NSClassFromString(@"V2TIMManager");
 if (!v2Cls || ![v2Cls respondsToSelector:@selector(sharedInstance)]) return;
 id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
 if (!mgr) return;
-SEL addGrpListenerSel = NSSelectorFromString(@"addGroupListener:");
-if ([mgr respondsToSelector:addGrpListenerSel]) {
-((void (*)(id, SEL, id))objc_msgSend)(mgr, addGrpListenerSel, self);
-self.listenerRegistered = YES;
+BOOL allOK = YES;
+SEL addGrpSel = NSSelectorFromString(@"addGroupListener:");
+if ([mgr respondsToSelector:addGrpSel]) {
+if (!self.groupListenerRegistered) {
+((void (*)(id, SEL, id))objc_msgSend)(mgr, addGrpSel, self);
+self.groupListenerRegistered = YES;
 }
-SEL addMsgListenerSel = NSSelectorFromString(@"addAdvancedMsgListener:");
-if ([mgr respondsToSelector:addMsgListenerSel]) {
-((void (*)(id, SEL, id))objc_msgSend)(mgr, addMsgListenerSel, self);
-self.listenerRegistered = YES;
+} else { allOK = NO; }
+SEL addMsgSel = NSSelectorFromString(@"addAdvancedMsgListener:");
+if ([mgr respondsToSelector:addMsgSel]) {
+if (!self.msgListenerRegistered) {
+((void (*)(id, SEL, id))objc_msgSend)(mgr, addMsgSel, self);
+self.msgListenerRegistered = YES;
+}
+} else { allOK = NO; }
+self.listenerRegistered = allOK;
+// 修复：任一监听注册失败就定时重试，避免“第一次没注册上就永远收不到消息”
+if (!allOK && !self.listenerRetryScheduled) {
+self.listenerRetryScheduled = YES;
+__weak typeof(self) weakSelf = self;
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+weakSelf.listenerRetryScheduled = NO;
+[weakSelf setupIMGroupWelcomeListener];
+});
 }
 } @catch (NSException *e) {}
 }
+
 - (void)onMemberEnter:(NSString *)groupID memberList:(NSArray *)memberList {
-[self handleNewMembersJoinedGroup:groupID memberList:memberList];
+[self ac_handleMembersJoined:memberList groupID:groupID];
 }
 - (void)onMemberInvited:(NSString *)groupID opUser:(id)opUser memberList:(NSArray *)memberList {
+[self ac_handleMembersJoined:memberList groupID:groupID];
+}
+- (void)ac_handleMembersJoined:(NSArray *)memberList groupID:(NSString *)groupID {
 [self handleNewMembersJoinedGroup:groupID memberList:memberList];
 }
-// 核心修复：单聊文本直达回调（腾讯云 IM 文本消息专属通道，绝不遗漏）
-- (void)onRecvC2CTextMessage:(NSString *)msgID sender:(id)info text:(NSString *)text {
-    if (!text || text.length == 0) return;
-    @try {
-        NSString *senderId = @"";
-        NSString *nick = @"";
-        if ([info isKindOfClass:[NSString class]]) {
-            senderId = (NSString *)info;
-        } else if (info) {
-            senderId = ACSafeStr([info valueForKey:@"userID"]);
-            nick = ACSafeStr([info valueForKey:@"nickName"]);
-        }
-        if (senderId.length >= 5 && ![senderId isEqualToString:self.selfUserId]) {
-            [self addFriendWithId:senderId name:nick tag:@"主动来信" chatMeType:0];
-            [self saveLocalPermanentCache];
-            self.lastAutoReplyLog = [NSString stringWithFormat:@"📩 收到单聊私信[%@]: %@", senderId, text];
-            [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-            if (self.autoReplyEnabled && self.autoReplyRules.count > 0) {
-                [self handleIncomingPrivateMessageFrom:senderId nickName:nick text:text];
-            }
-        }
-    } @catch (NSException *e) {}
-}
 - (void)onRecvNewMessage:(id)msg {
+[self ac_handleIncomingMessage:msg];
+}
+- (void)ac_handleIncomingMessage:(id)msg {
 if (!msg) return;
 @try {
-NSData *cData = [msg valueForKey:@"cloudCustomData"];
+NSData *cData = ACSafeValue(msg, @"cloudCustomData");
 if ([cData isKindOfClass:[NSData class]] && cData.length > 10) {
 NSDictionary *cDict = ACSafeDict([NSJSONSerialization JSONObjectWithData:cData options:0 error:nil]);
 NSString *v2Str = ACSafeStr(cDict[@"client_typeV2"]);
@@ -595,41 +664,28 @@ self.capturedClientTypeV2 = v2Str;
 self.capturedCloudCustomData = cData;
 }
 }
-BOOL isSelf = [[msg valueForKey:@"isSelf"] boolValue];
-NSString *groupID = ACSafeStr([msg valueForKey:@"groupID"]);
-NSString *userID = ACSafeStr([msg valueForKey:@"userID"]);
-NSString *sender = ACSafeStr([msg valueForKey:@"sender"]);
+BOOL isSelf = [ACSafeValue(msg, @"isSelf") boolValue];
+NSString *groupID = ACSafeStr(ACSafeValue(msg, @"groupID"));
+NSString *userID = ACSafeStr(ACSafeValue(msg, @"userID"));
+NSString *sender = ACSafeStr(ACSafeValue(msg, @"sender"));
 if (sender.length == 0) sender = userID;
-NSString *nickName = ACSafeStr([msg valueForKey:@"nickName"]);
-if (nickName.length == 0) nickName = ACSafeStr([msg valueForKey:@"nameCard"]);
+if (sender.length == 0) sender = ACSafeStr(ACSafeValue(msg, @"fromUser"));
+if (sender.length == 0) sender = ACSafeStr(ACSafeValue(msg, @"from"));
+NSString *nickName = ACSafeStr(ACSafeValue(msg, @"nickName"));
+if (nickName.length == 0) nickName = ACSafeStr(ACSafeValue(msg, @"nameCard"));
+if (nickName.length == 0) nickName = ACSafeStr(ACSafeValue(msg, @"friendRemark"));
 // A. 别人发来的 C2C 私信 -> 自动回复（严格使用槽位2或该条规则绑定的专属图片/视频）
 if (groupID.length == 0 && sender.length >= 5 && !isSelf && ![sender isEqualToString:self.selfUserId]) {
 [self addFriendWithId:sender name:nickName tag:@"主动来信" chatMeType:0];
 [self saveLocalPermanentCache];
 if (self.autoReplyEnabled && self.autoReplyRules.count > 0) {
 NSString *incomingText = @"";
-@try {
-    id textElem = [msg valueForKey:@"textElem"];
-    if (textElem && ![textElem isKindOfClass:[NSNull class]]) {
-        incomingText = ACSafeStr([textElem valueForKey:@"text"]);
-    }
-    if (incomingText.length == 0) {
-        SEL textSel = NSSelectorFromString(@"text");
-        if ([msg respondsToSelector:textSel]) {
-            incomingText = ACSafeStr(((NSString *(*)(id, SEL))objc_msgSend)(msg, textSel));
-        }
-    }
-    if (incomingText.length == 0) {
-        NSArray *elemList = ACSafeArray([msg valueForKey:@"elemList"]);
-        for (id elem in elemList) {
-            NSString *t = ACSafeStr([elem valueForKey:@"text"]);
-            if (t.length > 0) { incomingText = t; break; }
-        }
-    }
-} @catch (NSException *e) {}
-
-self.lastAutoReplyLog = [NSString stringWithFormat:@"📩 捕获新私信[%@]: %@", sender, incomingText.length > 0 ? incomingText : @"[媒体/表情]"];
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+id textElem = ACSafeValue(msg, @"textElem");
+if (textElem && ![textElem isKindOfClass:[NSNull class]]) {
+incomingText = ACSafeStr(ACSafeValue(textElem, @"text"));
+}
+if (incomingText.length == 0) incomingText = ACSafeStr(ACSafeValue(msg, @"text"));
+if (incomingText.length == 0) incomingText = ACSafeStr(ACSafeValue(msg, @"description"));
 [self handleIncomingPrivateMessageFrom:sender nickName:nickName text:incomingText];
 }
 return;
@@ -641,11 +697,11 @@ if ([self addGroupMemberWithId:sender name:nickName groupId:groupID role:@"群�
 [self saveLocalPermanentCache];
 }
 }
-id tipsElem = [msg valueForKey:@"groupTipsElem"];
+id tipsElem = ACSafeValue(msg, @"groupTipsElem");
 if (tipsElem && ![tipsElem isKindOfClass:[NSNull class]]) {
-NSInteger tipsType = [ACSafeStr([tipsElem valueForKey:@"type"]) integerValue];
+NSInteger tipsType = [ACSafeStr(ACSafeValue(tipsElem, @"type")) integerValue];
 if (tipsType == 1 || tipsType == 2) {
-NSArray *memberList = ACSafeArray([tipsElem valueForKey:@"memberList"]);
+NSArray *memberList = ACSafeArray(ACSafeValue(tipsElem, @"memberList"));
 if (memberList.count > 0) {
 [self handleNewMembersJoinedGroup:groupID memberList:memberList];
 }
@@ -657,22 +713,25 @@ if (memberList.count > 0) {
 @try {
 NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
 NSNumber *lastTimeNum = self.autoReplyCooldownMap[senderId];
-if (lastTimeNum && (now - [lastTimeNum doubleValue] < 6.0)) {
+if (lastTimeNum && (now - [lastTimeNum doubleValue] < 60.0)) {
 return;
 }
 ACAutoReplyRule *matchedRule = nil;
 ACAutoReplyRule *fallbackRule = nil;
+ACAutoReplyRule *firstEnabledRule = nil;
 for (ACAutoReplyRule *rule in self.autoReplyRules) {
 if (!rule.enabled || rule.replyText.length == 0) continue;
+if (!firstEnabledRule) firstEnabledRule = rule;
 NSString *kw = [rule.keyword stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-if (kw.length == 0 || [kw isEqualToString:@""] || [kw isEqualToString:@"*"] || [kw isEqualToString:@"全部"]) {
-    if (!fallbackRule) fallbackRule = rule;
+if (ACIsCatchAllKeyword(kw)) {
+if (!fallbackRule) fallbackRule = rule;
 } else if (incomingText.length > 0 && [incomingText localizedCaseInsensitiveContainsString:kw]) {
-    matchedRule = rule;
-    break;
+matchedRule = rule;
+break;
 }
 }
-ACAutoReplyRule *finalRule = matchedRule ?: fallbackRule;
+// 修复：关键词未命中时也回落到首条启用规则，避免“只填回复内容却永远不触发”
+ACAutoReplyRule *finalRule = matchedRule ?: fallbackRule ?: firstEnabledRule;
 if (!finalRule) return;
 self.autoReplyCooldownMap[senderId] = @(now);
 NSString *displayNick = (nick.length > 0) ? nick : @"朋友";
@@ -734,7 +793,8 @@ if (self.momentTimer) {
 self.momentTimer = nil;
 }
 if (!self.autoMomentEnabled) return;
-NSTimeInterval intervalSec = MAX(1, self.momentIntervalMinutes) * 60.0;
+// 修复：服务端单账号发布频率约 5 分钟/条，定时器最小间隔不得低于 5 分钟
+NSTimeInterval intervalSec = MAX(5, self.momentIntervalMinutes) * 60.0;
 self.momentTimer = [NSTimer scheduledTimerWithTimeInterval:intervalSec
 target:self
 selector:@selector(onMomentTimerTick)
@@ -744,6 +804,12 @@ repeats:YES];
 }
 - (void)onMomentTimerTick {
 if (!self.autoMomentEnabled || self.momentTasks.count == 0) return;
+if (![self ac_momentPublishAllowedNow]) {
+NSTimeInterval last = [[NSUserDefaults standardUserDefaults] doubleForKey:@"AC_LastMomentPublishAt"];
+NSTimeInterval wait = MAX(30.0, (NSTimeInterval)MAX(5, self.momentIntervalMinutes) * 60.0 - ([[NSDate date] timeIntervalSince1970] - last));
+[self ac_scheduleMomentRetryAfter:wait];
+return;
+}
 NSMutableArray<ACMomentTaskItem *> *activeTasks = [NSMutableArray array];
 for (ACMomentTaskItem *t in self.momentTasks) {
 if (t.enabled && t.contentText.length > 0) {
@@ -759,50 +825,115 @@ self.currentMomentRotationIdx = (self.currentMomentRotationIdx + 1) % activeTask
 [self publishMomentTask:taskToPublish completion:nil];
 }
 // 严格按照 StormSniffer 抓包 (04:36:23.102Z) 还原动态发布请求头与请求体
+- (BOOL)ac_momentPublishAllowedNow {
+NSTimeInterval last = [[NSUserDefaults standardUserDefaults] doubleForKey:@"AC_LastMomentPublishAt"];
+NSTimeInterval nowT = [[NSDate date] timeIntervalSince1970];
+NSInteger minGap = MAX(5, self.momentIntervalMinutes);
+if (last > 0 && (nowT - last) < (NSTimeInterval)minGap * 60.0) return NO;
+return YES;
+}
+- (void)ac_markMomentPublishAttempt {
+NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+[ud setDouble:[[NSDate date] timeIntervalSince1970] forKey:@"AC_LastMomentPublishAt"];
+[ud setDouble:(double)MAX(5, self.momentIntervalMinutes) forKey:@"AC_LastMomentGapMinutes"];
+[ud synchronize];
+}
+- (void)ac_scheduleMomentRetryAfter:(NSTimeInterval)delay {
+if (self.momentRetryScheduled) return;
+self.momentRetryScheduled = YES;
+__weak typeof(self) weakSelf = self;
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(30.0, delay) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+weakSelf.momentRetryScheduled = NO;
+if (weakSelf.autoMomentEnabled) [weakSelf onMomentTimerTick];
+});
+}
+static NSInteger ACParseRetryMinutes(NSString *msg) {
+// 服务端文案：“发布过于频繁，请5分钟后再次尝试。#SVIP”
+if (msg.length == 0) return 5;
+NSRange r = [msg rangeOfString:@"分钟"];
+if (r.location == NSNotFound) return 5;
+NSInteger end = (NSInteger)r.location;
+NSInteger start = end;
+while (start > 0) {
+unichar c = [msg characterAtIndex:(NSUInteger)(start - 1)];
+if (c >= '0' && c <= '9') start--; else break;
+}
+if (start >= end) return 5;
+NSInteger v = [[msg substringWithRange:NSMakeRange((NSUInteger)start, (NSUInteger)(end - start))] integerValue];
+return (v > 0 && v <= 720) ? v : 5;
+}
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
 if (!task || task.contentText.length == 0) {
 if (completion) completion(NO, @"动态内容为空");
 return;
 }
-NSString *token = self.latestHTTPHeaders[@"token"];
-if (!token || token.length == 0) {
-    token = ACSafeStr([[NSUserDefaults standardUserDefaults] objectForKey:@"token"]);
+if (self.momentPublishing) {
+if (completion) completion(NO, @"上一条动态仍在发布中");
+return;
 }
-if (!token || token.length == 0) {
-    token = @"OsTvgkDKLPLLryjos8vGomBtMIzYgvAF"; // 兜底有效凭证，绝不卡死
+// 修复：本地再做一道冷却闸门，避免定时器/手动按钮重复触发导致服务端 500
+if (![self ac_momentPublishAllowedNow]) {
+NSTimeInterval last = [[NSUserDefaults standardUserDefaults] doubleForKey:@"AC_LastMomentPublishAt"];
+NSTimeInterval wait = MAX(30.0, (NSTimeInterval)MAX(5, self.momentIntervalMinutes) * 60.0 - ([[NSDate date] timeIntervalSince1970] - last));
+self.lastMomentLog = [NSString stringWithFormat:@"⏳ 发布冷却中，约 %.0f 秒后自动重试（服务端限制≈5分钟/条）", wait];
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, self.lastMomentLog);
+[self ac_scheduleMomentRetryAfter:wait];
+return;
+}
+// 修复：token 大小写无关，并允许等待 App 后续请求把 token 捕获进来
+NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
+if (token.length == 0) {
+self.lastMomentLog = @"⏳ 正在获取登录凭证（最多等待 20 秒，请保持 App 前台）...";
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+__weak typeof(self) weakSelf = self;
+__block NSInteger tries = 0;
+__block void (^waitBlock)(void);
+waitBlock = ^{
+NSString *tk = ACHeaderValue(weakSelf.latestHTTPHeaders, @"token");
+if (tk.length > 0) {
+[weakSelf publishMomentTask:task completion:completion];
+return;
+}
+if (++tries >= 40) {
+weakSelf.lastMomentLog = @"❌ 未捕获到登录凭证：请先在 App 内切换一次页面（任意 API 请求）后重试";
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, weakSelf.lastMomentLog);
+return;
+}
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), waitBlock);
+};
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), waitBlock);
+return;
 }
 @try {
-NSString *apiHost = self.latestHTTPHeaders[@"Host"] ?: @"apiv1.airchat.cn";
-if ([apiHost containsString:@":"]) apiHost = [[apiHost componentsSeparatedByString:@":"] firstObject];
-NSString *urlString = [NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/publish", apiHost];
-NSURL *url = [NSURL URLWithString:urlString];
+self.momentPublishing = YES;
+NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/app/publish"];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
-// 1. 填充抓包中必需的全部鉴权请求头（包含之前遗漏的 X-Request-No）
-[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+[req setValue:@"/" forHTTPHeaderField:@"Accept"];
 [req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
 [req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
 [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 [req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
 [req setValue:token forHTTPHeaderField:@"token"];
-[req setValue:(self.selfUserId ?: @"1980559125632786434") forHTTPHeaderField:@"x-userid"];
-[req setValue:(self.latestHTTPHeaders[@"version"] ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
-[req setValue:(self.latestHTTPHeaders[@"User-Agent"] ?: @"airchat/1017 CFNetwork/1490.0.4 Darwin/23.2.0") forHTTPHeaderField:@"User-Agent"];
-[req setValue:(self.latestHTTPHeaders[@"channel"] ?: @"ios, iPhone iOS 17.2.1, 2A2BBADD-BD22-4D48-B795-8AB72EB246C8 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
-NSString *ltsId = self.latestHTTPHeaders[@"X-Lts-Id"] ?: self.latestHTTPHeaders[@"x-lts-id"];
-if (ltsId && ltsId.length > 0) {
-[req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
-}
-// 生成与抓包一致的 15 位 X-Request-No
-NSString *reqNo = self.latestHTTPHeaders[@"X-Request-No"] ?: [NSString stringWithFormat:@"2295089%08u", arc4random_uniform(99999999)];
+[req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"User-Agent") ?: @"airchat/1017 CFNetwork/1490.0.4 Darwin/23.2.0") forHTTPHeaderField:@"User-Agent"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
+NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+if (ltsId.length > 0) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+// 修复：X-Request-No 每次必须新生成，复用抓包里的旧值会被服务端判为重复请求
+NSString *reqNo = [NSString stringWithFormat:@"%015llu",
+(unsigned long long)((unsigned long long)([[NSDate date] timeIntervalSince1970] * 1000.0) % 100000000000000ULL)];
 [req setValue:reqNo forHTTPHeaderField:@"X-Request-No"];
-// 2. 严格还原抓包中的请求体结构：
-// 纯文字动态抓包真实 Body: {"commentPermission":1,"contentText":"u","contentType":1}（绝不传多余的 label 字段！）
-NSArray *mediaArr = ACSafeArray(task.capturedMediaList);
-BOOL hasRemoteMedia = (mediaArr && mediaArr.count > 0);
+// 请求体：纯文本 contentType=1；带远端媒体 contentType=3
+id safeMedia = ACJSONSafeObject(task.capturedMediaList, 0);
+NSArray *mediaArr = [safeMedia isKindOfClass:[NSArray class]] ? (NSArray *)safeMedia : nil;
+BOOL hasRemoteMedia = (mediaArr.count > 0);
 NSMutableDictionary *bodyDict = [NSMutableDictionary dictionary];
 bodyDict[@"commentPermission"] = @(1);
-bodyDict[@"contentText"] = task.contentText;
+bodyDict[@"contentText"] = ACSafeStr(task.contentText);
 if (hasRemoteMedia) {
 bodyDict[@"contentType"] = @(3);
 bodyDict[@"mediaList"] = mediaArr;
@@ -810,16 +941,23 @@ bodyDict[@"mediaList"] = mediaArr;
 bodyDict[@"contentType"] = @(1);
 }
 NSData *bodyData = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
+if (!bodyData) {
+self.momentPublishing = NO;
+if (completion) completion(NO, @"请求体序列化失败");
+return;
+}
 req.HTTPBody = bodyData;
 [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
 __weak typeof(self) weakSelf = self;
 [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
 dispatch_async(dispatch_get_main_queue(), ^{
+weakSelf.momentPublishing = NO;
 if (error || !data) {
 NSString *failMsg = [NSString stringWithFormat:@"❌ 发布异常: %@", error.localizedDescription ?: @"网络错误"];
 weakSelf.lastMomentLog = failMsg;
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 if (completion) completion(NO, failMsg);
+[weakSelf ac_scheduleMomentRetryAfter:60.0];
 return;
 }
 NSDictionary *respDict = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
@@ -835,22 +973,45 @@ NSString *okMsg = [NSString stringWithFormat:@"✅ 动态发布成功(%@) ID:%@ 
 weakSelf.lastMomentLog = okMsg;
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 if (completion) completion(YES, okMsg);
-} else {
+return;
+}
 NSString *serverMsg = ACSafeStr(respDict[@"msg"]);
-if (serverMsg.length == 0) {
-serverMsg = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"接口返回非200";
+if (serverMsg.length == 0) serverMsg = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"接口返回非200";
+// 修复：识别 token 过期与频率限制，分别走“重新抓 token”和“按服务端时间退避”
+if (code == 401 || code == 403 || [serverMsg.lowercaseString containsString:@"token"] ||
+[serverMsg containsString:@"登录"] || [serverMsg containsString:@"未授权"]) {
+[weakSelf.latestHTTPHeaders removeObjectForKey:@"token"];
+[weakSelf.latestHTTPHeaders removeObjectForKey:@"Token"];
+[weakSelf saveAllCustomSettings];
+NSString *errMsg = [NSString stringWithFormat:@"⚠️ 登录凭证失效(%ld): %@（已清除旧 token，60 秒后自动重试）", (long)code, serverMsg];
+weakSelf.lastMomentLog = errMsg;
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, errMsg);
+[weakSelf ac_scheduleMomentRetryAfter:60.0];
+return;
+}
+if ([serverMsg containsString:@"频繁"] || [serverMsg containsString:@"分钟"] || [serverMsg containsString:@"限制"]) {
+NSInteger waitMin = ACParseRetryMinutes(serverMsg);
+NSString *errMsg = [NSString stringWithFormat:@"⏳ 服务端限频(%ld): %@ | 已安排 %ld 分钟后自动重试", (long)code, serverMsg, (long)waitMin];
+weakSelf.lastMomentLog = errMsg;
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, errMsg);
+[weakSelf ac_scheduleMomentRetryAfter:(NSTimeInterval)waitMin * 60.0];
+return;
 }
 NSString *errLog = [NSString stringWithFormat:@"⚠️ 动态返回(%ld): %@", (long)code, serverMsg];
 weakSelf.lastMomentLog = errLog;
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 if (completion) completion(NO, errLog);
-}
 });
 }] resume];
+[self ac_markMomentPublishAttempt];
 } @catch (NSException *e) {
+self.momentPublishing = NO;
 if (completion) completion(NO, @"构造动态请求异常");
 }
 }
+
 #pragma mark - 2.1.3 新人进群迎新处理（严格使用槽位1：ACMediaSlotWelcome）
 - (void)handleNewMembersJoinedGroup:(NSString *)groupID memberList:(NSArray *)memberList {
 NSString *cleanGid = ACSafeStr(groupID);
@@ -1380,8 +1541,20 @@ NSString *randomTail = tails[arc4random_uniform((uint32_t)tails.count)];
 return [originalText stringByAppendingString:randomTail];
 }
 #pragma mark - 4. 支持「四槽位独立图片 / 独立视频 / 文本」破盾发送引擎
+- (void)ac_applyCapturedHeadersToRequest:(NSMutableURLRequest *)req {
+if (!req) return;
+[self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
+NSString *lk = k.lowercaseString;
+// 修复：重放抓包 Header 时不能带上一次的 Content-Length / Host / Connection / Accept-Encoding
+if ([lk isEqualToString:@"content-length"] || [lk isEqualToString:@"host"] ||
+[lk isEqualToString:@"connection"] || [lk isEqualToString:@"accept-encoding"] ||
+[lk isEqualToString:@"content-type"]) return;
+[req setValue:v forHTTPHeaderField:k];
+}];
+}
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
-if (!targetUserId || targetUserId.length == 0 || !self.latestHTTPHeaders[@"token"]) {
+if (!targetUserId || targetUserId.length == 0 || ACHeaderValue(self.latestHTTPHeaders, @"token").length == 0) {
 if (completion) completion();
 return;
 }
@@ -1390,9 +1563,7 @@ dispatch_group_t apiGroup = dispatch_group_create();
 dispatch_group_enter(apiGroup);
 NSMutableURLRequest *req1 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/userfriends/add"]];
 req1.HTTPMethod = @"POST";
-[self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
-[req1 setValue:v forHTTPHeaderField:k];
-}];
+[self ac_applyCapturedHeadersToRequest:req1];
 [req1 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 req1.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"friendId": targetUserId} options:0 error:nil];
 [[[NSURLSession sharedSession] dataTaskWithRequest:req1 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
@@ -1401,9 +1572,7 @@ dispatch_group_leave(apiGroup);
 dispatch_group_enter(apiGroup);
 NSMutableURLRequest *req2 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/useronechat/add"]];
 req2.HTTPMethod = @"POST";
-[self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
-[req2 setValue:v forHTTPHeaderField:k];
-}];
+[self ac_applyCapturedHeadersToRequest:req2];
 [req2 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 req2.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"chatWithHimId": targetUserId, @"id": targetUserId, @"userId": self.selfUserId ?: @""} options:0 error:nil];
 [[[NSURLSession sharedSession] dataTaskWithRequest:req2 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
@@ -1456,25 +1625,31 @@ return;
 } @catch (NSException *e) {}
 if (completion) completion();
 }
-- (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code,  NSString *desc))completion {
+- (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
-SEL sendMsgSel = NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:");
-if (!v2Msg || ![manager respondsToSelector:sendMsgSel]) {
+if (!v2MgrCls || !v2Msg) {
 if (completion) completion(NO, -1, @"构造消息失败");
 return;
 }
+id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
+if (!manager) {
+if (completion) completion(NO, -1, @"IM未初始化");
+return;
+}
+// cloudCustomData 为可选字段，任何异常都不能影响发送
+@try {
 if (self.capturedCloudCustomData) {
 [v2Msg setValue:self.capturedCloudCustomData forKey:@"cloudCustomData"];
 } else {
 NSDictionary *nativeCustom = @{
-@"client_typeV2": self.capturedClientTypeV2 ?: @"79b3h7aOxJurSbzVhPK2Wal1cKQzfppVutid7[d]gEtuxYU87uiCm3l2gMp7d5Eo3KZS3hFxBn8Db[d]yag55Ev1I3W[a]7xF6oF0FSXM[s]",
+@"client_typeV2": self.capturedClientTypeV2 ?: @"",
 @"client_type": @"iOS"
 };
 NSData *customData = [NSJSONSerialization dataWithJSONObject:nativeCustom options:0 error:nil];
 if (customData) [v2Msg setValue:customData forKey:@"cloudCustomData"];
 }
+} @catch (NSException *ignore) {}
 BOOL isGroup = (item.sourceType == 2);
 NSString *receiver = isGroup ? nil : item.targetId;
 NSString *groupID = isGroup ? item.targetId : nil;
@@ -1484,27 +1659,29 @@ if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, 0, 
 void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) {
 if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, code, desc); });
 };
-NSMethodSignature *sig = [manager methodSignatureForSelector:sendMsgSel];
-NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-[inv setTarget:manager];
-[inv setSelector:sendMsgSel];
-[inv setArgument:&v2Msg atIndex:2];
-[inv setArgument:&receiver atIndex:3];
-[inv setArgument:&groupID atIndex:4];
 NSInteger priority = 1;
 BOOL onlineOnly = NO;
 id nilObj = nil;
-[inv setArgument:&priority atIndex:5];
-[inv setArgument:&onlineOnly atIndex:6];
-[inv setArgument:&nilObj atIndex:7];
-[inv setArgument:&nilObj atIndex:8];
-[inv setArgument:&succBlock atIndex:9];
-[inv setArgument:&failBlock atIndex:10];
-[inv invoke];
+SEL selA = NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:");
+SEL selB = NSSelectorFromString(@"sendMessage:to:priority:onlineUserOnly:offlinePushInfo:succ:fail:");
+SEL selC = NSSelectorFromString(@"sendC2CMessage:to:succ:fail:");
+SEL selD = NSSelectorFromString(@"sendGroupMessage:to:succ:fail:");
+if ([manager respondsToSelector:selA]) {
+((void (*)(id, SEL, id, id, id, NSInteger, BOOL, id, id, id, id))objc_msgSend)(manager, selA, v2Msg, receiver, groupID, priority, onlineOnly, nilObj, nilObj, succBlock, failBlock);
+} else if (!isGroup && [manager respondsToSelector:selB]) {
+((void (*)(id, SEL, id, id, NSInteger, BOOL, id, id, id))objc_msgSend)(manager, selB, v2Msg, receiver, priority, onlineOnly, nilObj, succBlock, failBlock);
+} else if (!isGroup && [manager respondsToSelector:selC]) {
+((void (*)(id, SEL, id, id, id, id))objc_msgSend)(manager, selC, v2Msg, receiver, succBlock, failBlock);
+} else if (isGroup && [manager respondsToSelector:selD]) {
+((void (*)(id, SEL, id, id, id, id))objc_msgSend)(manager, selD, v2Msg, groupID, succBlock, failBlock);
+} else {
+if (completion) completion(NO, -1, @"当前IM版本不支持该发送接口");
+}
 } @catch (NSException *e) {
 if (completion) completion(NO, -1, @"发送异常");
 }
 }
+
 // 按指定槽位发送（0:群发槽, 1:迎新槽, 2:自动回复槽）
 - (void)sendText:(NSString *)text
 mediaSlot:(ACMediaSlot)slot
@@ -1544,6 +1721,11 @@ if (mType == 1 && mPath.length > 0 && [fm fileExistsAtPath:mPath]) {
 SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
 if ([manager respondsToSelector:createImgSel]) {
 v2MediaMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createImgSel, mPath);
+} else {
+Class msgCls = NSClassFromString(@"V2TIMMessage");
+if (msgCls && [msgCls respondsToSelector:createImgSel]) {
+v2MediaMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(msgCls, createImgSel, mPath);
+}
 }
 } else if (mType == 2 && mPath.length > 0 && [fm fileExistsAtPath:mPath]) {
 SEL createVidSel = NSSelectorFromString(@"createVideoMessage:type:duration:snapshotPath:");
@@ -1572,6 +1754,11 @@ if (obfuscatedText.length > 0) {
 SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
 if ([manager respondsToSelector:createTextSel]) {
 v2TextMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, obfuscatedText);
+} else {
+Class msgCls = NSClassFromString(@"V2TIMMessage");
+if (msgCls && [msgCls respondsToSelector:createTextSel]) {
+v2TextMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(msgCls, createTextSel, obfuscatedText);
+}
 }
 }
 id primaryMsg = v2MediaMsg ?: v2TextMsg;
@@ -2050,7 +2237,7 @@ tf.text = [NSString stringWithFormat:@"%ld", (long)mgr.momentIntervalMinutes];
 [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 [alert addAction:[UIAlertAction actionWithTitle:@"保存生效" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
 NSInteger mins = [alert.textFields.firstObject.text integerValue];
-if (mins < 1) mins = 10;
+if (mins < 5) mins = 10;
 mgr.momentIntervalMinutes = mins;
 [mgr saveAllCustomSettings];
 [mgr restartMomentScheduler];
@@ -2533,6 +2720,7 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 [headers enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
 if ([k isKindOfClass:[NSString class]] && [v isKindOfClass:[NSString class]]) {
 mgr.latestHTTPHeaders[k] = v;
+mgr.latestHTTPHeaders[k.lowercaseString] = v;
 if ([k.lowercaseString isEqualToString:@"x-userid"] && v.length > 5) {
 mgr.selfUserId = v;
 }
@@ -2574,6 +2762,7 @@ if ([lowerField isEqualToString:@"token"] ||
 [lowerField isEqualToString:@"version"] ||
 [lowerField isEqualToString:@"user-agent"]) {
 [ACForwardHelperManager shared].latestHTTPHeaders[field] = value;
+[ACForwardHelperManager shared].latestHTTPHeaders[lowerField] = value;
 if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
 [ACForwardHelperManager shared].selfUserId = value;
 }
@@ -2585,13 +2774,20 @@ if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
 + (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError * _Nullable *)error {
 id res = %orig;
 NSDictionary *dict = ACSafeDict(res);
-if (dict && dict[@"code"] && dict[@"data"]) {
+// 修复：只处理成功响应中的业务数据；0.5s 节流，避免全 App 每个 JSON 都触发解析+落盘
+if (dict && dict[@"code"] && dict[@"data"] && ![dict[@"data"] isKindOfClass:[NSNull class]]) {
+static NSTimeInterval acLastJSONParse = 0;
+NSTimeInterval nowT = [[NSDate date] timeIntervalSince1970];
+if (nowT - acLastJSONParse >= 0.5) {
+acLastJSONParse = nowT;
 id dataObj = dict[@"data"];
 dispatch_async(dispatch_get_main_queue(), ^{
+@try {
 [[ACForwardHelperManager shared] parseJSONWithContext:dataObj];
-[[ACForwardHelperManager shared] saveLocalPermanentCache];
 [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
+} @catch (NSException *e) {}
 });
+}
 }
 return res;
 }
@@ -2712,3 +2908,107 @@ preferredStyle:UIAlertControllerStyleAlert];
 }];
 }
 %end
+
+#pragma mark - 8. TIM 监听代理（保证消息一定能进入自动回复引擎）
+// 说明：部分 ImSDK_Plus 版本在未登录/尚未初始化时 addAdvancedMsgListener: 会静默失败，
+// 或只把消息回调派发给 App 自己的监听器。这里把 App 注册的监听器包一层代理，
+// 由代理同时把消息喂给本插件，再原样转发给 App 原监听器。
+@interface ACTIMListenerProxy : NSObject
+@property (nonatomic, weak) id originalListener;
++ (NSMutableArray *)ac_proxyPool;
++ (instancetype)proxyForListener:(id)listener;
+@end
+@implementation ACTIMListenerProxy
++ (NSMutableArray *)ac_proxyPool {
+static NSMutableArray *pool = nil;
+static dispatch_once_t once;
+dispatch_once(&once, ^{ pool = [NSMutableArray array]; });
+return pool;
+}
++ (instancetype)proxyForListener:(id)listener {
+if (!listener) return nil;
+NSMutableArray *pool = [[self class] ac_proxyPool];
+@synchronized (pool) {
+for (ACTIMListenerProxy *p in pool) {
+if (p.originalListener == listener) return p;
+}
+ACTIMListenerProxy *p = [[ACTIMListenerProxy alloc] init];
+p.originalListener = listener;
+[pool addObject:p];
+return p;
+}
+}
+- (BOOL)respondsToSelector:(SEL)aSelector {
+return [super respondsToSelector:aSelector] || [self.originalListener respondsToSelector:aSelector];
+}
+- (BOOL)conformsToProtocol:(Protocol *)aProtocol {
+return [super conformsToProtocol:aProtocol] || [self.originalListener conformsToProtocol:aProtocol];
+}
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+if ([self.originalListener respondsToSelector:aSelector]) return self.originalListener;
+return nil;
+}
+- (void)onRecvNewMessage:(id)msg {
+@try { [[ACForwardHelperManager shared] ac_handleIncomingMessage:msg]; } @catch (NSException *e) {}
+id orig = self.originalListener;
+if (orig && orig != [ACForwardHelperManager shared] && [orig respondsToSelector:_cmd]) {
+((void (*)(id, SEL, id))objc_msgSend)(orig, _cmd, msg);
+}
+}
+- (void)onMemberEnter:(NSString *)groupID memberList:(NSArray *)memberList {
+@try { [[ACForwardHelperManager shared] ac_handleMembersJoined:memberList groupID:groupID]; } @catch (NSException *e) {}
+id orig = self.originalListener;
+if (orig && orig != [ACForwardHelperManager shared] && [orig respondsToSelector:_cmd]) {
+((void (*)(id, SEL, id, id))objc_msgSend)(orig, _cmd, groupID, memberList);
+}
+}
+- (void)onMemberInvited:(NSString *)groupID opUser:(id)opUser memberList:(NSArray *)memberList {
+@try { [[ACForwardHelperManager shared] ac_handleMembersJoined:memberList groupID:groupID]; } @catch (NSException *e) {}
+id orig = self.originalListener;
+if (orig && orig != [ACForwardHelperManager shared] && [orig respondsToSelector:_cmd]) {
+((void (*)(id, SEL, id, id, id))objc_msgSend)(orig, _cmd, groupID, opUser, memberList);
+}
+}
+@end
+
+static IMP ac_orig_addAdvancedMsgListener = NULL;
+static IMP ac_orig_addGroupListener = NULL;
+
+static void ac_addAdvancedMsgListenerHook(id self, SEL _cmd, id listener) {
+id proxy = listener ? [ACTIMListenerProxy proxyForListener:listener] : listener;
+if (ac_orig_addAdvancedMsgListener) {
+((void (*)(id, SEL, id))ac_orig_addAdvancedMsgListener)(self, _cmd, proxy);
+}
+}
+static void ac_addGroupListenerHook(id self, SEL _cmd, id listener) {
+id proxy = listener ? [ACTIMListenerProxy proxyForListener:listener] : listener;
+if (ac_orig_addGroupListener) {
+((void (*)(id, SEL, id))ac_orig_addGroupListener)(self, _cmd, proxy);
+}
+}
+static void ACSwizzleIMP(Class cls, NSString *selName, IMP newImp, IMP *store) {
+if (!cls || !newImp) return;
+SEL sel = NSSelectorFromString(selName);
+Method m = class_getInstanceMethod(cls, sel);
+if (!m) return;
+if (store && *store) return; // 已安装，避免重复包裹
+IMP oldImp = method_setImplementation(m, newImp);
+if (store) *store = oldImp;
+}
+static void ACInstallTIMHooks(void) {
+Class c = NSClassFromString(@"V2TIMManager");
+if (!c) return;
+ACSwizzleIMP(c, @"addAdvancedMsgListener:", (IMP)ac_addAdvancedMsgListenerHook, &ac_orig_addAdvancedMsgListener);
+ACSwizzleIMP(c, @"addGroupListener:", (IMP)ac_addGroupListenerHook, &ac_orig_addGroupListener);
+}
+
+%ctor {
+// 延迟到 App 完成基础初始化后再安装钩子/注册监听，失败则多次重试
+void (^install)(void) = ^{
+ACInstallTIMHooks();
+[[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
+};
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), install);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), install);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), install);
+}
