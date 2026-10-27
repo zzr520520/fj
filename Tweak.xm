@@ -136,7 +136,7 @@ md[@"enabled"] = @(self.enabled);
 md[@"sentCount"] = @(self.sentCount);
 md[@"lastSentTimeStr"] = self.lastSentTimeStr ?: @"待发布";
 md[@"localMediaType"] = @(self.localMediaType);
-md[@"localMediaPath"] = self.localMediaPath ?: @"",
+md[@"localMediaPath"] = self.localMediaPath ?: @"";
 md[@"capturedMediaList"] = ACSafeArray(self.capturedMediaList) ?: @[];
 return md;
 }
@@ -630,47 +630,7 @@ self.listenerRegistered = YES;
         }
     } @catch (NSException *e) {}
 }
-}
-BOOL isSelf = [[msg valueForKey:@"isSelf"] boolValue];
-NSString *groupID = ACSafeStr([msg valueForKey:@"groupID"]);
-NSString *userID = ACSafeStr([msg valueForKey:@"userID"]);
-NSString *sender = ACSafeStr([msg valueForKey:@"sender"]);
-if (sender.length == 0) sender = userID;
-NSString *nickName = ACSafeStr([msg valueForKey:@"nickName"]);
-if (nickName.length == 0) nickName = ACSafeStr([msg valueForKey:@"nameCard"]);
-// A. 别人发来的 C2C 私信 -> 自动回复（严格使用槽位2或该条规则绑定的专属图片/视频）
-if (groupID.length == 0 && sender.length >= 5 && !isSelf && ![sender isEqualToString:self.selfUserId]) {
-[self addFriendWithId:sender name:nickName tag:@"主动来信" chatMeType:0];
-[self saveLocalPermanentCache];
-if (self.autoReplyEnabled && self.autoReplyRules.count > 0) {
-NSString *incomingText = @"";
-id textElem = [msg valueForKey:@"textElem"];
-if (textElem && ![textElem isKindOfClass:[NSNull class]]) {
-incomingText = ACSafeStr([textElem valueForKey:@"text"]);
-}
-[self handleIncomingPrivateMessageFrom:sender nickName:nickName text:incomingText];
-}
-return;
-}
-// B. 群消息处理
-if (groupID.length == 0) return;
-if (sender.length > 0 && !isSelf) {
-if ([self addGroupMemberWithId:sender name:nickName groupId:groupID role:@"群活跃" chatMeType:0]) {
-[self saveLocalPermanentCache];
-}
-}
-id tipsElem = [msg valueForKey:@"groupTipsElem"];
-if (tipsElem && ![tipsElem isKindOfClass:[NSNull class]]) {
-NSInteger tipsType = [ACSafeStr([tipsElem valueForKey:@"type"]) integerValue];
-if (tipsType == 1 || tipsType == 2) {
-NSArray *memberList = ACSafeArray([tipsElem valueForKey:@"memberList"]);
-if (memberList.count > 0) {
-[self handleNewMembersJoinedGroup:groupID memberList:memberList];
-}
-}
-}
-} @catch (NSException *e) {}
-}
+
 - (void)handleIncomingPrivateMessageFrom:(NSString *)senderId nickName:(NSString *)nick text:(NSString *)incomingText {
 @try {
 NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
