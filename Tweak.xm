@@ -1,6 +1,3 @@
-// AirChat 2.1.8 Tweak 升级版（基于用户提供的原始 Tweak_x.txt）
-// 新增：好友打招呼批处理、单个选中好友 TUICallKit 语音拨号、定时尝试点击原生挂断按钮。
-// 注意：TUICallKit 的运行时类/选择器依赖目标 IPA 实际导出；未提供 IPA/设备编译环境，需在目标设备验证。
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
@@ -339,64 +336,7 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_enqueueAutoCommentForPostId:(NSString *)postId;
 - (void)ac_pumpAutoCommentQueue;
 - (void)ac_commentPostId:(NSString *)postId text:(NSString *)text;
-// 好友问候与原生 TUICallKit 语音通话
-- (void)ac_startGreetingForFriends:(NSArray<ACContactItem *> *)friends text:(NSString *)text completion:(void(^)(NSInteger okCount, NSInteger failCount, NSString *lastError))completion;
-- (void)ac_checkAndStartAudioCallToFriend:(ACContactItem *)friendItem duration:(NSTimeInterval)duration fromVC:(UIViewController *)vc;
 @end
-static NSTimer *ACCallHangupTimer = nil;
-static NSString *ACCallTargetName = nil;
-static BOOL ACFindAndTapHangupButtonInView(UIView *view) {
-    if (!view || view.hidden || view.alpha < 0.05) return NO;
-    if ([view isKindOfClass:[UIButton class]]) {
-        UIButton *b = (UIButton *)view;
-        NSString *title = [[b titleForState:UIControlStateNormal] lowercaseString] ?: @"";
-        NSString *accessibility = [[b accessibilityLabel] lowercaseString] ?: @"";
-        NSString *combined = [NSString stringWithFormat:@"%@ %@", title, accessibility];
-        BOOL isHangup = ([combined containsString:@"挂断"] || [combined containsString:@"结束通话"] ||
-                         [combined containsString:@"hang up"] || [combined containsString:@"end call"] ||
-                         [combined containsString:@"hangup"]);
-        BOOL isReject = ([combined containsString:@"拒绝"] || [combined containsString:@"reject"] || [combined containsString:@"decline"]);
-        if (isHangup && !isReject && b.enabled && b.userInteractionEnabled) {
-            [b sendActionsForControlEvents:UIControlEventTouchUpInside];
-            ACLog(@"[通话] 定时器触发，已向原生挂断按钮发送点击事件: %@", combined);
-            return YES;
-        }
-    }
-    for (UIView *sub in view.subviews) {
-        if (ACFindAndTapHangupButtonInView(sub)) return YES;
-    }
-    return NO;
-}
-static BOOL ACRedButtonColor(UIColor *color) {
-    if (!color) return NO; CGFloat r=0,g=0,b=0,a=0;
-    if (![color getRed:&r green:&g blue:&b alpha:&a]) return NO;
-    return a > 0.35 && r > 0.62 && g < 0.38 && b < 0.42;
-}
-static BOOL ACFindRedHangupButtonInView(UIView *view) {
-    if (!view || view.hidden || view.alpha < 0.05) return NO;
-    if ([view isKindOfClass:[UIButton class]]) {
-        UIButton *b=(UIButton *)view;
-        BOOL red = ACRedButtonColor(b.backgroundColor) || ACRedButtonColor(b.tintColor);
-        if (!red && b.layer.backgroundColor) red = ACRedButtonColor([UIColor colorWithCGColor:b.layer.backgroundColor]);
-        if (red && b.enabled && b.userInteractionEnabled && b.bounds.size.width >= 35 && b.bounds.size.height >= 30) {
-            [b sendActionsForControlEvents:UIControlEventTouchUpInside];
-            ACLog(@"[通话] 已在通话视图中对红色按钮触发点击（文本标签不可用）");
-            return YES;
-        }
-    }
-    for (UIView *sub in view.subviews) if (ACFindRedHangupButtonInView(sub)) return YES;
-    return NO;
-}
-static UIViewController *ACTopViewController(UIViewController *vc) {
-    if (!vc) return nil;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    if ([vc isKindOfClass:[UINavigationController class]]) return ACTopViewController(((UINavigationController *)vc).visibleViewController);
-    if ([vc isKindOfClass:[UITabBarController class]]) return ACTopViewController(((UITabBarController *)vc).selectedViewController);
-    return vc;
-}
-static void ACStopHangupTimer(void) {
-    if (ACCallHangupTimer) { [ACCallHangupTimer invalidate]; ACCallHangupTimer = nil; }
-}
 @implementation ACForwardHelperManager
 + (instancetype)shared {
 static ACForwardHelperManager *instance = nil;
@@ -1173,7 +1113,7 @@ self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
 NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/app/publish"];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
-// 修复：Accept 必须是 *／*（通配符；注意注释里不要写半角星号+斜杠+星号，否则会被 Logos 当成块注释吞掉后续代码）；UA 必须固定为 App 原生 UA。
+// 修复：Accept 必须是 */*；UA 必须固定为 App 原生 UA。
 // 旧版从全局 Header 池取值，会被 COS 上传请求污染成 cos-xml-ios-sdk + Accept "/"，
 // 网关直接返回 HTTP 500（空 body），这就是“发布没效果”的主因。
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
@@ -2121,99 +2061,6 @@ if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc 
 if (completion) completion(NO, @"发送异常");
 }
 }
-// 对明确勾选的好友逐个发送打招呼；沿用现有 IM 发送引擎，不构造伪造接口。
-- (void)ac_startGreetingForFriends:(NSArray<ACContactItem *> *)friends text:(NSString *)text completion:(void(^)(NSInteger, NSInteger, NSString *))completion {
-    NSArray *targets = [friends copy] ?: @[];
-    NSString *greeting = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (targets.count == 0 || greeting.length == 0) { if (completion) completion(0, targets.count, @"请先选择好友并填写打招呼内容"); return; }
-    __block NSInteger idx = 0, okCount = 0, failCount = 0;
-    __block NSString *lastError = @"";
-    __weak typeof(self) weakSelf = self;
-    __block void (^next)(void);
-    next = ^{
-        if (idx >= targets.count) { ACLog(@"[好友打招呼] 完成 total=%lu ok=%ld fail=%ld", (unsigned long)targets.count, (long)okCount, (long)failCount); if (completion) completion(okCount, failCount, lastError); return; }
-        ACContactItem *item = targets[idx];
-        [weakSelf sendText:greeting mediaSlot:ACMediaSlotBatchSend attachMedia:NO toItem:item completion:^(BOOL ok, NSString *detail) {
-            if (ok) okCount++; else { failCount++; lastError = detail ?: @"发送失败"; }
-            ACLog(@"[好友打招呼] %@ (%ld/%lu) ok=%d detail=%@", item.name ?: item.targetId, (long)(idx+1), (unsigned long)targets.count, ok, detail ?: @"");
-            idx++;
-            if (idx < targets.count) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ next(); });
-            else if (completion) completion(okCount, failCount, lastError);
-        }];
-    };
-    next();
-}
-// 先检查业务层通话权限，再调用应用已加载的 TUICallKit 单人语音接口。
-- (void)ac_checkAndStartAudioCallToFriend:(ACContactItem *)friendItem duration:(NSTimeInterval)duration fromVC:(UIViewController *)vc {
-    if (!friendItem.targetId.length || !vc) return;
-    if (ACHeaderValue(self.latestHTTPHeaders, @"token").length == 0) {
-        ACLog(@"[通话] 尚未捕获登录 token，无法进行权限检查");
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"暂时无法拨号" message:@"尚未捕获登录凭证。请先在 AirChat 内正常打开一次好友或动态页面，再重试。" preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]; [vc presentViewController:a animated:YES completion:nil]; return;
-    }
-    NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/chat/checkCallType"];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url]; req.HTTPMethod = @"POST"; req.timeoutInterval = 15;
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
-    [self ac_applyCapturedHeadersToRequest:req];
-    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"id": friendItem.targetId} options:0 error:nil];
-    ACLog(@"[通话] 检查好友=%@ id=%@", friendItem.name ?: @"", friendItem.targetId);
-    __weak typeof(self) weakSelf = self; __weak UIViewController *weakVC = vc;
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!weakVC) return;
-            NSDictionary *json = nil; if (data) { id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil]; if ([obj isKindOfClass:[NSDictionary class]]) json = obj; }
-            NSDictionary *payload = ACSafeDict(json[@"data"]);
-            BOOL allowed = [ACSafeStr(payload[@"canCall"]) boolValue];
-            NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
-            if (error || code != 200 || !allowed) {
-                NSString *msg = error.localizedDescription ?: ACSafeStr(json[@"msg"]);
-                if (msg.length == 0) msg = allowed ? @"通话权限检查失败" : @"该好友当前不可通话或剩余通话时长不足";
-                ACLog(@"[通话] 权限检查失败 code=%ld msg=%@", (long)code, msg);
-                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"无法发起语音" message:msg preferredStyle:UIAlertControllerStyleAlert];
-                [a addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleCancel handler:nil]]; [weakVC presentViewController:a animated:YES completion:nil]; return;
-            }
-            Class kitClass = NSClassFromString(@"TUICallKit");
-            if (!kitClass) kitClass = NSClassFromString(@"TUICallKit.TUICallKit");
-            SEL createSel = NSSelectorFromString(@"createInstance");
-            id kit = (kitClass && [kitClass respondsToSelector:createSel]) ? ((id (*)(id, SEL))objc_msgSend)(kitClass, createSel) : nil;
-            SEL callSel = NSSelectorFromString(@"call:callMediaType:");
-            if (!kit || ![kit respondsToSelector:callSel]) {
-                ACLog(@"[通话] 未找到 TUICallKit createInstance/call:callMediaType:，class=%@", kitClass ? NSStringFromClass(kitClass) : @"nil");
-                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"通话接口不可用" message:@"当前运行包未暴露报告中所述 TUICallKit 单人拨号方法。请提供该版本 TUICallKit 的运行时方法列表以继续适配。" preferredStyle:UIAlertControllerStyleAlert];
-                [a addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleCancel handler:nil]]; [weakVC presentViewController:a animated:YES completion:nil]; return;
-            }
-            // 腾讯 TUICallKit iOS 旧版公开 API：call(userId:callMediaType:)；音频类型值 1。
-            @try {
-                ACStopHangupTimer();
-                ACCallTargetName = friendItem.name ?: friendItem.targetId;
-                ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(kit, callSel, friendItem.targetId, (NSInteger)1);
-                ACLog(@"[通话] 已调用 TUICallKit 发起音频呼叫 target=%@ duration=%.0f", friendItem.targetId, duration);
-                NSTimeInterval safeDuration = MAX(10.0, MIN(duration, 3600.0));
-                ACCallHangupTimer = [NSTimer scheduledTimerWithTimeInterval:safeDuration repeats:NO block:^(NSTimer *timer) {
-                    BOOL tapped = NO;
-                    for (UIWindow *window in UIApplication.sharedApplication.windows) { if (ACFindAndTapHangupButtonInView(window)) { tapped = YES; break; } }
-                    if (!tapped) {
-                        for (UIWindow *window in UIApplication.sharedApplication.windows) {
-                            UIViewController *top = ACTopViewController(window.rootViewController);
-                            NSString *topName = top ? NSStringFromClass([top class]) : @"";
-                            if ([topName.lowercaseString containsString:@"call"] || [topName.lowercaseString containsString:@"tui"]) {
-                                if (ACFindRedHangupButtonInView(top.view)) { tapped = YES; break; }
-                            }
-                        }
-                    }
-                    if (!tapped) ACLog(@"[通话] 到时未找到可识别的原生挂断按钮；请手动挂断。target=%@", ACCallTargetName ?: @"");
-                    else ACLog(@"[通话] 自动挂断动作已触发 target=%@", ACCallTargetName ?: @"");
-                    ACCallHangupTimer = nil;
-                }];
-                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已发起语音通话" message:[NSString stringWithFormat:@"好友：%@\n自动挂断计时：%.0f 秒。若应用界面未提供可识别的挂断按钮，到时仍需手动挂断。", ACCallTargetName, safeDuration] preferredStyle:UIAlertControllerStyleAlert];
-                [a addAction:[UIAlertAction actionWithTitle:@"取消计时" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *act){ ACStopHangupTimer(); }]];
-                [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]; [weakVC presentViewController:a animated:YES completion:nil];
-            } @catch (NSException *ex) { ACLog(@"[通话] 调用异常 %@", ex); }
-        });
-    }] resume];
-}
 @end
 #pragma mark - 5. 转发/迎新/自动回复/定时动态 六合一主界面控制器（各面板媒体独立切换）
 @interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource, UINavigationControllerDelegate, UIImagePickerControllerDelegate, UITextViewDelegate>
@@ -2373,7 +2220,6 @@ btn.tag = 600 + i;
 [self.actionBar addSubview:btn];
 }
 [self.headerContainer addSubview:self.actionBar];
-[self updateActionBarForCurrentTab];
 self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 156, width - 32, 38)];
 self.welcomeControlBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
 self.welcomeControlBar.layer.cornerRadius = 10;
@@ -2805,57 +2651,12 @@ if (self.tabControl.selectedSegmentIndex == 0) return mgr.friendList;
 if (self.tabControl.selectedSegmentIndex == 1) return mgr.groupMemberList;
 return mgr.groupList;
 }
-- (void)updateActionBarForCurrentTab {
-    NSInteger idx = self.tabControl.selectedSegmentIndex;
-    NSArray *buttons = [self.actionBar.subviews sortedArrayUsingComparator:^NSComparisonResult(UIView *a, UIView *b) { return a.frame.origin.x < b.frame.origin.x ? NSOrderedAscending : (a.frame.origin.x > b.frame.origin.x ? NSOrderedDescending : NSOrderedSame); }];
-    if (idx == 0) {
-        NSArray *titles = @[@"☑️全选好友", @"👋打招呼", @"📞拨语音", @"清空已选"];
-        NSInteger tags[] = {600, 604, 605, 603};
-        for (NSInteger i = 0; i < MIN(4, buttons.count); i++) { if ([buttons[i] isKindOfClass:[UIButton class]]) { UIButton *b = buttons[i]; [b setTitle:titles[i] forState:UIControlStateNormal]; b.tag = tags[i]; b.titleLabel.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold]; } }
-    } else {
-        NSArray *titles = @[@"🟢只选必达", @"🗑️清群成员", @"🎯定向采集", @"清空已选"];
-        for (NSInteger i = 0; i < MIN(4, buttons.count); i++) { if ([buttons[i] isKindOfClass:[UIButton class]]) { UIButton *b = buttons[i]; [b setTitle:titles[i] forState:UIControlStateNormal]; b.tag = 600 + i; } }
-    }
-}
-- (void)startFriendGreeting {
-    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-    NSMutableArray *targets = [NSMutableArray array];
-    for (ACContactItem *item in mgr.friendList) if (item.isSelected) [targets addObject:item];
-    NSString *text = [self.contentTextView.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (targets.count == 0 || text.length == 0) { self.statusLabel.textColor = [UIColor systemRedColor]; self.statusLabel.text = @"请先在【好友】页勾选好友，并填写打招呼内容"; return; }
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认发送好友招呼" message:[NSString stringWithFormat:@"将向 %lu 位已选好友逐个发送：\n\n%@", (unsigned long)targets.count, text] preferredStyle:UIAlertControllerStyleAlert];
-    [confirm addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [confirm addAction:[UIAlertAction actionWithTitle:@"开始发送" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        self.statusLabel.textColor = [UIColor systemBlueColor]; self.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在向 %lu 位好友发送招呼…", (unsigned long)targets.count];
-        [mgr ac_startGreetingForFriends:targets text:text completion:^(NSInteger ok, NSInteger fail, NSString *lastError) {
-            self.statusLabel.textColor = fail == 0 ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-            self.statusLabel.text = [NSString stringWithFormat:@"好友招呼完成：成功 %ld，失败 %ld %@", (long)ok, (long)fail, fail ? (lastError ?: @"") : @""];
-            UIAlertController *done = [UIAlertController alertControllerWithTitle:@"打招呼完成" message:self.statusLabel.text preferredStyle:UIAlertControllerStyleAlert];
-            [done addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]]; [self presentViewController:done animated:YES completion:nil];
-        }];
-    }]];
-    [self presentViewController:confirm animated:YES completion:nil];
-}
-- (void)startSelectedFriendAudioCall {
-    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-    NSMutableArray *targets = [NSMutableArray array]; for (ACContactItem *item in mgr.friendList) if (item.isSelected) [targets addObject:item];
-    if (targets.count != 1) { self.statusLabel.textColor = [UIColor systemOrangeColor]; self.statusLabel.text = @"语音通话请只勾选一位好友；可逐个选择拨打"; return; }
-    ACContactItem *friendItem = targets.firstObject;
-    UIAlertController *durationAlert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"拨打 %@ 的语音", friendItem.name ?: friendItem.targetId] message:@"选择通话时长，到时尝试点击原生红色挂断按钮。" preferredStyle:UIAlertControllerStyleActionSheet];
-    __weak typeof(self) weakSelf = self;
-    for (NSNumber *n in @[@30, @60, @120, @300]) { [durationAlert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%ld 秒后自动挂断", (long)n.integerValue] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [[ACForwardHelperManager shared] ac_checkAndStartAudioCallToFriend:friendItem duration:n.doubleValue fromVC:weakSelf]; }]]; }
-    [durationAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    UIPopoverPresentationController *pop = durationAlert.popoverPresentationController; if (pop) { pop.sourceView = self.actionBar; pop.sourceRect = self.actionBar.bounds; }
-    [self presentViewController:durationAlert animated:YES completion:nil];
-}
 - (void)quickSelectAction:(UIButton * _Nonnull)sender {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-if (sender.tag == 604) { [self startFriendGreeting]; return; }
-if (sender.tag == 605) { [self startSelectedFriendAudioCall]; return; }
 if (sender.tag == 600) {
 for (ACContactItem *i in [self currentItems]) {
-i.isSelected = (self.tabControl.selectedSegmentIndex == 0) ? YES : (i.chatMeType == 0);
+i.isSelected = (i.chatMeType == 0);
 }
 } else if (sender.tag == 601) {
 [mgr clearAllGroupMembersCache];
@@ -2907,7 +2708,6 @@ for (ACContactItem *i in mgr.groupList) i.isSelected = NO;
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.tabControl.selectedSegmentIndex;
-[self updateActionBarForCurrentTab];
 self.actionBar.hidden = (idx >= 3);
 self.welcomeControlBar.hidden = (idx != 3);
 self.autoReplyBar.hidden = (idx != 4);
@@ -3025,7 +2825,7 @@ return cell;
 }
 - (void)publishSingleMomentTaskNow:(UIButton *)sender {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-if (sender.tag < 0 || sender.tag >= mgr.momentTasks.count) { ACLog(@"[发布] 按钮任务索引越界 tag=%ld count=%lu", (long)sender.tag, (unsigned long)mgr.momentTasks.count); self.statusLabel.text = @"任务列表已变化，请刷新后重试"; return; }
+if (sender.tag < 0 || sender.tag >= mgr.momentTasks.count) return;
 ACMomentTaskItem *task = mgr.momentTasks[sender.tag];
 self.statusLabel.textColor = [UIColor systemBlueColor];
 self.statusLabel.text = @"⏳ 正在立即发布该条动态任务...（若未捕获登录凭证最多等待20秒）";
