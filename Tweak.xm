@@ -212,7 +212,7 @@ md[@"enabled"] = @(self.enabled);
 md[@"sentCount"] = @(self.sentCount);
 md[@"lastSentTimeStr"] = self.lastSentTimeStr ?: @"待发布";
 md[@"localMediaType"] = @(self.localMediaType);
-md[@"localMediaPath"] = self.localMediaPath ?: @"",
+md[@"localMediaPath"] = self.localMediaPath ?: @"";
 md[@"capturedMediaList"] = ACSafeArray(self.capturedMediaList) ?: @[];
 return md;
 }
@@ -978,6 +978,7 @@ return;
 }
 NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/interaction/comment/publish"];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+req.timeoutInterval = 30.0;
 req.HTTPMethod = @"POST";
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
@@ -1112,6 +1113,7 @@ self.momentPublishing = YES;
 self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
 NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/app/publish"];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+req.timeoutInterval = 30.0;
 req.HTTPMethod = @"POST";
 // 修复：Accept 必须是 *／*（通配符；注意注释里不要写半角星号+斜杠+星号，否则会被 Logos 当成块注释吞掉后续代码）；UA 必须固定为 App 原生 UA。
 // 旧版从全局 Header 池取值，会被 COS 上传请求污染成 cos-xml-ios-sdk + Accept "/"，
@@ -1123,7 +1125,18 @@ req.HTTPMethod = @"POST";
 [req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
 [req setValue:token forHTTPHeaderField:@"token"];
-[req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
+NSString *publishUserId = ACHeaderValue(self.latestHTTPHeaders, @"x-userid");
+if (publishUserId.length == 0) publishUserId = ACHeaderValue(self.lastPublishHeaders, @"x-userid");
+if (publishUserId.length == 0) publishUserId = self.selfUserId ?: @"";
+if (publishUserId.length < 5) {
+    self.momentPublishing = NO;
+    self.lastMomentLog = @"❌ 未捕获到当前账号 ID：请在 AirChat 内打开一次动态/个人页后重试";
+    ACLog(@"[发布] 中止：缺少有效 x-userid");
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+    if (completion) completion(NO, self.lastMomentLog);
+    return;
+}
+[req setValue:publishUserId forHTTPHeaderField:@"x-userid"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
 // X-Lts-Id 优先取最近一次“原生发布动态”请求的模板；全局池只接受合法长格式
@@ -1216,7 +1229,7 @@ df.dateFormat = @"HH:mm:ss";
 task.lastSentTimeStr = [df stringFromDate:[NSDate date]];
 [weakSelf saveAllCustomSettings];
 NSString *postIdStr = ACSafeStr(respDict[@"data"]);
-NSString *okMsg = [NSString stringWithFormat:@"✅ 动态发布成功(%@) ID:%@ | 累计%ld次", task.lastSentTimeStr, postIdStr, (long)task.sentCount];
+NSString *okMsg = [NSString stringWithFormat:@"✅ 服务端已接收发布(%@) ID:%@ | 累计%ld次；若动态列表暂未显示，请下拉刷新", task.lastSentTimeStr, postIdStr, (long)task.sentCount];
 weakSelf.lastMomentLog = okMsg;
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 if (completion) completion(YES, okMsg);
@@ -2797,6 +2810,8 @@ pubNowBtn.backgroundColor = [UIColor systemGreenColor];
 [pubNowBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
 pubNowBtn.layer.cornerRadius = 6;
 pubNowBtn.tag = indexPath.row;
+pubNowBtn.accessibilityIdentifier = @"ACMomentPublishNowButton";
+pubNowBtn.accessibilityValue = task.taskId ?: @"";
 [pubNowBtn addTarget:self action:@selector(publishSingleMomentTaskNow:) forControlEvents:UIControlEventTouchUpInside];
 cell.accessoryView = pubNowBtn;
 return cell;
@@ -2824,20 +2839,57 @@ cell.accessoryType = item.isSelected ? UITableViewCellAccessoryCheckmark : UITab
 return cell;
 }
 - (void)publishSingleMomentTaskNow:(UIButton *)sender {
+// 所有 UI 状态更新都强制回主线程；同时记录点击，便于定位“点了没反应”。
+if (![NSThread isMainThread]) {
+    dispatch_async(dispatch_get_main_queue(), ^{ [self publishSingleMomentTaskNow:sender]; });
+    return;
+}
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-if (sender.tag < 0 || sender.tag >= mgr.momentTasks.count) return;
-ACMomentTaskItem *task = mgr.momentTasks[sender.tag];
+ACMomentTaskItem *task = nil;
+NSString *taskId = sender.accessibilityValue ?: @"";
+if (taskId.length > 0) {
+    for (ACMomentTaskItem *candidate in mgr.momentTasks) {
+        if ([candidate.taskId isEqualToString:taskId]) { task = candidate; break; }
+    }
+}
+// 兼容旧缓存中没有 taskId 的任务。
+if (!task && sender.tag >= 0 && sender.tag < (NSInteger)mgr.momentTasks.count) {
+    task = mgr.momentTasks[(NSUInteger)sender.tag];
+}
+ACLog(@"[发布UI] 点击立即发 tag=%ld taskId=%@ tasks=%lu found=%d",
+      (long)sender.tag, taskId, (unsigned long)mgr.momentTasks.count, task != nil);
+if (!task) {
+    self.statusLabel.textColor = [UIColor systemRedColor];
+    self.statusLabel.text = @"❌ 找不到这条动态任务，请刷新列表后重试";
+    [self.tableView reloadData];
+    return;
+}
+if (mgr.momentPublishing) {
+    self.statusLabel.textColor = [UIColor systemOrangeColor];
+    self.statusLabel.text = @"⏳ 已有一条动态正在发布，请等待完成后再试";
+    return;
+}
+sender.enabled = NO;
 self.statusLabel.textColor = [UIColor systemBlueColor];
-self.statusLabel.text = @"⏳ 正在立即发布该条动态任务...（若未捕获登录凭证最多等待20秒）";
+self.statusLabel.text = @"⏳ 已触发发布：正在检查登录凭证并提交请求…";
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 __weak typeof(self) weakSelfVC = self;
 [mgr publishMomentTask:task completion:^(BOOL ok, NSString *msg) {
-weakSelfVC.statusLabel.textColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
-weakSelfVC.statusLabel.text = msg ?: (ok ? @"发布成功" : @"发布失败");
-UIAlertController *a = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 发布成功" : @"❌ 发布失败")
-message:(msg ?: @"")
-preferredStyle:UIAlertControllerStyleAlert];
-[a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
-[weakSelfVC presentViewController:a animated:YES completion:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelfVC) strongSelf = weakSelfVC;
+        if (!strongSelf) return;
+        sender.enabled = YES;
+        strongSelf.statusLabel.textColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+        strongSelf.statusLabel.text = msg ?: (ok ? @"发布成功" : @"发布失败（没有收到错误详情）");
+        [strongSelf.tableView reloadData];
+        // 页面正在关闭时不再弹窗，避免 presentViewController 警告或崩溃。
+        if (!strongSelf.view.window || strongSelf.presentedViewController) return;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 发布成功" : @"❌ 发布失败")
+            message:(msg ?: @"请查看动态状态日志")
+            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
+        [strongSelf presentViewController:a animated:YES completion:nil];
+    });
 }];
 }
 - (void)tableView:(UITableView * _Nonnull)tableView didSelectRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
