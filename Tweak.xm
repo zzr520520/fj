@@ -76,6 +76,30 @@ return dic;
 }
 return nil;
 }
+// 插件自身发出的请求（发布动态）不参与 Header 嗅探，避免自我污染
+static BOOL acInternalRequest = NO;
+static NSString * const kACNativeUserAgent = @"airchat/1017 CFNetwork/1490.0.4 Darwin/23.2.0";
+
+// 持久化诊断日志：沙盒 Documents/AirChatTweak.log，可直接用 Filza 打开
+static void ACLog(NSString *fmt, ...) {
+@autoreleasepool {
+va_list ap; va_start(ap, fmt);
+NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+va_end(ap);
+NSDateFormatter *df = [[NSDateFormatter alloc] init];
+df.dateFormat = @"MM-dd HH:mm:ss.SSS";
+NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
+NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+NSString *path = [dir stringByAppendingPathComponent:@"AirChatTweak.log"];
+NSFileManager *fm = [NSFileManager defaultManager];
+if (![fm fileExistsAtPath:path]) { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+else {
+NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+}
+NSLog(@"[AirChatTweak] %@", msg);
+}
+}
 typedef NS_ENUM(NSInteger, ACMediaSlot) {
 ACMediaSlotBatchSend = 0, // 槽位0：群发专属媒体（好友/群员/群聊）
 ACMediaSlotWelcome   = 1, // 槽位1：🤖迎新专属媒体
@@ -251,6 +275,17 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, assign) BOOL msgListenerRegistered;
 @property (nonatomic, assign) BOOL listenerRetryScheduled;
 @property (nonatomic, assign) BOOL momentPublishing;
+// 仅缓存“原生发布动态”请求的完整 Header 模板（UA / Accept / X-Lts-Id 都以它为准）
+@property (nonatomic, strong) NSMutableDictionary *lastPublishHeaders;
+// —— 自动评论（别人发动态后自动跟评）——
+@property (nonatomic, assign) BOOL autoCommentEnabled;
+@property (nonatomic, copy) NSString *autoCommentText;
+@property (nonatomic, strong) NSMutableSet *autoCommentSeenIds;
+@property (nonatomic, assign) BOOL autoCommentSeeded;
+@property (nonatomic, strong) NSMutableArray *autoCommentQueue;
+@property (nonatomic, assign) BOOL autoCommentSending;
+@property (nonatomic, assign) NSTimeInterval momentPublishingSince;
+@property (nonatomic, assign) NSTimeInterval autoCommentEnabledAt;
 @property (nonatomic, assign) BOOL momentRetryScheduled;
 + (instancetype)shared;
 // 四槽位独立媒体管理 API（0:群发, 1:迎新, 2:自动回复, 3:发动态）
@@ -294,9 +329,11 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_handleIncomingMessage:(id)msg;
 - (void)ac_handleMembersJoined:(NSArray *)memberList groupID:(NSString *)groupID;
 - (void)ac_applyCapturedHeadersToRequest:(NSMutableURLRequest *)req;
-- (BOOL)ac_momentPublishAllowedNow;
-- (void)ac_markMomentPublishAttempt;
 - (void)ac_scheduleMomentRetryAfter:(NSTimeInterval)delay;
+- (void)ac_handleFeedResponse:(NSDictionary *)json;
+- (void)ac_enqueueAutoCommentForPostId:(NSString *)postId;
+- (void)ac_pumpAutoCommentQueue;
+- (void)ac_commentPostId:(NSString *)postId text:(NSString *)text;
 @end
 @implementation ACForwardHelperManager
 + (instancetype)shared {
@@ -323,6 +360,11 @@ instance.lastAutoReplyLog = @"等待别人发来私信...";
 instance.momentTasks = [NSMutableArray array];
 instance.momentIntervalMinutes = 30;
 instance.lastMomentLog = @"等待定时发布动态...";
+instance.autoCommentEnabled = NO;
+instance.autoCommentText = @"不错";
+instance.autoCommentSeenIds = [NSMutableSet set];
+instance.autoCommentQueue = [NSMutableArray array];
+instance.autoCommentSeeded = NO;
 [instance loadLocalPermanentCache];
 [instance loadAllCustomSettings];
 [instance restartMomentScheduler];
@@ -456,7 +498,16 @@ if (self.capturedClientTypeV2) {
 [ud setObject:self.capturedClientTypeV2 forKey:@"AC_Captured_ClientTypeV2"];
 }
 if (self.latestHTTPHeaders.count > 0) {
-[ud setObject:[self.latestHTTPHeaders copy] forKey:@"AC_Saved_HTTPHeaders"];
+NSMutableDictionary *safeHeaders = [NSMutableDictionary dictionary];
+NSSet *allowed = [NSSet setWithObjects:@"token", @"x-userid", @"version", @"channel", @"x-lts-id", nil];
+[self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) {
+if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
+NSString *lk = k.lowercaseString;
+if (![allowed containsObject:lk]) return;
+if ([lk isEqualToString:@"x-lts-id"] && ((NSString *)v).length < 140) return;
+safeHeaders[lk] = v;
+}];
+[ud setObject:safeHeaders forKey:@"AC_Saved_HTTPHeaders"];
 }
 if (self.selfUserId.length > 5) {
 [ud setObject:self.selfUserId forKey:@"AC_Saved_SelfUserId"];
@@ -468,7 +519,12 @@ for (ACAutoReplyRule *r in self.autoReplyRules) {
 }
 [rDicts writeToFile:[self cacheFilePath:@"autoreply_rules"] atomically:YES];
 [ud setBool:self.autoMomentEnabled forKey:@"AC_AutoMoment_Enabled"];
-[ud setInteger:MAX(5, self.momentIntervalMinutes) forKey:@"AC_AutoMoment_Interval"];
+[ud setInteger:MAX(1, self.momentIntervalMinutes) forKey:@"AC_AutoMoment_Interval"];
+[ud setBool:self.autoCommentEnabled forKey:@"AC_AutoComment_Enabled"];
+[ud setObject:(self.autoCommentText ?: @"不错") forKey:@"AC_AutoComment_Text"];
+NSArray *seenArr = [[self.autoCommentSeenIds allObjects] sortedArrayUsingSelector:@selector(compare:)];
+if (seenArr.count > 1500) seenArr = [seenArr subarrayWithRange:NSMakeRange(seenArr.count - 1500, 1500)];
+[ud setObject:seenArr forKey:@"AC_AutoComment_Seen"];
 NSMutableArray *mDicts = [NSMutableArray array];
 for (ACMomentTaskItem *t in self.momentTasks) {
 [mDicts addObject:(ACJSONSafeObject([t toDict], 0) ?: @{})];
@@ -494,9 +550,28 @@ NSString *savedV2 = ACSafeStr([ud objectForKey:@"AC_Captured_ClientTypeV2"]);
 if (savedV2.length > 10) {
 self.capturedClientTypeV2 = savedV2;
 }
+self.autoCommentEnabled = [ud boolForKey:@"AC_AutoComment_Enabled"];
+NSString *savedComment = ACSafeStr([ud objectForKey:@"AC_AutoComment_Text"]);
+self.autoCommentText = savedComment.length > 0 ? savedComment : @"不错";
+NSArray *savedSeen = ACSafeArray([ud objectForKey:@"AC_AutoComment_Seen"]);
+if (savedSeen.count > 0) {
+for (id v in savedSeen) { NSString *sid = ACSafeStr(v); if (sid.length > 3) [self.autoCommentSeenIds addObject:sid]; }
+self.autoCommentSeeded = YES;
+}
+// 兼容旧版本：只恢复合法 Header，丢弃被 COS/上传请求污染的 UA 与短格式 X-Lts-Id
 NSDictionary *savedHeaders = ACSafeDict([ud objectForKey:@"AC_Saved_HTTPHeaders"]);
 if (savedHeaders) {
-[self.latestHTTPHeaders addEntriesFromDictionary:savedHeaders];
+NSMutableDictionary *clean = [NSMutableDictionary dictionary];
+[savedHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) {
+if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
+NSString *lk = k.lowercaseString;
+if (!([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
+[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] || [lk isEqualToString:@"x-lts-id"])) return;
+if ([lk isEqualToString:@"x-lts-id"] && ((NSString *)v).length < 140) return;
+clean[lk] = v;
+}];
+[self.latestHTTPHeaders addEntriesFromDictionary:clean];
+savedHeaders = clean;
 // 旧版本可能只存了原始大小写，统一补一份小写键
 for (NSString *k in savedHeaders) {
 if ([k isKindOfClass:[NSString class]]) {
@@ -793,8 +868,8 @@ if (self.momentTimer) {
 self.momentTimer = nil;
 }
 if (!self.autoMomentEnabled) return;
-// 修复：服务端单账号发布频率约 5 分钟/条，定时器最小间隔不得低于 5 分钟
-NSTimeInterval intervalSec = MAX(5, self.momentIntervalMinutes) * 60.0;
+// 本地不做发布冷却；间隔由用户设置（最低 1 分钟），服务端限频时按其文案退避
+NSTimeInterval intervalSec = MAX(1, self.momentIntervalMinutes) * 60.0;
 self.momentTimer = [NSTimer scheduledTimerWithTimeInterval:intervalSec
 target:self
 selector:@selector(onMomentTimerTick)
@@ -804,12 +879,6 @@ repeats:YES];
 }
 - (void)onMomentTimerTick {
 if (!self.autoMomentEnabled || self.momentTasks.count == 0) return;
-if (![self ac_momentPublishAllowedNow]) {
-NSTimeInterval last = [[NSUserDefaults standardUserDefaults] doubleForKey:@"AC_LastMomentPublishAt"];
-NSTimeInterval wait = MAX(30.0, (NSTimeInterval)MAX(5, self.momentIntervalMinutes) * 60.0 - ([[NSDate date] timeIntervalSince1970] - last));
-[self ac_scheduleMomentRetryAfter:wait];
-return;
-}
 NSMutableArray<ACMomentTaskItem *> *activeTasks = [NSMutableArray array];
 for (ACMomentTaskItem *t in self.momentTasks) {
 if (t.enabled && t.contentText.length > 0) {
@@ -824,20 +893,7 @@ ACMomentTaskItem *taskToPublish = activeTasks[self.currentMomentRotationIdx];
 self.currentMomentRotationIdx = (self.currentMomentRotationIdx + 1) % activeTasks.count;
 [self publishMomentTask:taskToPublish completion:nil];
 }
-// 严格按照 StormSniffer 抓包 (04:36:23.102Z) 还原动态发布请求头与请求体
-- (BOOL)ac_momentPublishAllowedNow {
-NSTimeInterval last = [[NSUserDefaults standardUserDefaults] doubleForKey:@"AC_LastMomentPublishAt"];
-NSTimeInterval nowT = [[NSDate date] timeIntervalSince1970];
-NSInteger minGap = MAX(5, self.momentIntervalMinutes);
-if (last > 0 && (nowT - last) < (NSTimeInterval)minGap * 60.0) return NO;
-return YES;
-}
-- (void)ac_markMomentPublishAttempt {
-NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-[ud setDouble:[[NSDate date] timeIntervalSince1970] forKey:@"AC_LastMomentPublishAt"];
-[ud setDouble:(double)MAX(5, self.momentIntervalMinutes) forKey:@"AC_LastMomentGapMinutes"];
-[ud synchronize];
-}
+// 仅在失败/服务端明确限频时安排一次重试，不影响用户手动发布
 - (void)ac_scheduleMomentRetryAfter:(NSTimeInterval)delay {
 if (self.momentRetryScheduled) return;
 self.momentRetryScheduled = YES;
@@ -846,6 +902,133 @@ dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(30.0, delay) * NSE
 weakSelf.momentRetryScheduled = NO;
 if (weakSelf.autoMomentEnabled) [weakSelf onMomentTimerTick];
 });
+}
+#pragma mark - 自动评论引擎（信息流有新动态即跟评）
+- (void)ac_handleFeedResponse:(NSDictionary *)json {
+@try {
+if (!self.autoCommentEnabled) return;
+NSDictionary *data = ACSafeDict(json[@"data"]);
+NSArray *records = ACSafeArray(data[@"records"]);
+if (records.count == 0) return;
+NSDateFormatter *df = [[NSDateFormatter alloc] init];
+df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+NSMutableArray *fresh = [NSMutableArray array];
+for (NSDictionary *rec in records) {
+if (![rec isKindOfClass:[NSDictionary class]]) continue;
+NSString *pid = ACSafeStr(rec[@"id"]);
+NSString *uid = ACSafeStr(rec[@"userId"]);
+if (pid.length < 5) continue;
+BOOL seen = [self.autoCommentSeenIds containsObject:pid];
+[self.autoCommentSeenIds addObject:pid];
+if (seen) continue;
+if (uid.length > 3 && [uid isEqualToString:self.selfUserId]) continue; // 自己的动态不评论
+id perm = rec[@"commentPermission"];
+if (perm && [perm respondsToSelector:@selector(integerValue)] && [perm integerValue] == 0) continue;
+NSTimeInterval ct = 0;
+NSDate *created = [df dateFromString:ACSafeStr(rec[@"createTime"])];
+if (created) ct = [created timeIntervalSince1970];
+if (!self.autoCommentSeeded) {
+// 刚开启功能：只评论“开启之后”发布的动态，避免把历史动态全部刷一遍
+if (self.autoCommentEnabledAt > 0 && ct >= self.autoCommentEnabledAt - 5.0) [fresh addObject:pid];
+continue;
+}
+[fresh addObject:pid];
+}
+if (!self.autoCommentSeeded) {
+self.autoCommentSeeded = YES;
+ACLog(@"[自动评论] 首次信息流播种完成，历史 %lu 条不评论，本次新动态 %lu 条",
+(unsigned long)records.count, (unsigned long)fresh.count);
+} else if (fresh.count > 0) {
+ACLog(@"[自动评论] 发现 %lu 条新动态：%@", (unsigned long)fresh.count, fresh);
+}
+// 倒序：先处理较新的
+for (NSString *pid in [[fresh reverseObjectEnumerator] allObjects]) {
+[self ac_enqueueAutoCommentForPostId:pid];
+}
+} @catch (NSException *e) {
+ACLog(@"[自动评论] 解析信息流异常 %@: %@", e.name, e.reason);
+}
+}
+- (void)ac_enqueueAutoCommentForPostId:(NSString *)postId {
+if (postId.length < 5) return;
+if (!self.autoCommentQueue) self.autoCommentQueue = [NSMutableArray array];
+if ([self.autoCommentQueue containsObject:postId]) return;
+[self.autoCommentQueue addObject:postId];
+[self ac_pumpAutoCommentQueue];
+}
+- (void)ac_pumpAutoCommentQueue {
+if (self.autoCommentSending) return;
+if (self.autoCommentQueue.count == 0) return;
+if (!self.autoCommentEnabled) { [self.autoCommentQueue removeAllObjects]; return; }
+NSString *pid = self.autoCommentQueue.firstObject;
+[self.autoCommentQueue removeObjectAtIndex:0];
+self.autoCommentSending = YES;
+NSString *text = self.autoCommentText.length > 0 ? self.autoCommentText : @"不错";
+[self ac_commentPostId:pid text:text];
+}
+- (void)ac_commentPostId:(NSString *)postId text:(NSString *)text {
+@try {
+NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
+if (token.length == 0) {
+self.autoCommentSending = NO;
+ACLog(@"[自动评论] 跳过 %@：token 未捕获", postId);
+return;
+}
+NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/interaction/comment/publish"];
+NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+req.HTTPMethod = @"POST";
+[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+[req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
+[req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
+[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+[req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
+[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
+[req setValue:token forHTTPHeaderField:@"token"];
+[req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
+NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
+if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+if (ltsId.length > 0) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+static uint64_t acReqSeq = 0;
+acReqSeq = (acReqSeq + 1) & 0x7F;
+[req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acReqSeq] forHTTPHeaderField:@"X-Request-No"];
+NSData *body = [NSJSONSerialization dataWithJSONObject:@{@"content": text ?: @"不错", @"postId": postId} options:0 error:nil];
+if (!body) { self.autoCommentSending = NO; return; }
+req.HTTPBody = body;
+[req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
+ACLog(@"[自动评论] 发送 postId=%@ text=%@ ltsLen=%lu", postId, text, (unsigned long)ltsId.length);
+acInternalRequest = YES;
+NSURLSessionDataTask *t = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+dispatch_async(dispatch_get_main_queue(), ^{
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.autoCommentSending = NO;
+NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+NSString *raw = data.length ? ([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"") : @"";
+NSInteger code = 0;
+NSDictionary *jd = ACSafeDict([NSJSONSerialization JSONObjectWithData:(data ?: [NSData data]) options:0 error:nil]);
+if (jd) code = [ACSafeStr(jd[@"code"]) integerValue];
+if (code == 200) {
+mgr.lastMomentLog = [NSString stringWithFormat:@"💬 已自动评论：%@", text];
+} else {
+mgr.lastMomentLog = [NSString stringWithFormat:@"⚠️ 自动评论失败 HTTP %ld / code %ld %@", (long)status, (long)code,
+raw.length > 60 ? [raw substringToIndex:60] : raw];
+}
+ACLog(@"[自动评论] 回调 %@ HTTP %ld code=%ld body=%@", postId, (long)status, (long)code, raw.length > 160 ? [raw substringToIndex:160] : raw);
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+[mgr saveAllCustomSettings];
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[mgr ac_pumpAutoCommentQueue];
+});
+});
+}];
+acInternalRequest = NO;
+[t resume];
+} @catch (NSException *e) {
+self.autoCommentSending = NO;
+ACLog(@"[自动评论] 异常 %@: %@", e.name, e.reason);
+}
 }
 static NSInteger ACParseRetryMinutes(NSString *msg) {
 // 服务端文案：“发布过于频繁，请5分钟后再次尝试。#SVIP”
@@ -863,22 +1046,27 @@ NSInteger v = [[msg substringWithRange:NSMakeRange((NSUInteger)start, (NSUIntege
 return (v > 0 && v <= 720) ? v : 5;
 }
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
+ACLog(@"[发布] 入口 task=%@ textLen=%lu token=%lu lts=%lu publishing=%d",
+task ? @"有" : @"无", (unsigned long)task.contentText.length,
+(unsigned long)ACHeaderValue(self.latestHTTPHeaders, @"token").length,
+(unsigned long)ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id").length,
+(int)self.momentPublishing);
 if (!task || task.contentText.length == 0) {
-if (completion) completion(NO, @"动态内容为空");
-return;
-}
-if (self.momentPublishing) {
-if (completion) completion(NO, @"上一条动态仍在发布中");
-return;
-}
-// 修复：本地再做一道冷却闸门，避免定时器/手动按钮重复触发导致服务端 500
-if (![self ac_momentPublishAllowedNow]) {
-NSTimeInterval last = [[NSUserDefaults standardUserDefaults] doubleForKey:@"AC_LastMomentPublishAt"];
-NSTimeInterval wait = MAX(30.0, (NSTimeInterval)MAX(5, self.momentIntervalMinutes) * 60.0 - ([[NSDate date] timeIntervalSince1970] - last));
-self.lastMomentLog = [NSString stringWithFormat:@"⏳ 发布冷却中，约 %.0f 秒后自动重试（服务端限制≈5分钟/条）", wait];
+self.lastMomentLog = @"❌ 动态内容为空，发布被跳过";
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 if (completion) completion(NO, self.lastMomentLog);
-[self ac_scheduleMomentRetryAfter:wait];
+return;
+}
+// 自愈：上一次发布如果因进程挂起/会话失效没有回调，不能永久卡住后续发布
+if (self.momentPublishing && self.momentPublishingSince > 0 &&
+[[NSDate date] timeIntervalSince1970] - self.momentPublishingSince > 120.0) {
+ACLog(@"[发布] 检测到上一次发布超过120秒未回调，强制解锁");
+self.momentPublishing = NO;
+}
+if (self.momentPublishing) {
+self.lastMomentLog = @"⏳ 上一条动态仍在发布中，请稍后再试";
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, self.lastMomentLog);
 return;
 }
 // 修复：token 大小写无关，并允许等待 App 后续请求把 token 捕获进来
@@ -907,27 +1095,35 @@ dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), 
 return;
 }
 @try {
+acInternalRequest = NO;
 self.momentPublishing = YES;
+self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
 NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/app/publish"];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
-[req setValue:@"/" forHTTPHeaderField:@"Accept"];
+// 修复：Accept 必须是 */*；UA 必须固定为 App 原生 UA。
+// 旧版从全局 Header 池取值，会被 COS 上传请求污染成 cos-xml-ios-sdk + Accept "/"，
+// 网关直接返回 HTTP 500（空 body），这就是“发布没效果”的主因。
+[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
 [req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
 [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 [req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
+[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"User-Agent") ?: @"airchat/1017 CFNetwork/1490.0.4 Darwin/23.2.0") forHTTPHeaderField:@"User-Agent"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
-NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+// X-Lts-Id 优先取最近一次“原生发布动态”请求的模板；全局池只接受合法长格式
+NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
+if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
 if (ltsId.length > 0) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
-// 修复：X-Request-No 每次必须新生成，复用抓包里的旧值会被服务端判为重复请求
-NSString *reqNo = [NSString stringWithFormat:@"%015llu",
-(unsigned long long)((unsigned long long)([[NSDate date] timeIntervalSince1970] * 1000.0) % 100000000000000ULL)];
+// 修复：X-Request-No 与 App 原生一致 = (毫秒时间戳 << 7) | 0~127 序号，15 位数字
+uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+uint64_t reqNoVal = (nowMs << 7) | (uint64_t)(arc4random() & 0x7F);
+NSString *reqNo = [NSString stringWithFormat:@"%015llu", reqNoVal];
 [req setValue:reqNo forHTTPHeaderField:@"X-Request-No"];
-// 请求体：纯文本 contentType=1；带远端媒体 contentType=3
+// 请求体：纯文本 contentType=1；带远端媒体 contentType=2（抓包实证）
 id safeMedia = ACJSONSafeObject(task.capturedMediaList, 0);
 NSArray *mediaArr = [safeMedia isKindOfClass:[NSArray class]] ? (NSArray *)safeMedia : nil;
 BOOL hasRemoteMedia = (mediaArr.count > 0);
@@ -935,7 +1131,8 @@ NSMutableDictionary *bodyDict = [NSMutableDictionary dictionary];
 bodyDict[@"commentPermission"] = @(1);
 bodyDict[@"contentText"] = ACSafeStr(task.contentText);
 if (hasRemoteMedia) {
-bodyDict[@"contentType"] = @(3);
+// 抓包实证：原生带图动态 contentType = 2（不是 3），3 会被业务层判非法
+bodyDict[@"contentType"] = @(2);
 bodyDict[@"mediaList"] = mediaArr;
 } else {
 bodyDict[@"contentType"] = @(1);
@@ -943,24 +1140,48 @@ bodyDict[@"contentType"] = @(1);
 NSData *bodyData = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
 if (!bodyData) {
 self.momentPublishing = NO;
-if (completion) completion(NO, @"请求体序列化失败");
+self.lastMomentLog = @"❌ 请求体序列化失败（文案含非法字符）";
+ACLog(@"[发布] 请求体序列化失败");
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, self.lastMomentLog);
 return;
 }
 req.HTTPBody = bodyData;
 [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
+ACLog(@"[发布] 即将发送 tokenLen=%lu ltsLen=%lu reqNo=%@ bodyLen=%lu media=%d",
+(unsigned long)token.length, (unsigned long)ltsId.length, reqNo,
+(unsigned long)bodyData.length, (int)hasRemoteMedia);
 __weak typeof(self) weakSelf = self;
-[[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+acInternalRequest = YES;
+NSURLSessionDataTask *publishTask =
+[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
 dispatch_async(dispatch_get_main_queue(), ^{
 weakSelf.momentPublishing = NO;
-if (error || !data) {
-NSString *failMsg = [NSString stringWithFormat:@"❌ 发布异常: %@", error.localizedDescription ?: @"网络错误"];
+NSHTTPURLResponse *httpResp = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+NSInteger httpStatus = httpResp ? (NSInteger)httpResp.statusCode : 0;
+NSString *rawText = data.length > 0 ? ([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"") : @"";
+ACLog(@"[发布] 回调 HTTP %ld err=%@ body=%@", (long)httpStatus,
+error.localizedDescription ?: @"无",
+rawText.length > 200 ? [rawText substringToIndex:200] : rawText);
+if (error) {
+NSString *failMsg = [NSString stringWithFormat:@"❌ 发布异常 HTTP %ld: %@", (long)httpStatus, error.localizedDescription ?: @"网络错误"];
 weakSelf.lastMomentLog = failMsg;
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 if (completion) completion(NO, failMsg);
 [weakSelf ac_scheduleMomentRetryAfter:60.0];
 return;
 }
-NSDictionary *respDict = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+NSDictionary *respDict = ACSafeDict([NSJSONSerialization JSONObjectWithData:(data ?: [NSData data]) options:0 error:nil]);
+if (!respDict) {
+// 没有 JSON：网关/鉴权层直接拒绝（例如 Header 被污染导致 HTTP 500 空 body）
+NSString *snippet = rawText.length > 120 ? [rawText substringToIndex:120] : rawText;
+NSString *failMsg = [NSString stringWithFormat:@"❌ 发布被拒 HTTP %ld：%@", (long)httpStatus, snippet.length ? snippet : @"(空响应)"];
+weakSelf.lastMomentLog = failMsg;
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, failMsg);
+[weakSelf ac_scheduleMomentRetryAfter:60.0];
+return;
+}
 NSInteger code = [ACSafeStr(respDict[@"code"]) integerValue];
 if (code == 200) {
 task.sentCount++;
@@ -999,16 +1220,21 @@ if (completion) completion(NO, errMsg);
 [weakSelf ac_scheduleMomentRetryAfter:(NSTimeInterval)waitMin * 60.0];
 return;
 }
-NSString *errLog = [NSString stringWithFormat:@"⚠️ 动态返回(%ld): %@", (long)code, serverMsg];
+NSString *errLog = [NSString stringWithFormat:@"⚠️ 动态返回 HTTP %ld / code %ld: %@", (long)httpStatus, (long)code, serverMsg];
 weakSelf.lastMomentLog = errLog;
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 if (completion) completion(NO, errLog);
 });
-}] resume];
-[self ac_markMomentPublishAttempt];
+}];
+acInternalRequest = NO;
+[publishTask resume];
 } @catch (NSException *e) {
+acInternalRequest = NO;
 self.momentPublishing = NO;
-if (completion) completion(NO, @"构造动态请求异常");
+ACLog(@"[发布] 异常 %@: %@", e.name, e.reason);
+self.lastMomentLog = [NSString stringWithFormat:@"❌ 发布异常: %@", e.reason ?: e.name];
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, self.lastMomentLog);
 }
 }
 
@@ -1549,7 +1775,8 @@ NSString *lk = k.lowercaseString;
 // 修复：重放抓包 Header 时不能带上一次的 Content-Length / Host / Connection / Accept-Encoding
 if ([lk isEqualToString:@"content-length"] || [lk isEqualToString:@"host"] ||
 [lk isEqualToString:@"connection"] || [lk isEqualToString:@"accept-encoding"] ||
-[lk isEqualToString:@"content-type"]) return;
+[lk isEqualToString:@"content-type"] || [lk isEqualToString:@"accept"] ||
+[lk isEqualToString:@"user-agent"]) return;
 [req setValue:v forHTTPHeaderField:k];
 }];
 }
@@ -1826,6 +2053,9 @@ if (completion) completion(NO, @"发送异常");
 @property (nonatomic, strong) UIView *momentTaskBar;
 @property (nonatomic, strong) UISwitch *momentSwitch;
 @property (nonatomic, strong) UIButton *intervalBtn;
+@property (nonatomic, strong) UIView *autoCommentBar;
+@property (nonatomic, strong) UISwitch *autoCommentSwitch;
+@property (nonatomic, strong) UITextField *autoCommentField;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIButton *floatingSendBtn;
@@ -2033,7 +2263,29 @@ self.momentSwitch.on = mgr.autoMomentEnabled;
 [self.momentSwitch addTarget:self action:@selector(momentSwitchChanged:) forControlEvents:UIControlEventValueChanged];
 [self.momentTaskBar addSubview:self.momentSwitch];
 [self.headerContainer addSubview:self.momentTaskBar];
-self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 200, width - 32, 24)];
+self.autoCommentBar = [[UIView alloc] initWithFrame:CGRectMake(16, 200, width - 32, 38)];
+self.autoCommentBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+self.autoCommentBar.layer.cornerRadius = 10;
+self.autoCommentBar.hidden = YES;
+UILabel *acLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, 118, 38)];
+acLabel.font = [UIFont boldSystemFontOfSize:11.5];
+acLabel.text = @"💬 新动态自动评论";
+[self.autoCommentBar addSubview:acLabel];
+self.autoCommentField = [[UITextField alloc] initWithFrame:CGRectMake(126, 5, width - 32 - 126 - 64, 28)];
+self.autoCommentField.borderStyle = UITextBorderStyleRoundedRect;
+self.autoCommentField.font = [UIFont systemFontOfSize:11.5];
+self.autoCommentField.placeholder = @"评论内容";
+self.autoCommentField.text = mgr.autoCommentText ?: @"不错";
+self.autoCommentField.clearButtonMode = UITextFieldViewModeWhileEditing;
+[self.autoCommentField addTarget:self action:@selector(autoCommentFieldChanged:) forControlEvents:UIControlEventEditingDidEnd];
+[self.autoCommentBar addSubview:self.autoCommentField];
+self.autoCommentSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(width - 32 - 56, 3.5, 51, 31)];
+self.autoCommentSwitch.transform = CGAffineTransformMakeScale(0.82, 0.82);
+self.autoCommentSwitch.on = mgr.autoCommentEnabled;
+[self.autoCommentSwitch addTarget:self action:@selector(autoCommentSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+[self.autoCommentBar addSubview:self.autoCommentSwitch];
+[self.headerContainer addSubview:self.autoCommentBar];
+self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 244, width - 32, 24)];
 self.statusLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightMedium];
 self.statusLabel.textColor = [UIColor secondaryLabelColor];
 self.statusLabel.textAlignment = NSTextAlignmentCenter;
@@ -2078,7 +2330,7 @@ self.mediaBadgeLabel.hidden = YES;
 CGFloat width = self.view.bounds.size.width;
 CGFloat height = self.view.bounds.size.height;
 CGFloat topOffset = self.view.safeAreaInsets.top;
-CGFloat headerH = 232.0;
+CGFloat headerH = 276.0;
 self.headerContainer.frame = CGRectMake(0, topOffset, width, headerH);
 CGFloat tableY = topOffset + headerH;
 self.tableView.frame = CGRectMake(0, tableY, width, height - tableY);
@@ -2223,6 +2475,33 @@ self.statusLabel.text = @"⚪ 定时发动态已关闭";
 }
 [self updateUI];
 }
+- (void)autoCommentSwitchChanged:(UISwitch *)sw {
+[self.view endEditing:YES];
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.autoCommentEnabled = sw.isOn;
+if (sw.isOn) {
+// 重新播种：从此刻起出现的新动态才评论，不刷历史
+mgr.autoCommentEnabledAt = [[NSDate date] timeIntervalSince1970];
+mgr.autoCommentSeeded = NO;
+[mgr.autoCommentSeenIds removeAllObjects];
+self.statusLabel.textColor = [UIColor systemGreenColor];
+self.statusLabel.text = @"🟢 自动评论已开启：别人发布新动态后会自动跟评";
+ACLog(@"[自动评论] 用户开启，已重置播种时间");
+} else {
+self.statusLabel.textColor = [UIColor secondaryLabelColor];
+self.statusLabel.text = @"⚪ 自动评论已关闭";
+ACLog(@"[自动评论] 用户关闭");
+}
+[mgr saveAllCustomSettings];
+[self updateUI];
+}
+- (void)autoCommentFieldChanged:(UITextField *)tf {
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+NSString *txt = tf.text;
+mgr.autoCommentText = txt.length > 0 ? txt : @"不错";
+[mgr saveAllCustomSettings];
+self.statusLabel.text = [NSString stringWithFormat:@"✅ 自动评论内容已保存：%@", mgr.autoCommentText];
+}
 - (void)cycleMomentInterval {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
@@ -2237,7 +2516,7 @@ tf.text = [NSString stringWithFormat:@"%ld", (long)mgr.momentIntervalMinutes];
 [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 [alert addAction:[UIAlertAction actionWithTitle:@"保存生效" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
 NSInteger mins = [alert.textFields.firstObject.text integerValue];
-if (mins < 5) mins = 10;
+if (mins < 1) mins = 10;
 mgr.momentIntervalMinutes = mins;
 [mgr saveAllCustomSettings];
 [mgr restartMomentScheduler];
@@ -2407,6 +2686,7 @@ self.actionBar.hidden = (idx >= 3);
 self.welcomeControlBar.hidden = (idx != 3);
 self.autoReplyBar.hidden = (idx != 4);
 self.momentTaskBar.hidden = (idx != 5);
+self.autoCommentBar.hidden = (idx != 5);
 self.floatingSendBtn.hidden = (idx >= 3);
 [self refreshMediaPreviewUI];
 if (idx == 3) {
@@ -2522,8 +2802,17 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (sender.tag < 0 || sender.tag >= mgr.momentTasks.count) return;
 ACMomentTaskItem *task = mgr.momentTasks[sender.tag];
 self.statusLabel.textColor = [UIColor systemBlueColor];
-self.statusLabel.text = @"⏳ 正在立即发布该条动态任务...";
-[mgr publishMomentTask:task completion:nil];
+self.statusLabel.text = @"⏳ 正在立即发布该条动态任务...（若未捕获登录凭证最多等待20秒）";
+__weak typeof(self) weakSelfVC = self;
+[mgr publishMomentTask:task completion:^(BOOL ok, NSString *msg) {
+weakSelfVC.statusLabel.textColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+weakSelfVC.statusLabel.text = msg ?: (ok ? @"发布成功" : @"发布失败");
+UIAlertController *a = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 发布成功" : @"❌ 发布失败")
+message:(msg ?: @"")
+preferredStyle:UIAlertControllerStyleAlert];
+[a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
+[weakSelfVC presentViewController:a animated:YES completion:nil];
+}];
 }
 - (void)tableView:(UITableView * _Nonnull)tableView didSelectRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
 [tableView deselectRowAtIndexPath:indexPath animated:YES];
@@ -2714,17 +3003,32 @@ nav.modalPresentationStyle = UIModalPresentationPageSheet;
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
 NSString *urlStr = request.URL.absoluteString;
 // 自动捕获 apiv1.airchat.cc 请求中的全部真实 Header（用于动态发布鉴权）
-if ([urlStr containsString:@"apiv1.airchat.cc"] && request.allHTTPHeaderFields) {
+BOOL acIsAirChatHost = ([urlStr containsString:@"airchat.cc"] || [urlStr containsString:@"airchat.cn"] || [urlStr containsString:@"airchat.ltd"]);
+if (!acInternalRequest && acIsAirChatHost && request.allHTTPHeaderFields) {
 NSDictionary *headers = request.allHTTPHeaderFields;
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+// 原生发布请求：整份 Header 作为模板保存（UA/Accept/X-Lts-Id 都与该接口匹配）
+if ([urlStr containsString:@"/post/app/publish"]) {
+mgr.lastPublishHeaders = [headers mutableCopy];
+}
 [headers enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
-if ([k isKindOfClass:[NSString class]] && [v isKindOfClass:[NSString class]]) {
+if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
+NSString *lk = k.lowercaseString;
+if ([lk isEqualToString:@"x-lts-id"]) {
+// 修复：只接受 App 正常业务请求生成的 LtsId（约 150 字符且以 [s] 结尾），
+// COS SDK 等短格式会让服务端直接 500
+if (v.length >= 140 && [v hasSuffix:@"[s]"]) {
+mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
+mgr.latestHTTPHeaders[@"x-lts-id"] = v;
+}
+return;
+}
+if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
+[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"]) {
 mgr.latestHTTPHeaders[k] = v;
-mgr.latestHTTPHeaders[k.lowercaseString] = v;
-if ([k.lowercaseString isEqualToString:@"x-userid"] && v.length > 5) {
-mgr.selfUserId = v;
+mgr.latestHTTPHeaders[lk] = v;
 }
-}
+if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
 }];
 }
 if ([urlStr containsString:@"/post/app/publish"] && request.HTTPBody) {
@@ -2746,21 +3050,36 @@ completionHandler(newData, response, error);
 return %orig(request, wrappedHandler);
 }
 }
+if ([urlStr containsString:@"/post/app/batchQueryPostInfo"] && completionHandler) {
+void (^origHandler)(NSData *, NSURLResponse *, NSError *) = [completionHandler copy];
+void (^feedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+if (origHandler) origHandler(data, response, error);
+if (!error && data.length > 0) {
+@try {
+NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+if (json) [[ACForwardHelperManager shared] ac_handleFeedResponse:json];
+} @catch (NSException *e) {
+ACLog(@"[自动评论] 响应解析异常 %@", e.reason);
+}
+}
+};
+return %orig(request, feedHandler);
+}
 return %orig;
 }
 %end
 %hook NSMutableURLRequest
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString * _Nullable)field {
 %orig;
+if (acInternalRequest) return;
 if (field && value && [field isKindOfClass:[NSString class]] && [value isKindOfClass:[NSString class]]) {
 NSString *lowerField = field.lowercaseString;
-if ([lowerField isEqualToString:@"token"] ||
+BOOL stable = ([lowerField isEqualToString:@"token"] ||
 [lowerField isEqualToString:@"x-userid"] ||
-[lowerField isEqualToString:@"x-lts-id"] ||
-[lowerField isEqualToString:@"x-request-no"] ||
-[lowerField isEqualToString:@"channel"] ||
 [lowerField isEqualToString:@"version"] ||
-[lowerField isEqualToString:@"user-agent"]) {
+[lowerField isEqualToString:@"channel"]);
+BOOL validLts = ([lowerField isEqualToString:@"x-lts-id"] && value.length >= 140 && [value hasSuffix:@"[s]"]);
+if (stable || validLts) {
 [ACForwardHelperManager shared].latestHTTPHeaders[field] = value;
 [ACForwardHelperManager shared].latestHTTPHeaders[lowerField] = value;
 if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
