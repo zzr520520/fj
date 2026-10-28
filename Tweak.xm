@@ -286,6 +286,8 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, assign) BOOL autoCommentSending;
 @property (nonatomic, assign) NSTimeInterval momentPublishingSince;
 @property (nonatomic, assign) NSTimeInterval autoCommentEnabledAt;
+@property (nonatomic, weak) NSURLSession *latestAppSession;
+@property (nonatomic, assign) NSTimeInterval latestLtsAt;
 @property (nonatomic, assign) BOOL momentRetryScheduled;
 + (instancetype)shared;
 // 四槽位独立媒体管理 API（0:群发, 1:迎新, 2:自动回复, 3:发动态）
@@ -989,7 +991,14 @@ req.HTTPMethod = @"POST";
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (ltsId.length > 0) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+if (ltsId.length < 140 && self.latestAppSession) {
+NSString *sessLts = ACHeaderValue(self.latestAppSession.configuration.HTTPAdditionalHeaders, @"X-Lts-Id");
+if (sessLts.length >= 140) ltsId = sessLts;
+}
+NSTimeInterval ltsAge = self.latestLtsAt > 0 ? [[NSDate date] timeIntervalSince1970] - self.latestLtsAt : -1;
+if (ltsId.length >= 140 && (ltsAge <= 30 || self.latestAppSession)) {
+[req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+}
 uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
 static uint64_t acReqSeq = 0;
 acReqSeq = (acReqSeq + 1) & 0x7F;
@@ -1000,7 +1009,10 @@ req.HTTPBody = body;
 [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
 ACLog(@"[自动评论] 发送 postId=%@ text=%@ ltsLen=%lu", postId, text, (unsigned long)ltsId.length);
 acInternalRequest = YES;
-NSURLSessionDataTask *t = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+NSURLSession *acSession = [ACForwardHelperManager shared].latestAppSession;
+if (!acSession) acSession = [NSURLSession sharedSession];
+ACLog(@"[自动评论] 使用 AppSession=%@", acSession == [NSURLSession sharedSession] ? @"否(shared)" : @"是");
+NSURLSessionDataTask *t = [acSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
 dispatch_async(dispatch_get_main_queue(), ^{
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 mgr.autoCommentSending = NO;
@@ -1117,7 +1129,14 @@ req.HTTPMethod = @"POST";
 // X-Lts-Id 优先取最近一次“原生发布动态”请求的模板；全局池只接受合法长格式
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (ltsId.length > 0) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+if (ltsId.length < 140 && self.latestAppSession) {
+NSString *sessLts = ACHeaderValue(self.latestAppSession.configuration.HTTPAdditionalHeaders, @"X-Lts-Id");
+if (sessLts.length >= 140) ltsId = sessLts;
+}
+NSTimeInterval ltsAge = self.latestLtsAt > 0 ? [[NSDate date] timeIntervalSince1970] - self.latestLtsAt : -1;
+if (ltsId.length >= 140 && (ltsAge <= 30 || self.latestAppSession)) {
+[req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+}
 // 修复：X-Request-No 与 App 原生一致 = (毫秒时间戳 << 7) | 0~127 序号，15 位数字
 uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
 uint64_t reqNoVal = (nowMs << 7) | (uint64_t)(arc4random() & 0x7F);
@@ -1148,13 +1167,20 @@ return;
 }
 req.HTTPBody = bodyData;
 [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
+ACLog(@"[发布] 实际头发送 Lts=%lu keys=%@",
+(unsigned long)ACHeaderValue([req allHTTPHeaderFields], @"X-Lts-Id").length,
+[[req allHTTPHeaderFields] allKeys]);
 ACLog(@"[发布] 即将发送 tokenLen=%lu ltsLen=%lu reqNo=%@ bodyLen=%lu media=%d",
 (unsigned long)token.length, (unsigned long)ltsId.length, reqNo,
 (unsigned long)bodyData.length, (int)hasRemoteMedia);
 __weak typeof(self) weakSelf = self;
 acInternalRequest = YES;
+NSURLSession *acPubSession = [ACForwardHelperManager shared].latestAppSession;
+if (!acPubSession) acPubSession = [NSURLSession sharedSession];
+ACLog(@"[发布] AppSession=%@ ltsAge=%.1fs", acPubSession == [NSURLSession sharedSession] ? @"否(shared)" : @"是",
+self.latestLtsAt > 0 ? [[NSDate date] timeIntervalSince1970] - self.latestLtsAt : -1.0);
 NSURLSessionDataTask *publishTask =
-[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+[acPubSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
 dispatch_async(dispatch_get_main_queue(), ^{
 weakSelf.momentPublishing = NO;
 NSHTTPURLResponse *httpResp = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
@@ -3020,6 +3046,7 @@ if ([lk isEqualToString:@"x-lts-id"]) {
 if (v.length >= 140 && [v hasSuffix:@"[s]"]) {
 mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
 mgr.latestHTTPHeaders[@"x-lts-id"] = v;
+mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
 }
 return;
 }
@@ -3067,6 +3094,43 @@ return %orig(request, feedHandler);
 }
 return %orig;
 }
+// Alamofire 5 走的是 delegate 版本（无 completionHandler），
+// 在这里抓 Session 实例与最终请求头，发布时复用同一个 Session 即可自动带上会话级头
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+if (!acInternalRequest && request && request.URL) {
+NSString *urlStr = request.URL.absoluteString ?: @"";
+if (urlStr.length > 0 && ([urlStr containsString:@"airchat.cc"] || [urlStr containsString:@"airchat.cn"])) {
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.latestAppSession = self;
+NSDictionary *headers = request.allHTTPHeaderFields;
+if (headers) {
+if ([urlStr containsString:@"/post/app/publish"]) {
+mgr.lastPublishHeaders = [headers mutableCopy];
+ACLog(@"[抓包] 原生发布模板 Lts=%lu", (unsigned long)ACHeaderValue(headers, @"X-Lts-Id").length);
+}
+[headers enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
+NSString *lk = k.lowercaseString;
+if ([lk isEqualToString:@"x-lts-id"]) {
+if (v.length >= 140 && [v hasSuffix:@"[s]"]) {
+mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
+mgr.latestHTTPHeaders[@"x-lts-id"] = v;
+mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
+}
+return;
+}
+if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
+[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"]) {
+mgr.latestHTTPHeaders[k] = v;
+mgr.latestHTTPHeaders[lk] = v;
+}
+if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
+}];
+}
+}
+}
+return %orig;
+}
 %end
 %hook NSMutableURLRequest
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString * _Nullable)field {
@@ -3089,12 +3153,59 @@ if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
 }
 }
 %end
+%hook NSMutableURLRequest
+- (void)addValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+%orig;
+if (acInternalRequest) return;
+if (![field isKindOfClass:[NSString class]] || ![value isKindOfClass:[NSString class]]) return;
+NSString *lf = field.lowercaseString;
+if ([lf isEqualToString:@"x-lts-id"] && value.length >= 140 && [value hasSuffix:@"[s]"]) {
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.latestHTTPHeaders[@"X-Lts-Id"] = value;
+mgr.latestHTTPHeaders[@"x-lts-id"] = value;
+mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
+}
+}
+- (void)setAllHTTPHeaderFields:(NSDictionary<NSString *,NSString *> *)headers {
+%orig;
+if (acInternalRequest || headers.count == 0) return;
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+[headers enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
+NSString *lk = k.lowercaseString;
+if ([lk isEqualToString:@"x-lts-id"] && v.length >= 140 && [v hasSuffix:@"[s]"]) {
+mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
+mgr.latestHTTPHeaders[@"x-lts-id"] = v;
+mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
+}
+if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
+[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"]) {
+mgr.latestHTTPHeaders[k] = v;
+mgr.latestHTTPHeaders[lk] = v;
+}
+if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
+}];
+}
+%end
 %hook NSJSONSerialization
 + (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError * _Nullable *)error {
 id res = %orig;
 NSDictionary *dict = ACSafeDict(res);
 // 修复：只处理成功响应中的业务数据；0.5s 节流，避免全 App 每个 JSON 都触发解析+落盘
 if (dict && dict[@"code"] && dict[@"data"] && ![dict[@"data"] isKindOfClass:[NSNull class]]) {
+// 信息流响应结构 { data: { records: [ {id, userId, contentText, createTime...} ] } }
+// 从这里触发自动评论，不受 App 使用哪种网络 API 影响
+NSDictionary *acFeedData = ACSafeDict(dict[@"data"]);
+NSArray *acFeedRecords = ACSafeArray(acFeedData[@"records"]);
+if (acFeedRecords.count > 0) {
+NSDictionary *acFirst = ACSafeDict(acFeedRecords.firstObject);
+if (acFirst[@"id"] && (acFirst[@"contentText"] || acFirst[@"mediaList"] || acFirst[@"commentPermission"])) {
+dispatch_async(dispatch_get_main_queue(), ^{
+@try { [[ACForwardHelperManager shared] ac_handleFeedResponse:dict]; }
+@catch (NSException *e) { ACLog(@"[自动评论] 触发异常 %@", e.reason); }
+});
+}
+}
 static NSTimeInterval acLastJSONParse = 0;
 NSTimeInterval nowT = [[NSDate date] timeIntervalSince1970];
 if (nowT - acLastJSONParse >= 0.5) {
