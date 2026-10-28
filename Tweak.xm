@@ -2840,10 +2840,10 @@ return mgr.groupList;
     ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
     NSMutableArray *targets = [NSMutableArray array]; for (ACContactItem *item in mgr.friendList) if (item.isSelected) [targets addObject:item];
     if (targets.count != 1) { self.statusLabel.textColor = [UIColor systemOrangeColor]; self.statusLabel.text = @"语音通话请只勾选一位好友；可逐个选择拨打"; return; }
-    ACContactItem *friend = targets.firstObject;
-    UIAlertController *durationAlert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"拨打 %@ 的语音", friend.name ?: friend.targetId] message:@"选择通话时长，到时尝试点击原生红色挂断按钮。" preferredStyle:UIAlertControllerStyleActionSheet];
+    ACContactItem *friendItem = targets.firstObject;
+    UIAlertController *durationAlert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"拨打 %@ 的语音", friendItem.name ?: friendItem.targetId] message:@"选择通话时长，到时尝试点击原生红色挂断按钮。" preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
-    for (NSNumber *n in @[@30, @60, @120, @300]) { [durationAlert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%ld 秒后自动挂断", (long)n.integerValue] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [[ACForwardHelperManager shared] ac_checkAndStartAudioCallToFriend:friend duration:n.doubleValue fromVC:weakSelf]; }]]; }
+    for (NSNumber *n in @[@30, @60, @120, @300]) { [durationAlert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%ld 秒后自动挂断", (long)n.integerValue] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [[ACForwardHelperManager shared] ac_checkAndStartAudioCallToFriend:friendItem duration:n.doubleValue fromVC:weakSelf]; }]]; }
     [durationAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     UIPopoverPresentationController *pop = durationAlert.popoverPresentationController; if (pop) { pop.sourceView = self.actionBar; pop.sourceRect = self.actionBar.bounds; }
     [self presentViewController:durationAlert animated:YES completion:nil];
