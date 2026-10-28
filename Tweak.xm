@@ -1101,7 +1101,7 @@ self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
 NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/app/publish"];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
-// 修复：Accept 必须是 */*；UA 必须固定为 App 原生 UA。
+// 修复：Accept 必须是 *／*（通配符；注意注释里不要写半角星号+斜杠+星号，否则会被 Logos 当成块注释吞掉后续代码）；UA 必须固定为 App 原生 UA。
 // 旧版从全局 Header 池取值，会被 COS 上传请求污染成 cos-xml-ios-sdk + Accept "/"，
 // 网关直接返回 HTTP 500（空 body），这就是“发布没效果”的主因。
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
