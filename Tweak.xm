@@ -3546,9 +3546,11 @@ dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
 
 - (void)layoutSubviews {
     %orig;
-    self.hidden = YES;
-    self.frame = CGRectZero;
-    [self removeFromSuperview];
+    // FFAdsBottomView 未声明，Logos 只给前向声明，需转成 UIView 才能访问这些成员
+    UIView *adView = (UIView *)self;
+    adView.hidden = YES;
+    adView.frame = CGRectZero;
+    [adView removeFromSuperview];
 }
 
 %end
