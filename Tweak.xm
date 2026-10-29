@@ -3442,3 +3442,169 @@ dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), 
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), install);
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), install);
 }
+
+
+// =========================================================================
+// 9. 防截屏 / 防录屏 + 广告拦截（BatChat 模块，并入同一 dylib）
+// =========================================================================
+// 注意：注释中不要出现半角星号+斜杠+星号，否则会被 Logos 当成块注释吞掉后续代码。
+
+// ---- 9.1 解除截图 / 录屏限制 (Anti-Screenshot & Screen Recording Bypass) ----
+
+// 阻断 UITextField 开启 secureTextEntry 导致的系统黑屏遮挡
+%hook UITextField
+
+- (void)setSecureTextEntry:(BOOL)secureTextEntry {
+    // 强制关闭安全文本输入，防止视图被系统渲染层置黑
+    %orig(NO);
+}
+
+%end
+
+// 阻断应用对系统截屏与录屏通知的监听及弹窗遮罩
+%hook NSNotificationCenter
+
+- (void)addObserver:(id)observer selector:(SEL)aSelector name:(NSNotificationName)aName object:(id)anObject {
+    // 过滤系统截屏通知
+    if ([aName isEqualToString:UIApplicationUserDidTakeScreenshotNotification]) {
+        return;
+    }
+    // 过滤 iOS 11+ 录屏状态变化通知
+    if (@available(iOS 11.0, *)) {
+        if ([aName isEqualToString:UIScreenCapturedDidChangeNotification]) {
+            return;
+        }
+    }
+    %orig;
+}
+
+%end
+
+// 拦截应用内可能存在的截屏提醒上报逻辑
+%hook UIViewController
+
+- (void)userDidTakeScreenshot:(id)sender {
+    // 阻断控制器触发向对方发送“对方已截屏”的提示消息
+    return;
+}
+
+%end
+
+
+// ---- 9.2 去广告模块 (Ad-Block for CSJ, GDT, KS & Native Ads) ----
+
+// 针对应用内置的广告统一调度管理器 (FFAllADsManager / FFADsBaseManager)
+%hook FFAllADsManager
+
+- (void)loadSplashAd {
+    // 阻止开屏广告的初始化与加载
+    return;
+}
+
+- (void)showSplashAdWithWindow:(id)arg1 {
+    // 阻止开屏广告在 Window 上的展示
+    return;
+}
+
+- (BOOL)isSplashAdValid {
+    // 强制声明开屏广告失效
+    return NO;
+}
+
+- (void)loadRewardVideoAd:(id)arg1 {
+    // 阻止激励视频请求
+    return;
+}
+
+- (void)loadFeedAd:(id)arg1 {
+    // 阻止信息流广告
+    return;
+}
+
+%end
+
+%hook FFADsBaseManager
+
+- (void)startRequestAds {
+    // 阻断基类请求
+    return;
+}
+
+- (void)requestAdWithPlacementId:(id)arg1 {
+    return;
+}
+
+%end
+
+// 针对底部广告横幅视图 (FFAdsBottomView) 进行直接抹平与隐藏
+%hook FFAdsBottomView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    // 将广告视图的高宽直接置零
+    return %orig(CGRectZero);
+}
+
+- (void)layoutSubviews {
+    %orig;
+    self.hidden = YES;
+    self.frame = CGRectZero;
+    [self removeFromSuperview];
+}
+
+%end
+
+// 拦截穿山甲 SDK (CSJ / Pangle) 的开屏视图
+%hook BUSplashAdView
+
+- (void)loadAdData {
+    return;
+}
+
+- (BOOL)isAdValid {
+    return NO;
+}
+
+%end
+
+// 拦截腾讯优量汇 (GDTMobSDK) 的开屏广告组件
+%hook GDTSplashAd
+
+- (void)loadAd {
+    return;
+}
+
+- (void)loadAdAndShow {
+    return;
+}
+
+- (BOOL)isAdValid {
+    return NO;
+}
+
+%end
+
+// 拦截快手广告 (KSAdSDK) 的开屏广告组件
+%hook KSAdSplashManager
+
+- (void)loadSplashAdWithTimeout:(NSTimeInterval)timeout {
+    return;
+}
+
+- (BOOL)isAdValid {
+    return NO;
+}
+
+%end
+
+
+// ---- 9.3 动态库初始化入口日志 (用于排查注入后不生效的问题) ----
+
+%ctor {
+    @autoreleasepool {
+        NSLog(@"========================================");
+        NSLog(@"[BatChatTweak] 插件加载成功!");
+        NSLog(@"[BatChatTweak] 防截屏限制已自动解除");
+        NSLog(@"[BatChatTweak] 穿山甲/优量汇/快手广告组件已拦截");
+        NSLog(@"========================================");
+    }
+}
