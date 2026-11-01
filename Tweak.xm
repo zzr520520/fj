@@ -336,18 +336,6 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_enqueueAutoCommentForPostId:(NSString *)postId;
 - (void)ac_pumpAutoCommentQueue;
 - (void)ac_commentPostId:(NSString *)postId text:(NSString *)text;
-// —— 自动点赞（飞行圈：信息流出现新动态即点赞）——
-@property (nonatomic, assign) BOOL autoLikeEnabled;
-@property (nonatomic, strong) NSMutableSet<NSString *> *likedPostIds;
-@property (nonatomic, strong) NSMutableArray<NSString *> *likeQueue;
-@property (nonatomic, assign) BOOL isLikeSending;
-// —— 语音打招呼 + 自动 1 秒挂断 ——
-@property (nonatomic, assign) BOOL autoVoiceCallEnabled;
-- (void)ac_handleFeedResponseForAutoLike:(NSDictionary *)json;
-- (void)ac_enqueueAutoLikeForPostId:(NSString *)postId;
-- (void)ac_pumpAutoLikeQueue;
-- (void)ac_triggerAutoLikeForPost:(NSString *)postId;
-- (void)batchVoiceGreetAndHangup:(NSArray<ACContactItem *> *)targets;
 @end
 @implementation ACForwardHelperManager
 + (instancetype)shared {
@@ -379,8 +367,6 @@ instance.autoCommentText = @"不错";
 instance.autoCommentSeenIds = [NSMutableSet set];
 instance.autoCommentQueue = [NSMutableArray array];
 instance.autoCommentSeeded = NO;
-instance.likedPostIds = [NSMutableSet set];
-instance.likeQueue = [NSMutableArray array];
 [instance loadLocalPermanentCache];
 [instance loadAllCustomSettings];
 [instance restartMomentScheduler];
@@ -1055,147 +1041,6 @@ acInternalRequest = NO;
 self.autoCommentSending = NO;
 ACLog(@"[自动评论] 异常 %@: %@", e.name, e.reason);
 }
-}
-#pragma mark - 自动点赞引擎（信息流有新动态即点赞）
-// 信息流响应入口：把每条记录的 postId 派发进点赞队列（likedPostIds 保证同一条只赞一次）
-- (void)ac_handleFeedResponseForAutoLike:(NSDictionary *)json {
-@try {
-if (!self.autoLikeEnabled) return;
-NSDictionary *data = ACSafeDict(json[@"data"]);
-NSArray *records = ACSafeArray(data[@"records"]);
-if (records.count == 0) return;
-for (NSDictionary *post in records) {
-if (![post isKindOfClass:[NSDictionary class]]) continue;
-NSString *pid = ACSafeStr(post[@"id"]);
-if (pid.length > 5) [self ac_enqueueAutoLikeForPostId:pid];
-}
-} @catch (NSException *e) {
-ACLog(@"[自动点赞] 解析信息流异常 %@: %@", e.name, e.reason);
-}
-}
-- (void)ac_enqueueAutoLikeForPostId:(NSString *)postId {
-if (!self.autoLikeEnabled || postId.length == 0) return;
-if (!self.likedPostIds) self.likedPostIds = [NSMutableSet set];
-if (!self.likeQueue) self.likeQueue = [NSMutableArray array];
-if ([self.likedPostIds containsObject:postId] || [self.likeQueue containsObject:postId]) return;
-[self.likeQueue addObject:postId];
-[self ac_pumpAutoLikeQueue];
-}
-- (void)ac_pumpAutoLikeQueue {
-if (self.isLikeSending || self.likeQueue.count == 0 || !self.autoLikeEnabled) return;
-NSString *postId = self.likeQueue.firstObject;
-[self.likeQueue removeObjectAtIndex:0];
-[self.likedPostIds addObject:postId];
-self.isLikeSending = YES;
-[self ac_triggerAutoLikeForPost:postId];
-}
-- (void)ac_triggerAutoLikeForPost:(NSString *)postId {
-@try {
-NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
-if (token.length == 0) {
-self.isLikeSending = NO;
-ACLog(@"[自动点赞] 跳过 %@：token 未捕获", postId);
-return;
-}
-NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/interaction/like/post"];
-NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-req.HTTPMethod = @"POST";
-[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-[req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
-[req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
-[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-[req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
-[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
-[req setValue:token forHTTPHeaderField:@"token"];
-[req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
-NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (ltsId.length < 140 && self.latestAppSession) {
-NSString *sessLts = ACHeaderValue(self.latestAppSession.configuration.HTTPAdditionalHeaders, @"X-Lts-Id");
-if (sessLts.length >= 140) ltsId = sessLts;
-}
-if (ltsId.length >= 140) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
-// 动态计算时间戳与请求号（与原生同构：毫秒 << 7 | 序号）
-uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
-static uint64_t acLikeReqSeq = 0;
-acLikeReqSeq = (acLikeReqSeq + 1) & 0x7F;
-[req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acLikeReqSeq] forHTTPHeaderField:@"X-Request-No"];
-NSData *body = [NSJSONSerialization dataWithJSONObject:@{@"postId": postId ?: @""} options:0 error:nil];
-if (!body) { self.isLikeSending = NO; return; }
-req.HTTPBody = body;
-[req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
-ACLog(@"[自动点赞] 发送 postId=%@ ltsLen=%lu", postId, (unsigned long)ltsId.length);
-acInternalRequest = YES;
-NSURLSession *acSession = self.latestAppSession ?: [NSURLSession sharedSession];
-NSURLSessionDataTask *t = [acSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-dispatch_async(dispatch_get_main_queue(), ^{
-ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-mgr.isLikeSending = NO;
-NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
-NSString *raw = data.length ? ([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"") : @"";
-NSDictionary *jd = ACSafeDict([NSJSONSerialization JSONObjectWithData:(data ?: [NSData data]) options:0 error:nil]);
-NSInteger code = jd ? [ACSafeStr(jd[@"code"]) integerValue] : 0;
-if (code == 200) {
-mgr.lastMomentLog = [NSString stringWithFormat:@"👍 已自动点赞：%@", postId];
-} else {
-mgr.lastMomentLog = [NSString stringWithFormat:@"⚠️ 自动点赞失败 HTTP %ld / code %ld %@", (long)status, (long)code,
-raw.length > 60 ? [raw substringToIndex:60] : raw];
-}
-ACLog(@"[自动点赞] 回调 %@ HTTP %ld code=%ld body=%@", postId, (long)status, (long)code, raw.length > 160 ? [raw substringToIndex:160] : raw);
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-// 节流处理，避免点赞过频触发安全限制
-NSTimeInterval delay = 2.0 + (arc4random_uniform(20) / 10.0);
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[mgr ac_pumpAutoLikeQueue];
-});
-});
-}];
-acInternalRequest = NO;
-[t resume];
-} @catch (NSException *e) {
-self.isLikeSending = NO;
-ACLog(@"[自动点赞] 异常 %@: %@", e.name, e.reason);
-}
-}
-#pragma mark - 语音打招呼 + 自动 1 秒挂断引擎
-- (void)batchVoiceGreetAndHangup:(NSArray<ACContactItem *> *)targets {
-if (targets.count == 0) return;
-__block NSInteger currentIndex = 0;
-__block void (^performCallNext)(void) = ^{
-if (currentIndex >= targets.count) {
-ACLog(@"[语音打招呼] 批量打招呼任务执行完成");
-return;
-}
-ACContactItem *target = targets[currentIndex];
-currentIndex++;
-// 尝试通过 TUICallKit 单例发起音频呼叫
-Class callKitCls = NSClassFromString(@"TUICallKit");
-if (callKitCls && [callKitCls respondsToSelector:@selector(createInstance)]) {
-id engine = ((id (*)(id, SEL))objc_msgSend)(callKitCls, @selector(createInstance));
-SEL callSel = NSSelectorFromString(@"call:type:");
-SEL hangupSel = NSSelectorFromString(@"hangup");
-if (engine && [engine respondsToSelector:callSel] && [engine respondsToSelector:hangupSel]) {
-ACLog(@"[语音打招呼] 正在向 %@ (%@) 发起语音打招呼...", target.name, target.targetId);
-// 1 = TUICallMediaTypeAudio（音频通话）
-((void (*)(id, SEL, id, NSInteger))objc_msgSend)(engine, callSel, target.targetId, 1);
-// 精确 1.0 秒后挂断
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-((void (*)(id, SEL))objc_msgSend)(engine, hangupSel);
-ACLog(@"[语音打招呼] 已自动挂断 %@ 的通话", target.targetId);
-// 等待 3.5-6 秒再拨下一个，防止信令风暴被服务器熔断
-NSTimeInterval interval = 3.5 + (arc4random_uniform(25) / 10.0);
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(interval * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-performCallNext();
-});
-});
-return;
-}
-}
-// 未能获取 CallEngine，跳过并继续下一位
-performCallNext();
-};
-performCallNext();
 }
 static NSInteger ACParseRetryMinutes(NSString *msg) {
 // 服务端文案：“发布过于频繁，请5分钟后再次尝试。#SVIP”
@@ -3239,10 +3084,7 @@ if (origHandler) origHandler(data, response, error);
 if (!error && data.length > 0) {
 @try {
 NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
-if (json) {
-[[ACForwardHelperManager shared] ac_handleFeedResponse:json];
-[[ACForwardHelperManager shared] ac_handleFeedResponseForAutoLike:json];
-}
+if (json) [[ACForwardHelperManager shared] ac_handleFeedResponse:json];
 } @catch (NSException *e) {
 ACLog(@"[自动评论] 响应解析异常 %@", e.reason);
 }
@@ -3453,18 +3295,6 @@ action:@selector(ac_openFromAbout)];
 btn.tintColor = [UIColor systemBlueColor];
 self.navigationItem.rightBarButtonItem = btn;
 }
-} else if ([clsName containsString:@"MeViewController"] ||
-[clsName containsString:@"Setting"] ||
-[clsName containsString:@"AccountSecurityViewController"]) {
-// 把“转发助手”入口融入“我的 / 设置”页右上角（保留 App 已有按钮，不覆盖）
-if (self.navigationItem && !self.navigationItem.rightBarButtonItem) {
-UIBarButtonItem *entryBtn = [[UIBarButtonItem alloc] initWithTitle:@"转发助手"
-style:UIBarButtonItemStyleDone
-target:self
-action:@selector(ac_launchForwardHelper)];
-entryBtn.tintColor = [UIColor systemBlueColor];
-self.navigationItem.rightBarButtonItem = entryBtn;
-}
 }
 if ([clsName containsString:@"ChatC2CViewController"]) {
 UIView *existingForceBtn = [self.view viewWithTag:665544];
@@ -3486,10 +3316,6 @@ forceBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
 %new
 - (void)ac_openFromAbout {
 __pendingForwardText = nil;
-ACPresentForwardAssistantFromTopVC();
-}
-%new
-- (void)ac_launchForwardHelper {
 ACPresentForwardAssistantFromTopVC();
 }
 %new
