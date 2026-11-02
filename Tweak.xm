@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <sqlite3.h>
+#import <string.h>
 #pragma mark - 0. 防闪退安全转换工具函数（彻底杜绝 NSNull 崩溃）
 static inline NSDictionary *ACSafeDict(id obj) {
 if (obj && [obj isKindOfClass:[NSDictionary class]]) {
@@ -317,6 +318,7 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, assign) NSTimeInterval autoLikeEnabledAt;
 // —— 批量语音打招呼（TUICallKit/TUICallEngine，默认 1 秒自动挂断）——
 @property (nonatomic, assign) BOOL voiceCallRunning;
+@property (nonatomic, assign) BOOL welcomeVoiceCalling;
 @property (nonatomic, assign) float voiceHangupSeconds;
 // —— 自动点赞后台巡检（独立 Session 主动拉取，无需用户浏览信息流）——
 @property (nonatomic, strong) NSTimer *autoLikePollTimer;
@@ -331,6 +333,9 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, copy) NSString *manualTargetGroupId;
 @property (nonatomic, assign) NSTimeInterval latestLtsAt;
 @property (nonatomic, assign) BOOL momentRetryScheduled;
+@property (nonatomic, assign) BOOL momentNativeBridgeDisabled;
+// —— 自动记录 App 实际使用的业务域名（.cn / .cc / .ltd），避免写死域名导致 500 ——
+@property (nonatomic, copy) NSString *lastAirchatHost;
 + (instancetype)shared;
 // 四槽位独立媒体管理 API（0:群发, 1:迎新, 2:自动回复, 3:发动态）
 - (NSInteger)mediaTypeForSlot:(ACMediaSlot)slot; // 0:无, 1:图片, 2:视频
@@ -374,6 +379,8 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)restartMomentScheduler;
 - (void)onMomentTimerTick;
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion;
+- (BOOL)ac_tryNativeMomentPublish:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion;
+- (void)triggerSingleVoiceCallForTarget:(NSString *)uid nick:(NSString *)nick completion:(void(^)(void))completion;
 // v2.1 新增：统一消息入口（TIM 监听代理与直接监听共用）、发动态节流/重试
 - (void)ac_handleIncomingMessage:(id)msg;
 - (void)ac_handleMembersJoined:(NSArray *)memberList groupID:(NSString *)groupID;
@@ -1071,7 +1078,7 @@ req.HTTPMethod = @"POST";
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
 if (ltsId.length >= 140) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
@@ -1193,7 +1200,7 @@ req.HTTPMethod = @"POST";
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
 if (ltsId.length >= 140) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
@@ -1387,6 +1394,67 @@ if (nextCall) nextCall();
 nextCall = nextImpl;
 nextCall();
 }
+// 单人语音打招呼：发起 1 秒振铃后自动挂断，完成后回调（供迎新链路复用）
+- (void)triggerSingleVoiceCallForTarget:(NSString *)uid nick:(NSString *)nick completion:(void(^)(void))completion {
+if (uid.length < 5) { if (completion) completion(); return; }
+@try {
+id engine = nil;
+Class engineCls = NSClassFromString(@"TUICallEngine");
+if (engineCls && [engineCls respondsToSelector:@selector(createInstance)]) {
+engine = ((id (*)(id, SEL))objc_msgSend)(engineCls, @selector(createInstance));
+}
+if (!engine) {
+Class kitCls = NSClassFromString(@"TUICallKit");
+if (kitCls && [kitCls respondsToSelector:@selector(createInstance)]) {
+engine = ((id (*)(id, SEL))objc_msgSend)(kitCls, @selector(createInstance));
+}
+}
+SEL callEngineSel = NSSelectorFromString(@"call:callMediaType:params:succ:fail:");
+SEL callKitSel = NSSelectorFromString(@"call:type:");
+SEL callPlainSel = NSSelectorFromString(@"call:");
+BOOL called = NO;
+// 呼叫发起前就置位，确保 TUICall 同步弹出呼叫 VC 时能被 presentViewController 钩子压制
+self.welcomeVoiceCalling = YES;
+if (engine && [engine respondsToSelector:callEngineSel]) {
+((void (*)(id, SEL, NSString *, NSInteger, id, id, id))objc_msgSend)(engine, callEngineSel, uid, 1, nil, nil, nil);
+called = YES;
+} else if (engine && [engine respondsToSelector:callKitSel]) {
+((void (*)(id, SEL, NSString *, NSInteger))objc_msgSend)(engine, callKitSel, uid, 1);
+called = YES;
+} else if (engine && [engine respondsToSelector:callPlainSel]) {
+((void (*)(id, SEL, NSString *))objc_msgSend)(engine, callPlainSel, uid);
+called = YES;
+}
+if (!called) {
+self.welcomeVoiceCalling = NO;
+ACLog(@"[迎新语音] 未找到可用的呼叫实例，跳过 %@", uid);
+if (completion) completion();
+return;
+}
+float hangupSec = (self.voiceHangupSeconds >= 0.3f && self.voiceHangupSeconds <= 15.0f) ? self.voiceHangupSeconds : 1.0f;
+ACLog(@"[迎新语音] 已向 %@ (%@) 发起语音振铃，%.1f 秒后自动挂断", nick ?: uid, uid, hangupSec);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(hangupSec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+@try {
+SEL hangupEngineSel = NSSelectorFromString(@"hangup:fail:");
+SEL hangupSel = NSSelectorFromString(@"hangup");
+if ([engine respondsToSelector:hangupEngineSel]) {
+((void (*)(id, SEL, id, id))objc_msgSend)(engine, hangupEngineSel, nil, nil);
+} else if ([engine respondsToSelector:hangupSel]) {
+((void (*)(id, SEL))objc_msgSend)(engine, hangupSel);
+}
+} @catch (NSException *e) {
+ACLog(@"[迎新语音] 挂断异常 %@", e.reason);
+}
+self.welcomeVoiceCalling = NO;
+ACLog(@"[迎新语音] 已自动挂断 %@", uid);
+if (completion) completion();
+});
+} @catch (NSException *e) {
+self.welcomeVoiceCalling = NO;
+ACLog(@"[迎新语音] 发起异常 %@", e.reason);
+if (completion) completion();
+}
+}
 #pragma mark - 后台静音保活（内存生成 WAV，不依赖任何资源文件）
 - (void)ac_applyKeepAliveState {
 dispatch_async(dispatch_get_main_queue(), ^{
@@ -1442,6 +1510,82 @@ if (start >= end) return 5;
 NSInteger v = [[msg substringWithRange:NSMakeRange((NSUInteger)start, (NSUInteger)(end - start))] integerValue];
 return (v > 0 && v <= 720) ? v : 5;
 }
+// 优先桥接 App 原生发布业务类：由 App 自己组装 channel / 签名 / X-Lts-Id，避免 code:500
+- (BOOL)ac_tryNativeMomentPublish:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
+if (self.momentNativeBridgeDisabled) return NO;
+Class cls = NSClassFromString(@"AirMomentBussinessCenter");
+if (!cls) cls = NSClassFromString(@"airchat.AirMomentBussinessCenter");
+if (!cls) cls = NSClassFromString(@"AirChat.AirMomentBussinessCenter");
+if (!cls) cls = NSClassFromString(@"AirMomentPublishViewController");
+if (!cls) cls = NSClassFromString(@"airchat.AirMomentPublishViewController");
+if (!cls) cls = NSClassFromString(@"AirChat.AirMomentPublishViewController");
+if (!cls) {
+ACLog(@"[发布] 未找到 App 原生发布类，走 HTTP 兜底");
+return NO;
+}
+SEL sel = NSSelectorFromString(@"publishMomentWithContent:mediaList:permission:completion:");
+if (![cls respondsToSelector:sel]) {
+ACLog(@"[发布] %@ 无原生发布方法，走 HTTP 兜底", NSStringFromClass(cls));
+self.momentNativeBridgeDisabled = YES;
+return NO;
+}
+NSMethodSignature *sig = [cls methodSignatureForSelector:sel];
+if (!sig || [sig numberOfArguments] != 6) {
+ACLog(@"[发布] 原生发布方法签名不匹配(%lu)，走 HTTP 兜底", (unsigned long)(sig ? [sig numberOfArguments] : 0));
+self.momentNativeBridgeDisabled = YES;
+return NO;
+}
+// 严格校验参数类型：content/mediaList 必须是对象，permission 必须是整数，completion 必须是 block
+const char *t2 = [sig getArgumentTypeAtIndex:2];
+const char *t3 = [sig getArgumentTypeAtIndex:3];
+const char *t4 = [sig getArgumentTypeAtIndex:4];
+const char *t5 = [sig getArgumentTypeAtIndex:5];
+if (!t2 || !t3 || !t4 || !t5 || t2[0] != '@' || t3[0] != '@' ||
+strchr("qQil", t4[0]) == NULL || t5[0] != '@') {
+ACLog(@"[发布] 原生发布参数类型不符，走 HTTP 兜底");
+self.momentNativeBridgeDisabled = YES;
+return NO;
+}
+id media = ACJSONSafeObject(task.capturedMediaList, 0) ?: @[];
+__block BOOL finished = NO;
+void (^cb)(BOOL, id) = ^(BOOL success, id resObj) {
+dispatch_async(dispatch_get_main_queue(), ^{
+if (finished) return;
+finished = YES;
+self.momentPublishing = NO;
+if (success) {
+task.sentCount++;
+self.lastMomentLog = [NSString stringWithFormat:@"✅ 原生动态发布成功 | 累计%ld次", (long)task.sentCount];
+[self saveAllCustomSettings];
+ACLog(@"[发布] 原生桥接成功 sentCount=%ld", (long)task.sentCount);
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(YES, self.lastMomentLog);
+} else {
+ACLog(@"[发布] 原生桥接失败 resp=%@，切换 HTTP 兜底", resObj);
+self.momentNativeBridgeDisabled = YES;
+[self publishMomentTask:task completion:completion];
+}
+});
+};
+ACLog(@"[发布] 尝试 App 原生桥接：%@ %@", NSStringFromClass(cls), NSStringFromSelector(sel));
+@try {
+((void (*)(id, SEL, id, id, NSInteger, id))objc_msgSend)((id)cls, sel, task.contentText ?: @"", media, (NSInteger)1, cb);
+} @catch (NSException *e) {
+ACLog(@"[发布] 原生桥接调用异常 %@", e.reason);
+self.momentNativeBridgeDisabled = YES;
+return NO;
+}
+// 25 秒看门狗：原生迟迟不回调就回落 HTTP，避免一直卡在发布中
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+if (finished) return;
+finished = YES;
+self.momentPublishing = NO;
+self.momentNativeBridgeDisabled = YES;
+ACLog(@"[发布] 原生桥接 25 秒未回调，回落 HTTP");
+[self publishMomentTask:task completion:completion];
+});
+return YES;
+}
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
 ACLog(@"[发布] 入口 task=%@ textLen=%lu token=%lu lts=%lu publishing=%d",
 task ? @"有" : @"无", (unsigned long)task.contentText.length,
@@ -1466,6 +1610,12 @@ self.lastMomentLog = @"⏳ 上一条动态仍在发布中，请稍后再试";
 if (completion) completion(NO, self.lastMomentLog);
 return;
 }
+// ① 优先走 App 原生发布（自动带全签名/环境头，规避 code:500）
+self.momentPublishing = YES;
+self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
+if ([self ac_tryNativeMomentPublish:task completion:completion]) return;
+self.momentPublishing = NO;
+ACLog(@"[发布] 原生桥接不可用，使用 HTTP 兜底");
 // 修复：token 大小写无关，并允许等待 App 后续请求把 token 捕获进来
 NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
 if (token.length == 0) {
@@ -1495,7 +1645,8 @@ return;
 acInternalRequest = NO;
 self.momentPublishing = YES;
 self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/app/publish"];
+NSString *acPubHost = self.lastAirchatHost.length > 0 ? self.lastAirchatHost : @"apiv1.airchat.cn";
+NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/publish", acPubHost]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
 // 修复：Accept 必须是 *／*（通配符；注意注释里不要写半角星号+斜杠+星号，否则会被 Logos 当成块注释吞掉后续代码）；UA 必须固定为 App 原生 UA。
@@ -1510,7 +1661,7 @@ req.HTTPMethod = @"POST";
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
 // X-Lts-Id 优先取最近一次“原生发布动态”请求的模板；全局池只接受合法长格式
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
@@ -1689,27 +1840,40 @@ __weak typeof(self) weakSelf = self;
 __block void (^greetNext)(void) = ^{
 if (idx >= newTargetsToGreet.count) return;
 ACContactItem *newMember = newTargetsToGreet[idx];
-NSString *templateText = weakSelf.welcomeMessageText ?: @"";
+ACForwardHelperManager *m = weakSelf;
+if (!m) return;
+// ① 先语音打招呼：发起振铃并在 voiceHangupSeconds 后自动挂断
+[m triggerSingleVoiceCallForTarget:newMember.targetId nick:newMember.name completion:^{
+ACForwardHelperManager *m2 = weakSelf;
+if (!m2) return;
+m2.greetedCount++;
+m2.lastGreetLog = [NSString stringWithFormat:@"📞 已对新成员 [%@] 执行 %.1f 秒语音打招呼 (累计%ld人)",
+newMember.name, (m2.voiceHangupSeconds >= 0.3f ? m2.voiceHangupSeconds : 1.0f), (long)m2.greetedCount];
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+// ② 若配置了欢迎文案，语音后再补一条文字/机器人消息
+NSString *templateText = m2.welcomeMessageText ?: @"";
+if (templateText.length > 0) {
 NSString *displayNick = (newMember.name && ![newMember.name hasPrefix:@"群友_"]) ? newMember.name : @"新朋友";
 NSString *finalGreeting = [templateText stringByReplacingOccurrencesOfString:@"{name}" withString:displayNick];
-// 迎新只使用槽位1（ACMediaSlotWelcome）的专属图片或视频，绝不跟群发或自动回复混用
-[weakSelf sendText:finalGreeting mediaSlot:ACMediaSlotWelcome attachMedia:YES toItem:newMember completion:^(BOOL ok, NSString *detail) {
+[m2 sendText:finalGreeting mediaSlot:ACMediaSlotWelcome attachMedia:YES toItem:newMember asRobot:m2.robotModeEnabled completion:^(BOOL ok, NSString *detail) {
 if (ok) {
-weakSelf.greetedCount++;
-weakSelf.lastGreetLog = [NSString stringWithFormat:@"✅ 已安全迎新(%@): %@ (共%ld人)", detail, newMember.name, (long)weakSelf.greetedCount];
+m2.lastGreetLog = [NSString stringWithFormat:@"✅ 语音+文字迎新 [%@]: %@ (共%ld人)", newMember.name, detail, (long)m2.greetedCount];
 } else {
-weakSelf.lastGreetLog = [NSString stringWithFormat:@"⚠️ 迎新 %@: %@", newMember.name, detail];
+m2.lastGreetLog = [NSString stringWithFormat:@"⚠️ 语音已拨，文字迎新 %@: %@", newMember.name, detail];
 }
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+}];
+}
 idx++;
-NSTimeInterval safeRandomDelay = 8.0 + (arc4random_uniform(71) / 10.0);
+// 每次间隔 3~5 秒，避免连续呼叫被风控
+NSTimeInterval safeRandomDelay = 3.0 + (arc4random_uniform(21) / 10.0);
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(safeRandomDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 greetNext();
 });
 }];
 };
-NSTimeInterval initialDelay = 8.0 + (arc4random_uniform(71) / 10.0);
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(initialDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+// 首位新成员延迟 2 秒后发起语音呼叫
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 greetNext();
 });
 }
@@ -2100,8 +2264,9 @@ ACLog(@"[群聊] 未捕获 token，跳过云端群列表");
 if (completion) completion(0);
 return;
 }
+NSString *acGroupHost = self.lastAirchatHost.length > 0 ? self.lastAirchatHost : @"apiv1.airchat.cn";
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
-[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/group/myJoinGroupPage?current=1&searchKey=&size=9999"]];
+[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/group/myJoinGroupPage?current=1&searchKey=&size=9999", acGroupHost]]];
 req.HTTPMethod = @"GET";
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
@@ -2172,7 +2337,8 @@ if (progressBlock) progressBlock([NSString stringWithFormat:@"⏳ 正在采集�
 return;
 }
 if (progressBlock) progressBlock(@"🔍 正在解析群号...");
-NSString *path = [NSString stringWithFormat:@"https://apiv1.airchat.cc/client/biz/group/get/by/number?number=%@&groupNumber=%@", num, num];
+NSString *acNumHost = self.lastAirchatHost.length > 0 ? self.lastAirchatHost : @"apiv1.airchat.cn";
+NSString *path = [NSString stringWithFormat:@"https://%@/client/biz/group/get/by/number?number=%@&groupNumber=%@", acNumHost, num, num];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:path]];
 req.HTTPMethod = @"GET";
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
@@ -3778,6 +3944,8 @@ BOOL acIsAirChatHost = ([urlStr containsString:@"airchat.cc"] || [urlStr contain
 if (!acInternalRequest && acIsAirChatHost && request.allHTTPHeaderFields) {
 NSDictionary *headers = request.allHTTPHeaderFields;
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+// 记录 App 实际业务域名（.cn/.cc/.ltd），发布/群列表请求优先复用它
+if (request.URL.host.length > 0) mgr.lastAirchatHost = request.URL.host;
 // 原生发布请求：整份 Header 作为模板保存（UA/Accept/X-Lts-Id 都与该接口匹配）
 if ([urlStr containsString:@"/post/app/publish"]) {
 mgr.lastPublishHeaders = [headers mutableCopy];
@@ -4030,6 +4198,21 @@ ACPresentForwardAssistantFromTopVC();
 }
 %end
 %hook UIViewController
+// 迎新/批量语音打招呼期间，压制 TUICall 前台呼叫弹窗，避免打断用户操作
+- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)animated completion:(void (^)(void))completion {
+@try {
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+if (mgr && (mgr.voiceCallRunning || mgr.welcomeVoiceCalling)) {
+NSString *vcName = NSStringFromClass([viewControllerToPresent class]);
+if ([vcName containsString:@"TUICall"] || [vcName containsString:@"CallViewController"] || [vcName containsString:@"CallView"]) {
+ACLog(@"[语音打招呼] 已压制呼叫弹窗 %@", vcName);
+if (completion) completion();
+return;
+}
+}
+} @catch (NSException *e) {}
+%orig;
+}
 - (void)viewDidAppear:(BOOL)animated {
 %orig;
 @try {
