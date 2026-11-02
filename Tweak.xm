@@ -286,6 +286,21 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, assign) BOOL autoCommentSending;
 @property (nonatomic, assign) NSTimeInterval momentPublishingSince;
 @property (nonatomic, assign) NSTimeInterval autoCommentEnabledAt;
+// —— 自动点赞（信息流出现新动态即点赞，复用已有信息流响应）——
+@property (nonatomic, assign) BOOL autoLikeEnabled;
+@property (nonatomic, strong) NSMutableSet<NSString *> *likedPostIds;
+@property (nonatomic, strong) NSMutableArray<NSString *> *likeQueue;
+@property (nonatomic, assign) BOOL isLikeSending;
+@property (nonatomic, assign) BOOL autoLikeSeeded;
+@property (nonatomic, assign) NSTimeInterval autoLikeEnabledAt;
+// —— 批量语音打招呼（TUICallKit/TUICallEngine，1 秒自动挂断）——
+@property (nonatomic, assign) BOOL voiceCallRunning;
+// —— 后台静音保活（内存生成 WAV，不依赖资源文件）——
+@property (nonatomic, assign) BOOL keepAliveEnabled;
+@property (nonatomic, strong) AVAudioPlayer *keepAlivePlayer;
+// —— 群机器人伪装（cloudCustomData + 文案前缀）——
+@property (nonatomic, assign) BOOL robotModeEnabled;
+@property (nonatomic, copy) NSString *robotDisplayName;
 @property (nonatomic, weak) NSURLSession *latestAppSession;
 @property (nonatomic, assign) NSTimeInterval latestLtsAt;
 @property (nonatomic, assign) BOOL momentRetryScheduled;
@@ -336,6 +351,16 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_enqueueAutoCommentForPostId:(NSString *)postId;
 - (void)ac_pumpAutoCommentQueue;
 - (void)ac_commentPostId:(NSString *)postId text:(NSString *)text;
+// —— 自动点赞 ——
+- (void)ac_handleFeedResponseForAutoLike:(NSDictionary *)json;
+- (void)ac_enqueueAutoLikeForPostId:(NSString *)postId;
+- (void)ac_pumpAutoLikeQueue;
+- (void)ac_triggerAutoLikeForPost:(NSString *)postId;
+// —— 批量语音打招呼 + 1 秒挂断 ——
+- (void)ac_startBatchVoiceCall:(NSArray<ACContactItem *> *)targets;
+- (void)ac_stopBatchVoiceCall;
+// —— 后台静音保活 ——
+- (void)ac_applyKeepAliveState;
 @end
 @implementation ACForwardHelperManager
 + (instancetype)shared {
@@ -367,9 +392,13 @@ instance.autoCommentText = @"不错";
 instance.autoCommentSeenIds = [NSMutableSet set];
 instance.autoCommentQueue = [NSMutableArray array];
 instance.autoCommentSeeded = NO;
+instance.likedPostIds = [NSMutableSet set];
+instance.likeQueue = [NSMutableArray array];
+instance.robotDisplayName = @"群管机器人";
 [instance loadLocalPermanentCache];
 [instance loadAllCustomSettings];
 [instance restartMomentScheduler];
+[instance ac_applyKeepAliveState];
 });
 return instance;
 }
@@ -524,6 +553,10 @@ for (ACAutoReplyRule *r in self.autoReplyRules) {
 [ud setInteger:MAX(1, self.momentIntervalMinutes) forKey:@"AC_AutoMoment_Interval"];
 [ud setBool:self.autoCommentEnabled forKey:@"AC_AutoComment_Enabled"];
 [ud setObject:(self.autoCommentText ?: @"不错") forKey:@"AC_AutoComment_Text"];
+[ud setBool:self.autoLikeEnabled forKey:@"AC_AutoLike_Enabled"];
+[ud setBool:self.keepAliveEnabled forKey:@"AC_KeepAlive_Enabled"];
+[ud setBool:self.robotModeEnabled forKey:@"AC_RobotMode_Enabled"];
+[ud setObject:(self.robotDisplayName ?: @"群管机器人") forKey:@"AC_Robot_Name"];
 NSArray *seenArr = [[self.autoCommentSeenIds allObjects] sortedArrayUsingSelector:@selector(compare:)];
 if (seenArr.count > 1500) seenArr = [seenArr subarrayWithRange:NSMakeRange(seenArr.count - 1500, 1500)];
 [ud setObject:seenArr forKey:@"AC_AutoComment_Seen"];
@@ -555,6 +588,13 @@ self.capturedClientTypeV2 = savedV2;
 self.autoCommentEnabled = [ud boolForKey:@"AC_AutoComment_Enabled"];
 NSString *savedComment = ACSafeStr([ud objectForKey:@"AC_AutoComment_Text"]);
 self.autoCommentText = savedComment.length > 0 ? savedComment : @"不错";
+self.autoLikeEnabled = [ud boolForKey:@"AC_AutoLike_Enabled"];
+// 重启后开启自动点赞时，以当前时间作为“只赞新动态”的起点，避免把历史动态刷一遍
+if (self.autoLikeEnabled) self.autoLikeEnabledAt = [[NSDate date] timeIntervalSince1970];
+self.keepAliveEnabled = [ud boolForKey:@"AC_KeepAlive_Enabled"];
+self.robotModeEnabled = [ud boolForKey:@"AC_RobotMode_Enabled"];
+NSString *savedRobotName = ACSafeStr([ud objectForKey:@"AC_Robot_Name"]);
+self.robotDisplayName = savedRobotName.length > 0 ? savedRobotName : @"群管机器人";
 NSArray *savedSeen = ACSafeArray([ud objectForKey:@"AC_AutoComment_Seen"]);
 if (savedSeen.count > 0) {
 for (id v in savedSeen) { NSString *sid = ACSafeStr(v); if (sid.length > 3) [self.autoCommentSeenIds addObject:sid]; }
@@ -1041,6 +1081,273 @@ acInternalRequest = NO;
 self.autoCommentSending = NO;
 ACLog(@"[自动评论] 异常 %@: %@", e.name, e.reason);
 }
+}
+#pragma mark - 自动点赞引擎（复用信息流响应，不重复安装网络钩子）
+- (void)ac_handleFeedResponseForAutoLike:(NSDictionary *)json {
+@try {
+if (!self.autoLikeEnabled) return;
+NSDictionary *data = ACSafeDict(json[@"data"]);
+NSArray *records = ACSafeArray(data[@"records"]);
+if (records.count == 0) return;
+if (self.autoLikeEnabledAt <= 0) self.autoLikeEnabledAt = [[NSDate date] timeIntervalSince1970];
+NSDateFormatter *df = [[NSDateFormatter alloc] init];
+df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+NSMutableArray *fresh = [NSMutableArray array];
+for (NSDictionary *rec in records) {
+if (![rec isKindOfClass:[NSDictionary class]]) continue;
+NSString *pid = ACSafeStr(rec[@"id"]);
+NSString *uid = ACSafeStr(rec[@"userId"]);
+if (pid.length < 6) continue;
+if (uid.length > 3 && [uid isEqualToString:self.selfUserId]) continue; // 自己的动态不点赞
+if ([self.likedPostIds containsObject:pid] || [self.likeQueue containsObject:pid]) continue;
+NSTimeInterval ct = 0;
+NSDate *created = [df dateFromString:ACSafeStr(rec[@"createTime"])];
+if (created) ct = [created timeIntervalSince1970];
+if (!self.autoLikeSeeded) {
+// 刚开启功能：只点赞“开启之后”的新动态，避免把历史动态全部刷一遍
+if (ct >= self.autoLikeEnabledAt - 5.0) [fresh addObject:pid];
+continue;
+}
+[fresh addObject:pid];
+}
+if (!self.autoLikeSeeded) {
+self.autoLikeSeeded = YES;
+ACLog(@"[自动点赞] 首次信息流播种完成，本次新动态 %lu 条", (unsigned long)fresh.count);
+}
+for (NSString *pid in [[fresh reverseObjectEnumerator] allObjects]) {
+[self ac_enqueueAutoLikeForPostId:pid];
+}
+} @catch (NSException *e) {
+ACLog(@"[自动点赞] 解析信息流异常 %@: %@", e.name, e.reason);
+}
+}
+- (void)ac_enqueueAutoLikeForPostId:(NSString *)postId {
+if (!self.autoLikeEnabled || postId.length < 6) return;
+if (!self.likedPostIds) self.likedPostIds = [NSMutableSet set];
+if (!self.likeQueue) self.likeQueue = [NSMutableArray array];
+if ([self.likedPostIds containsObject:postId] || [self.likeQueue containsObject:postId]) return;
+[self.likeQueue addObject:postId];
+[self ac_pumpAutoLikeQueue];
+}
+- (void)ac_pumpAutoLikeQueue {
+if (self.isLikeSending || self.likeQueue.count == 0) return;
+if (!self.autoLikeEnabled) { [self.likeQueue removeAllObjects]; return; }
+NSString *pid = self.likeQueue.firstObject;
+[self.likeQueue removeObjectAtIndex:0];
+[self.likedPostIds addObject:pid];
+self.isLikeSending = YES;
+[self ac_triggerAutoLikeForPost:pid];
+}
+- (void)ac_triggerAutoLikeForPost:(NSString *)postId {
+@try {
+NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
+if (token.length == 0) {
+self.isLikeSending = NO;
+ACLog(@"[自动点赞] 跳过 %@：token 未捕获", postId);
+return;
+}
+NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/interaction/like/post"];
+NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+req.HTTPMethod = @"POST";
+[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+[req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
+[req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
+[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+[req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
+[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
+[req setValue:token forHTTPHeaderField:@"token"];
+[req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios") forHTTPHeaderField:@"channel"];
+NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
+if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+if (ltsId.length < 140 && self.latestAppSession) {
+NSString *sessLts = ACHeaderValue(self.latestAppSession.configuration.HTTPAdditionalHeaders, @"X-Lts-Id");
+if (sessLts.length >= 140) ltsId = sessLts;
+}
+if (ltsId.length >= 140) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+static uint64_t acLikeSeq = 0;
+acLikeSeq = (acLikeSeq + 1) & 0x7F;
+[req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acLikeSeq] forHTTPHeaderField:@"X-Request-No"];
+NSDictionary *bodyDict = @{@"postId": postId ?: @"", @"id": postId ?: @"", @"likeStatus": @(1), @"type": @(1)};
+NSData *body = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
+if (!body) { self.isLikeSending = NO; return; }
+req.HTTPBody = body;
+[req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
+ACLog(@"[自动点赞] 发送 postId=%@ ltsLen=%lu", postId, (unsigned long)ltsId.length);
+acInternalRequest = YES;
+NSURLSession *acSession = self.latestAppSession ?: [NSURLSession sharedSession];
+NSURLSessionDataTask *t = [acSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+dispatch_async(dispatch_get_main_queue(), ^{
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.isLikeSending = NO;
+NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+NSString *raw = data.length ? ([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"") : @"";
+NSDictionary *jd = ACSafeDict([NSJSONSerialization JSONObjectWithData:(data ?: [NSData data]) options:0 error:nil]);
+NSInteger code = jd ? [ACSafeStr(jd[@"code"]) integerValue] : 0;
+if (code == 200) {
+mgr.lastMomentLog = [NSString stringWithFormat:@"👍 已自动点赞：%@", postId];
+} else {
+mgr.lastMomentLog = [NSString stringWithFormat:@"⚠️ 自动点赞失败 HTTP %ld / code %ld %@", (long)status, (long)code,
+raw.length > 60 ? [raw substringToIndex:60] : raw];
+}
+ACLog(@"[自动点赞] 回调 %@ HTTP %ld code=%ld body=%@", postId, (long)status, (long)code, raw.length > 160 ? [raw substringToIndex:160] : raw);
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+// 节流：2-4 秒后处理下一条，避免点赞过频触发风控
+NSTimeInterval delay = 2.0 + (arc4random_uniform(21) / 10.0);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[mgr ac_pumpAutoLikeQueue];
+});
+});
+}];
+acInternalRequest = NO;
+[t resume];
+} @catch (NSException *e) {
+self.isLikeSending = NO;
+ACLog(@"[自动点赞] 异常 %@: %@", e.name, e.reason);
+}
+}
+#pragma mark - 批量语音打招呼（优先进 TUICallEngine/TUICallKit，1 秒自动挂断）
+- (void)ac_stopBatchVoiceCall {
+if (!self.voiceCallRunning) return;
+self.voiceCallRunning = NO;
+ACLog(@"[语音打招呼] 已手动停止批量任务");
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+}
+- (void)ac_startBatchVoiceCall:(NSArray<ACContactItem *> *)targets {
+if (self.voiceCallRunning) {
+[self ac_stopBatchVoiceCall];
+return;
+}
+if (targets.count == 0) {
+ACLog(@"[语音打招呼] 目标为空，请先勾选群成员");
+return;
+}
+self.voiceCallRunning = YES;
+ACLog(@"[语音打招呼] 启动批量任务，目标 %lu 人（1.0 秒强制挂断）", (unsigned long)targets.count);
+__weak typeof(self) weakSelf = self;
+__block NSInteger currentIndex = 0;
+__block void (^nextCall)(void) = nil;
+void (^nextImpl)(void) = ^{
+ACForwardHelperManager *mgr = weakSelf;
+if (!mgr || !mgr.voiceCallRunning) { nextCall = nil; return; }
+if (currentIndex >= targets.count) {
+mgr.voiceCallRunning = NO;
+ACLog(@"[语音打招呼] 批量任务全部执行完毕");
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+nextCall = nil;
+return;
+}
+ACContactItem *target = targets[currentIndex];
+currentIndex++;
+NSString *uid = target.targetId;
+if (uid.length < 5) {
+nextCall();
+return;
+}
+// 依次尝试腾讯云呼叫组件：TUICallEngine 单例优先，TUICallKit 兜底
+id engine = nil;
+Class engineCls = NSClassFromString(@"TUICallEngine");
+if (engineCls && [engineCls respondsToSelector:@selector(createInstance)]) {
+engine = ((id (*)(id, SEL))objc_msgSend)(engineCls, @selector(createInstance));
+}
+if (!engine) {
+Class kitCls = NSClassFromString(@"TUICallKit");
+if (kitCls && [kitCls respondsToSelector:@selector(createInstance)]) {
+engine = ((id (*)(id, SEL))objc_msgSend)(kitCls, @selector(createInstance));
+}
+}
+SEL callEngineSel = NSSelectorFromString(@"call:callMediaType:params:succ:fail:");
+SEL callKitSel = NSSelectorFromString(@"call:type:");
+SEL callPlainSel = NSSelectorFromString(@"call:");
+BOOL called = NO;
+@try {
+if (engine && [engine respondsToSelector:callEngineSel]) {
+((void (*)(id, SEL, NSString *, NSInteger, id, id, id))objc_msgSend)(engine, callEngineSel, uid, 1, nil, nil, nil);
+called = YES;
+} else if (engine && [engine respondsToSelector:callKitSel]) {
+((void (*)(id, SEL, NSString *, NSInteger))objc_msgSend)(engine, callKitSel, uid, 1);
+called = YES;
+} else if (engine && [engine respondsToSelector:callPlainSel]) {
+((void (*)(id, SEL, NSString *))objc_msgSend)(engine, callPlainSel, uid);
+called = YES;
+}
+} @catch (NSException *e) {
+ACLog(@"[语音打招呼] 发起呼叫异常 %@", e.reason);
+}
+if (!called) {
+ACLog(@"[语音打招呼] 未找到可用的腾讯云呼叫实例，任务终止");
+mgr.voiceCallRunning = NO;
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+nextCall = nil;
+return;
+}
+ACLog(@"[语音打招呼] 已向 %@ (%@) 发起语音振铃", target.name ?: uid, uid);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+ACForwardHelperManager *m2 = weakSelf;
+if (!m2) return;
+@try {
+SEL hangupEngineSel = NSSelectorFromString(@"hangup:fail:");
+SEL hangupSel = NSSelectorFromString(@"hangup");
+if ([engine respondsToSelector:hangupEngineSel]) {
+((void (*)(id, SEL, id, id))objc_msgSend)(engine, hangupEngineSel, nil, nil);
+} else if ([engine respondsToSelector:hangupSel]) {
+((void (*)(id, SEL))objc_msgSend)(engine, hangupSel);
+}
+} @catch (NSException *e) {
+ACLog(@"[语音打招呼] 挂断异常 %@", e.reason);
+}
+ACLog(@"[语音打招呼] 已自动挂断 %@", uid);
+// 间隔 3.5-6 秒再拨下一位，避免信令风暴
+NSTimeInterval gap = 3.5 + (arc4random_uniform(26) / 10.0);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gap * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+if (nextCall) nextCall();
+});
+});
+};
+nextCall = nextImpl;
+nextCall();
+}
+#pragma mark - 后台静音保活（内存生成 WAV，不依赖任何资源文件）
+- (void)ac_applyKeepAliveState {
+dispatch_async(dispatch_get_main_queue(), ^{
+if (!self.keepAliveEnabled) {
+if (self.keepAlivePlayer.isPlaying) [self.keepAlivePlayer stop];
+self.keepAlivePlayer = nil;
+return;
+}
+if (self.keepAlivePlayer.isPlaying) return;
+@try {
+uint32_t sampleRate = 44100;
+uint32_t numSamples = sampleRate * 2;
+uint32_t dataSize = numSamples * 2;
+uint32_t totalSize = 36 + dataSize;
+NSMutableData *wav = [NSMutableData dataWithCapacity:totalSize + 8];
+[wav appendBytes:"RIFF" length:4];
+[wav appendBytes:&totalSize length:4];
+[wav appendBytes:"WAVEfmt " length:8];
+uint32_t fsize = 16; [wav appendBytes:&fsize length:4];
+uint16_t fmt = 1; [wav appendBytes:&fmt length:2];
+uint16_t ch = 1; [wav appendBytes:&ch length:2];
+[wav appendBytes:&sampleRate length:4];
+uint32_t br = sampleRate * 2; [wav appendBytes:&br length:4];
+uint16_t ba = 2; [wav appendBytes:&ba length:2];
+uint16_t bps = 16; [wav appendBytes:&bps length:2];
+[wav appendBytes:"data" length:4];
+[wav appendBytes:&dataSize length:4];
+[wav increaseLengthBy:dataSize];
+[[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
+[[AVAudioSession sharedInstance] setActive:YES error:nil];
+self.keepAlivePlayer = [[AVAudioPlayer alloc] initWithData:wav error:nil];
+self.keepAlivePlayer.numberOfLoops = -1;
+self.keepAlivePlayer.volume = 0.01;
+[self.keepAlivePlayer play];
+ACLog(@"[保活] 静音后台音频已启动");
+} @catch (NSException *e) {
+ACLog(@"[保活] 启动异常 %@", e.reason);
+}
+});
 }
 static NSInteger ACParseRetryMinutes(NSString *msg) {
 // 服务端文案：“发布过于频繁，请5分钟后再次尝试。#SVIP”
@@ -1892,7 +2199,18 @@ return;
 }
 // cloudCustomData 为可选字段，任何异常都不能影响发送
 @try {
-if (self.capturedCloudCustomData) {
+if (self.robotModeEnabled) {
+// 机器人伪装：走扩展字段而不是改账号身份，风险更低
+NSDictionary *robotJson = @{
+@"isRobot": @(1),
+@"isGroupRobot": @YES,
+@"robotName": self.robotDisplayName.length > 0 ? self.robotDisplayName : @"群管机器人",
+@"role": @"system_robot",
+@"client_type": @"iOS"
+};
+NSData *robotData = [NSJSONSerialization dataWithJSONObject:robotJson options:0 error:nil];
+if (robotData) [v2Msg setValue:robotData forKey:@"cloudCustomData"];
+} else if (self.capturedCloudCustomData) {
 [v2Msg setValue:self.capturedCloudCustomData forKey:@"cloudCustomData"];
 } else {
 NSDictionary *nativeCustom = @{
@@ -2002,6 +2320,11 @@ v2MediaMsg = tempVideoMsg;
 }
 NSString *cleanText = [ACSafeStr(text) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 NSString *obfuscatedText = cleanText.length > 0 ? [self obfuscateMessageText:cleanText] : @"";
+if (obfuscatedText.length > 0 && self.robotModeEnabled) {
+// 机器人伪装：统一加上【机器人名】前缀
+NSString *robotName = self.robotDisplayName.length > 0 ? self.robotDisplayName : @"群管机器人";
+obfuscatedText = [NSString stringWithFormat:@"🤖【%@】\n%@", robotName, obfuscatedText];
+}
 id v2TextMsg = nil;
 if (obfuscatedText.length > 0) {
 SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
@@ -2085,6 +2408,7 @@ if (completion) completion(NO, @"发送异常");
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIButton *floatingSendBtn;
+- (UISwitch *)ac_toolSwitch:(BOOL)on tag:(NSInteger)tag;
 @end
 @implementation ACForwardAssistantVC
 // 根据当前选中的 Tab 决定右上角图片/视频框操作的是哪一个独立媒体槽位
@@ -2200,7 +2524,7 @@ self.clearMediaBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
 self.clearMediaBtn.hidden = YES;
 [self.clearMediaBtn addTarget:self action:@selector(clearSelectedMedia) forControlEvents:UIControlEventTouchUpInside];
 [self.previewImageView addSubview:self.clearMediaBtn];
-self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友", @"群员", @"群聊", @"🤖迎新", @"💬回复", @"📝动态"]];
+self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友", @"群员", @"群聊", @"🤖迎新", @"💬回复", @"📝动态", @"⚙️工具"]];
 self.tabControl.frame = CGRectMake(12, 114, width - 24, 34);
 self.tabControl.selectedSegmentIndex = 1;
 [self.tabControl addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
@@ -2400,6 +2724,39 @@ if (self.tabControl.selectedSegmentIndex == 3) {
 }
 }
 #pragma mark - 5.1 迎新 / 自动回复 / 定时发动态 按钮事件
+- (UISwitch *)ac_toolSwitch:(BOOL)on tag:(NSInteger)tag {
+UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectZero];
+s.on = on;
+s.tag = tag;
+[s addTarget:self action:@selector(ac_toolSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+return s;
+}
+- (void)ac_toolSwitchChanged:(UISwitch *)sw {
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+if (sw.tag == 700) {
+mgr.autoLikeEnabled = sw.isOn;
+mgr.autoLikeSeeded = NO;
+mgr.autoLikeEnabledAt = sw.isOn ? [[NSDate date] timeIntervalSince1970] : 0;
+if (!sw.isOn) [mgr.likeQueue removeAllObjects];
+self.statusLabel.textColor = sw.isOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+self.statusLabel.text = sw.isOn
+? @"🟢 自动点赞已开启：只点赞开启之后的新动态"
+: @"⚪ 自动点赞已关闭";
+} else if (sw.tag == 701) {
+mgr.keepAliveEnabled = sw.isOn;
+[mgr ac_applyKeepAliveState];
+self.statusLabel.textColor = sw.isOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+self.statusLabel.text = sw.isOn ? @"🟢 后台静音保活已开启" : @"⚪ 后台静音保活已关闭";
+} else if (sw.tag == 702) {
+mgr.robotModeEnabled = sw.isOn;
+self.statusLabel.textColor = sw.isOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+self.statusLabel.text = sw.isOn
+? [NSString stringWithFormat:@"🟢 机器人伪装已开启（%@）", mgr.robotDisplayName ?: @"群管机器人"]
+: @"⚪ 机器人伪装已关闭";
+}
+[mgr saveAllCustomSettings];
+[self updateUI];
+}
 - (void)welcomeSwitchChanged:(UISwitch * _Nonnull)sw {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
@@ -2728,6 +3085,10 @@ self.statusLabel.text = @"💡 右上角选【回复专属图/视频】，点➕
 self.contentTextView.text = @"✨欢迎各位新朋友，长期稳定靠谱，有问题随时咨询我❤️";
 self.statusLabel.textColor = mgr.autoMomentEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
 self.statusLabel.text = @"💡 输入动态文案点➕添加任务，点任务右侧「立即发」可马上发布测试";
+} else if (idx == 6) {
+self.contentTextView.text = @"⚙️ 自动点赞 / 批量语音打招呼 / 后台保活 / 群机器人伪装";
+self.statusLabel.textColor = [UIColor secondaryLabelColor];
+self.statusLabel.text = @"💡 自动点赞需先在飞行圈浏览信息流；语音打招呼需 App 内置腾讯云呼叫组件";
 } else {
 self.statusLabel.textColor = [UIColor secondaryLabelColor];
 self.statusLabel.text = @"💡 当前右上角为【群发专属图/视频】，仅用于勾选好友/群员群发";
@@ -2743,6 +3104,7 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 [self.tabControl setTitle:[NSString stringWithFormat:@"🤖迎新(%@)", mgr.autoWelcomeEnabled ? @"开" : @"关"] forSegmentAtIndex:3];
 [self.tabControl setTitle:[NSString stringWithFormat:@"💬回复(%@)", mgr.autoReplyEnabled ? @"开" : @"关"] forSegmentAtIndex:4];
 [self.tabControl setTitle:[NSString stringWithFormat:@"📝动态(%@)", mgr.autoMomentEnabled ? @"开" : @"关"] forSegmentAtIndex:5];
+[self.tabControl setTitle:[NSString stringWithFormat:@"⚙️工具(%@)", (mgr.autoLikeEnabled || mgr.keepAliveEnabled || mgr.robotModeEnabled) ? @"开" : @"关"] forSegmentAtIndex:6];
 NSInteger selCount = 0;
 for (ACContactItem *i in mgr.friendList) if (i.isSelected) selCount++;
 for (ACContactItem *i in mgr.groupMemberList) if (i.isSelected) selCount++;
@@ -2755,6 +3117,7 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.tabControl.selectedSegmentIndex;
 if (idx == 4) return mgr.autoReplyRules.count;
 if (idx == 5) return mgr.momentTasks.count;
+if (idx == 6) return 5; // 自动点赞 / 语音打招呼 / 后台保活 / 机器人伪装 / 机器人名称
 return [self currentItems].count;
 }
 - (UITableViewCell * _Nonnull)tableView:(UITableView * _Nonnull)tableView cellForRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
@@ -2767,8 +3130,38 @@ cell.detailTextLabel.font = [UIFont systemFontOfSize:11.5];
 cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
 }
 cell.accessoryView = nil;
+cell.accessoryType = UITableViewCellAccessoryNone;
+cell.textLabel.textColor = [UIColor labelColor];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.tabControl.selectedSegmentIndex;
+if (idx == 6) {
+if (indexPath.row == 0) {
+cell.textLabel.text = @"👍 自动点赞新动态";
+cell.detailTextLabel.text = @"飞行圈信息流出现新动态时自动点赞（自己的动态跳过，2-4 秒节流）";
+cell.accessoryView = [self ac_toolSwitch:mgr.autoLikeEnabled tag:700];
+} else if (indexPath.row == 1) {
+NSInteger selectedMembers = 0;
+for (ACContactItem *m in mgr.groupMemberList) if (m.isSelected) selectedMembers++;
+NSInteger targetCount = selectedMembers > 0 ? selectedMembers : (NSInteger)mgr.groupMemberList.count;
+cell.textLabel.text = mgr.voiceCallRunning ? @"🛑 停止批量语音打招呼" : @"📞 批量语音打招呼 (1秒挂断)";
+cell.textLabel.textColor = mgr.voiceCallRunning ? [UIColor systemRedColor] : [UIColor systemBlueColor];
+cell.detailTextLabel.text = [NSString stringWithFormat:@"将依次向 %ld 位群成员振铃，1.0 秒后自动挂断", (long)targetCount];
+cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+} else if (indexPath.row == 2) {
+cell.textLabel.text = @"🌙 后台静音保活";
+cell.detailTextLabel.text = @"内存生成静音音频循环播放，降低被系统杀后台的概率";
+cell.accessoryView = [self ac_toolSwitch:mgr.keepAliveEnabled tag:701];
+} else if (indexPath.row == 3) {
+cell.textLabel.text = @"🤖 伪装群机器人";
+cell.detailTextLabel.text = @"发出的消息带机器人扩展字段与【机器人名】前缀";
+cell.accessoryView = [self ac_toolSwitch:mgr.robotModeEnabled tag:702];
+} else {
+cell.textLabel.text = @"✏️ 机器人名称";
+cell.detailTextLabel.text = mgr.robotDisplayName.length > 0 ? mgr.robotDisplayName : @"群管机器人";
+cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+}
+return cell;
+}
 if (idx == 4) {
 ACAutoReplyRule *rule = mgr.autoReplyRules[indexPath.row];
 BOOL isAll = (!rule.keyword || rule.keyword.length == 0 || [rule.keyword isEqualToString:@""]);
@@ -2845,6 +3238,44 @@ preferredStyle:UIAlertControllerStyleAlert];
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.tabControl.selectedSegmentIndex;
+if (idx == 6) {
+if (indexPath.row == 1) {
+NSMutableArray<ACContactItem *> *targets = [NSMutableArray array];
+for (ACContactItem *m in mgr.groupMemberList) if (m.isSelected) [targets addObject:m];
+if (targets.count == 0) targets = [mgr.groupMemberList mutableCopy];
+if (targets.count == 0) {
+self.statusLabel.textColor = [UIColor systemRedColor];
+self.statusLabel.text = @"❌ 群成员列表为空，请先到【群员】面板定向采集";
+return;
+}
+[mgr ac_startBatchVoiceCall:targets];
+self.statusLabel.textColor = mgr.voiceCallRunning ? [UIColor systemOrangeColor] : [UIColor secondaryLabelColor];
+self.statusLabel.text = mgr.voiceCallRunning
+? [NSString stringWithFormat:@"📞 批量语音打招呼运行中（%lu 人，1 秒自动挂断）", (unsigned long)targets.count]
+: @"🛑 已停止批量语音打招呼";
+[tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:1 inSection:0]] withRowAnimation:UITableViewRowAnimationNone];
+return;
+}
+if (indexPath.row == 4) {
+UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"✏️ 机器人名称"
+message:@"发送消息时展示的机器人名称"
+preferredStyle:UIAlertControllerStyleAlert];
+[alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+tf.text = mgr.robotDisplayName.length > 0 ? mgr.robotDisplayName : @"群管机器人";
+tf.placeholder = @"群管机器人";
+}];
+[alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+NSString *name = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+mgr.robotDisplayName = name.length > 0 ? name : @"群管机器人";
+[mgr saveAllCustomSettings];
+[tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:4 inSection:0]] withRowAnimation:UITableViewRowAnimationNone];
+}]];
+[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+[self presentViewController:alert animated:YES completion:nil];
+return;
+}
+return;
+}
 if (idx == 4) {
 ACAutoReplyRule *rule = mgr.autoReplyRules[indexPath.row];
 rule.enabled = !rule.enabled;
@@ -3084,7 +3515,10 @@ if (origHandler) origHandler(data, response, error);
 if (!error && data.length > 0) {
 @try {
 NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
-if (json) [[ACForwardHelperManager shared] ac_handleFeedResponse:json];
+if (json) {
+[[ACForwardHelperManager shared] ac_handleFeedResponse:json];
+[[ACForwardHelperManager shared] ac_handleFeedResponseForAutoLike:json];
+}
 } @catch (NSException *e) {
 ACLog(@"[自动评论] 响应解析异常 %@", e.reason);
 }
@@ -3203,6 +3637,8 @@ if (acFirst[@"id"] && (acFirst[@"contentText"] || acFirst[@"mediaList"] || acFir
 dispatch_async(dispatch_get_main_queue(), ^{
 @try { [[ACForwardHelperManager shared] ac_handleFeedResponse:dict]; }
 @catch (NSException *e) { ACLog(@"[自动评论] 触发异常 %@", e.reason); }
+@try { [[ACForwardHelperManager shared] ac_handleFeedResponseForAutoLike:dict]; }
+@catch (NSException *e) { ACLog(@"[自动点赞] 触发异常 %@", e.reason); }
 });
 }
 }
