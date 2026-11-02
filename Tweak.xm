@@ -327,6 +327,8 @@ static NSString *__currentChatPeerId = nil;
 // —— 群机器人伪装（cloudCustomData + 文案前缀）——
 @property (nonatomic, assign) BOOL robotModeEnabled;
 @property (nonatomic, copy) NSString *robotDisplayName;
+// —— 手动群号采集（外显群号 -> 真实群 ID -> 递归拉成员/历史消息）——
+@property (nonatomic, copy) NSString *manualTargetGroupId;
 @property (nonatomic, assign) NSTimeInterval latestLtsAt;
 @property (nonatomic, assign) BOOL momentRetryScheduled;
 + (instancetype)shared;
@@ -348,6 +350,9 @@ static NSString *__currentChatPeerId = nil;
 - (void)parseJSONWithContext:(id)jsonObj;
 - (BOOL)ac_isValidGroupId:(NSString *)gid;
 - (void)ac_fetchGroupListFromServer:(void(^)(NSInteger count))completion;
+- (void)fetchMembersByManualGroupNumber:(NSString *)groupNum
+progress:(void(^)(NSString *msg))progressBlock
+completion:(void(^)(NSString *res))completion;
 - (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
 progress:(void(^)(NSString *progressMsg))progressBlock
 completion:(void(^)(NSString *finalMsg))completion;
@@ -426,6 +431,7 @@ instance.likedPostIds = [NSMutableSet set];
 instance.likeQueue = [NSMutableArray array];
 instance.robotDisplayName = @"群管机器人";
 instance.voiceHangupSeconds = 1.0f;
+instance.manualTargetGroupId = @"";
 [instance loadLocalPermanentCache];
 [instance loadAllCustomSettings];
 [instance restartMomentScheduler];
@@ -590,6 +596,7 @@ for (ACAutoReplyRule *r in self.autoReplyRules) {
 [ud setBool:self.robotModeEnabled forKey:@"AC_RobotMode_Enabled"];
 [ud setObject:(self.robotDisplayName ?: @"群管机器人") forKey:@"AC_Robot_Name"];
 [ud setFloat:self.voiceHangupSeconds forKey:@"AC_VoiceHangup_Seconds"];
+[ud setObject:(self.manualTargetGroupId ?: @"") forKey:@"AC_ManualTargetGroupId"];
 NSArray *seenArr = [[self.autoCommentSeenIds allObjects] sortedArrayUsingSelector:@selector(compare:)];
 if (seenArr.count > 1500) seenArr = [seenArr subarrayWithRange:NSMakeRange(seenArr.count - 1500, 1500)];
 [ud setObject:seenArr forKey:@"AC_AutoComment_Seen"];
@@ -630,6 +637,7 @@ NSString *savedRobotName = ACSafeStr([ud objectForKey:@"AC_Robot_Name"]);
 self.robotDisplayName = savedRobotName.length > 0 ? savedRobotName : @"群管机器人";
 float savedHangup = [ud floatForKey:@"AC_VoiceHangup_Seconds"];
 self.voiceHangupSeconds = (savedHangup >= 0.3f && savedHangup <= 15.0f) ? savedHangup : 1.0f;
+self.manualTargetGroupId = ACSafeStr([ud objectForKey:@"AC_ManualTargetGroupId"]);
 NSArray *savedSeen = ACSafeArray([ud objectForKey:@"AC_AutoComment_Seen"]);
 if (savedSeen.count > 0) {
 for (id v in savedSeen) { NSString *sid = ACSafeStr(v); if (sid.length > 3) [self.autoCommentSeenIds addObject:sid]; }
@@ -2144,6 +2152,59 @@ ACLog(@"[群聊] 云端群列表请求异常 %@", e.reason);
 if (completion) completion(0);
 }
 }
+#pragma mark - 2.5 手动群号采集（外显群号 -> 真实群 ID -> 递归拉成员/历史）
+- (void)fetchMembersByManualGroupNumber:(NSString *)groupNum
+progress:(void(^)(NSString *msg))progressBlock
+completion:(void(^)(NSString *res))completion {
+NSString *num = [ACSafeStr(groupNum) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+if (num.length == 0) {
+if (completion) completion(@"❌ 请输入有效群号");
+return;
+}
+self.manualTargetGroupId = num;
+[self saveAllCustomSettings];
+// 已是群 ID（@TGS# 或长数字 ID）就不用再解析群号，直接采集
+BOOL looksLikeId = [num hasPrefix:@"@TGS#"] || (num.length >= 15 && [self ac_isValidGroupId:num]);
+if (looksLikeId) {
+[self addGroupWithId:num name:@"" ban:NO];
+if (progressBlock) progressBlock([NSString stringWithFormat:@"⏳ 正在采集群 %@ ...", num]);
+[self reloadSelectedGroupsData:@[num] progress:progressBlock completion:completion];
+return;
+}
+if (progressBlock) progressBlock(@"🔍 正在解析群号...");
+NSString *path = [NSString stringWithFormat:@"https://apiv1.airchat.cc/client/biz/group/get/by/number?number=%@&groupNumber=%@", num, num];
+NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:path]];
+req.HTTPMethod = @"GET";
+[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
+[self ac_applyCapturedHeadersToRequest:req];
+NSURLSession *session = ACDedicatedPluginSession();
+if (!session) { if (completion) completion(@"❌ 网络未就绪"); return; }
+acInternalRequest = YES;
+NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:(data ?: [NSData data]) options:0 error:nil]);
+NSDictionary *d = ACSafeDict(json[@"data"]);
+NSString *realGid = ACSafeStr(d[@"id"]);
+if (realGid.length == 0) realGid = ACSafeStr(d[@"groupId"]);
+if (realGid.length == 0) realGid = ACSafeStr(d[@"groupNo"]);
+NSString *gName = ACSafeStr(d[@"name"]);
+if (gName.length == 0) gName = ACSafeStr(d[@"groupName"]);
+dispatch_async(dispatch_get_main_queue(), ^{
+if ([self ac_isValidGroupId:realGid]) {
+[self addGroupWithId:realGid name:gName ban:NO];
+ACLog(@"[群聊] 群号 %@ -> 群ID %@ (%@)", num, realGid, gName);
+[self saveLocalPermanentCache];
+[self reloadSelectedGroupsData:@[realGid] progress:progressBlock completion:completion];
+} else {
+NSString *why = error ? [NSString stringWithFormat:@"网络错误 %@", error.localizedDescription] : @"接口未返回群ID";
+ACLog(@"[群聊] 群号 %@ 解析失败：%@", num, why);
+if (completion) completion([NSString stringWithFormat:@"❌ 未能找到对应群聊（%@），请确认群号正确！", why]);
+}
+});
+}];
+acInternalRequest = NO;
+[task resume];
+}
 - (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
 progress:(void(^)(NSString *progressMsg))progressBlock
 completion:(void(^)(NSString *finalMsg))completion {
@@ -2566,6 +2627,8 @@ if (completion) completion(NO, @"发送异常");
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIButton *floatingSendBtn;
+@property (nonatomic, strong) UIView *manualGroupBar;
+@property (nonatomic, strong) UITextField *manualGroupField;
 - (UISwitch *)ac_toolSwitch:(BOOL)on tag:(NSInteger)tag;
 @end
 @implementation ACForwardAssistantVC
@@ -2702,6 +2765,34 @@ btn.tag = 600 + i;
 [self.actionBar addSubview:btn];
 }
 [self.headerContainer addSubview:self.actionBar];
+// 手动群号采集条：仅在【群聊】面板显示，直接按外显群号/群ID 定向采集
+self.manualGroupBar = [[UIView alloc] initWithFrame:CGRectMake(16, 196, width - 32, 34)];
+self.manualGroupBar.hidden = YES;
+CGFloat manualFieldW = width - 32 - 104;
+self.manualGroupField = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, manualFieldW, 34)];
+self.manualGroupField.font = [UIFont systemFontOfSize:12.5];
+self.manualGroupField.placeholder = @"输入群号 / 群ID（如 123456）";
+self.manualGroupField.text = mgr.manualTargetGroupId ?: @"";
+self.manualGroupField.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+self.manualGroupField.layer.cornerRadius = 8;
+self.manualGroupField.layer.borderColor = [UIColor separatorColor].CGColor;
+self.manualGroupField.layer.borderWidth = 0.5;
+self.manualGroupField.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
+self.manualGroupField.leftViewMode = UITextFieldViewModeAlways;
+self.manualGroupField.clearButtonMode = UITextFieldViewModeWhileEditing;
+self.manualGroupField.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+self.manualGroupField.returnKeyType = UIReturnKeyDone;
+[self.manualGroupBar addSubview:self.manualGroupField];
+UIButton *manualFetchBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+manualFetchBtn.frame = CGRectMake(width - 32 - 96, 0, 96, 34);
+[manualFetchBtn setTitle:@"🎯 按群号采集" forState:UIControlStateNormal];
+manualFetchBtn.titleLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightSemibold];
+manualFetchBtn.backgroundColor = [UIColor systemBlueColor];
+[manualFetchBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+manualFetchBtn.layer.cornerRadius = 8;
+[manualFetchBtn addTarget:self action:@selector(fetchByManualGroupNumberAction) forControlEvents:UIControlEventTouchUpInside];
+[self.manualGroupBar addSubview:manualFetchBtn];
+[self.headerContainer addSubview:self.manualGroupBar];
 self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 156, width - 32, 38)];
 self.welcomeControlBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
 self.welcomeControlBar.layer.cornerRadius = 10;
@@ -3167,6 +3258,33 @@ if (self.tabControl.selectedSegmentIndex == 0) return mgr.friendList;
 if (self.tabControl.selectedSegmentIndex == 1) return mgr.groupMemberList;
 return mgr.groupList;
 }
+// 按外显群号/群ID 直接定向采集（无需先在列表里勾选）
+- (void)fetchByManualGroupNumberAction {
+[self.view endEditing:YES];
+NSString *num = [ACSafeStr(self.manualGroupField.text) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+if (num.length == 0) {
+self.statusLabel.textColor = [UIColor systemRedColor];
+self.statusLabel.text = @"❌ 请先输入群号或群ID";
+return;
+}
+self.statusLabel.textColor = [UIColor systemBlueColor];
+self.statusLabel.text = @"🔍 正在解析群号并采集...";
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.manualTargetGroupId = num;
+[mgr saveAllCustomSettings];
+__weak typeof(self) weakSelf = self;
+[mgr fetchMembersByManualGroupNumber:num progress:^(NSString *msg) {
+weakSelf.statusLabel.textColor = [UIColor systemBlueColor];
+weakSelf.statusLabel.text = msg;
+[weakSelf updateUI];
+[weakSelf.tableView reloadData];
+} completion:^(NSString *res) {
+weakSelf.statusLabel.textColor = [UIColor systemGreenColor];
+weakSelf.statusLabel.text = res;
+[weakSelf updateUI];
+[weakSelf.tableView reloadData];
+}];
+}
 - (void)quickSelectAction:(UIButton * _Nonnull)sender {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
@@ -3229,9 +3347,16 @@ self.welcomeControlBar.hidden = (idx != 3);
 self.autoReplyBar.hidden = (idx != 4);
 self.momentTaskBar.hidden = (idx != 5);
 self.autoCommentBar.hidden = (idx != 5);
+self.manualGroupBar.hidden = (idx != 2);
+if (idx == 2 && self.manualGroupField.text.length == 0 && mgr.manualTargetGroupId.length > 0) {
+self.manualGroupField.text = mgr.manualTargetGroupId;
+}
 self.floatingSendBtn.hidden = (idx >= 3);
 [self refreshMediaPreviewUI];
-if (idx == 3) {
+if (idx == 2) {
+self.statusLabel.textColor = [UIColor secondaryLabelColor];
+self.statusLabel.text = @"💡 可在下方输入群号直接采集；也可勾选群列表后点「🎯定向采集」";
+} else if (idx == 3) {
 self.contentTextView.text = mgr.welcomeMessageText ?: @"您好 {name}，欢迎进群！认识一下~";
 self.statusLabel.textColor = mgr.autoWelcomeEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
 self.statusLabel.text = [NSString stringWithFormat:@"%@ | 右上角为【迎新专属图/视频】，不与群发互通",
