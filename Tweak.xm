@@ -2832,7 +2832,9 @@ if (completion) completion(NO, @"发送异常");
 @property (nonatomic, strong) UIButton *pickMediaBtn;
 @property (nonatomic, strong) UIButton *clearMediaBtn;
 @property (nonatomic, strong) UILabel *mediaBadgeLabel;
-@property (nonatomic, strong) UISegmentedControl *tabControl;
+@property (nonatomic, strong) UISegmentedControl *tabControl;       // 上排：好友/群员/群聊/迎新
+@property (nonatomic, strong) UISegmentedControl *tabControlBottom;    // 下排：回复/动态/工具
+@property (nonatomic, assign) NSInteger ac_selectedTabIndex;            // 0-6 统一索引
 @property (nonatomic, strong) UIView *actionBar;
 @property (nonatomic, strong) UIView *welcomeControlBar;
 @property (nonatomic, strong) UISwitch *welcomeSwitch;
@@ -2854,6 +2856,10 @@ if (completion) completion(NO, @"发送异常");
 @property (nonatomic, strong) UITextField *manualGroupField;
 - (UISwitch *)ac_toolSwitch:(BOOL)on tag:(NSInteger)tag;
 - (NSString *)ac_welcomeModeSummary;
+- (void)topTabChanged;
+- (void)bottomTabChanged;
+- (void)tabChanged;
+- (void)updateUI;
 - (void)welcomeTextSwitchChanged:(UISwitch *)sw;
 - (void)welcomeMediaSwitchChanged:(UISwitch *)sw;
 - (void)welcomeVoiceSwitchChanged:(UISwitch *)sw;
@@ -2861,7 +2867,7 @@ if (completion) completion(NO, @"发送异常");
 @implementation ACForwardAssistantVC
 // 根据当前选中的 Tab 决定右上角图片/视频框操作的是哪一个独立媒体槽位
 - (ACMediaSlot)currentActiveMediaSlot {
-NSInteger idx = self.tabControl ? self.tabControl.selectedSegmentIndex : 0;
+NSInteger idx = self.tabControl ? self.ac_selectedTabIndex : 0;
 if (idx == 3) return ACMediaSlotWelcome;   // 🤖迎新专属图片/视频槽
 if (idx == 4) return ACMediaSlotAutoReply; // 💬自动回复专属图片/视频槽
 if (idx == 5) return ACMediaSlotMoment;    // 📝动态专属图片/视频槽
@@ -2905,7 +2911,7 @@ self.statusLabel.text = [NSString stringWithFormat:@"📁 本地缓存：%lu 好
 }
 - (void)onStatusUpdateNotification {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-NSInteger idx = self.tabControl.selectedSegmentIndex;
+NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 3) {
 self.statusLabel.textColor = [UIColor systemGreenColor];
 self.statusLabel.text = mgr.lastGreetLog;
@@ -2922,7 +2928,7 @@ self.statusLabel.text = mgr.lastMomentLog;
 - (void)setupCleanUI {
 CGFloat width = self.view.bounds.size.width;
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-self.headerContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 236)];
+self.headerContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 304)];
 self.headerContainer.backgroundColor = [UIColor systemGroupedBackgroundColor];
 [self.view addSubview:self.headerContainer];
 CGFloat imgBoxW = 90.0;
@@ -2972,12 +2978,19 @@ self.clearMediaBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
 self.clearMediaBtn.hidden = YES;
 [self.clearMediaBtn addTarget:self action:@selector(clearSelectedMedia) forControlEvents:UIControlEventTouchUpInside];
 [self.previewImageView addSubview:self.clearMediaBtn];
-self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友", @"群员", @"群聊", @"🤖迎新", @"💬回复", @"📝动态", @"⚙️工具"]];
-self.tabControl.frame = CGRectMake(12, 114, width - 24, 34);
+// 两排 Tab：上排四个常用面板，下排三个功能面板，避免 7 个挤在同一行
+self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"好友", @"群员", @"群聊", @"🤖迎新"]];
+self.tabControl.frame = CGRectMake(12, 110, width - 24, 32);
 self.tabControl.selectedSegmentIndex = 1;
-[self.tabControl addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
+[self.tabControl addTarget:self action:@selector(topTabChanged) forControlEvents:UIControlEventValueChanged];
 [self.headerContainer addSubview:self.tabControl];
-self.actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 158, width - 32, 34)];
+self.tabControlBottom = [[UISegmentedControl alloc] initWithItems:@[@"💬回复", @"📝动态", @"⚙️工具"]];
+self.tabControlBottom.frame = CGRectMake(12, 145, width - 24, 32);
+self.tabControlBottom.selectedSegmentIndex = UISegmentedControlNoSegment;
+[self.tabControlBottom addTarget:self action:@selector(bottomTabChanged) forControlEvents:UIControlEventValueChanged];
+[self.headerContainer addSubview:self.tabControlBottom];
+self.ac_selectedTabIndex = 1;
+self.actionBar = [[UIView alloc] initWithFrame:CGRectMake(16, 182, width - 32, 34)];
 NSArray *btnTitles = @[@"🟢只选必达", @"🗑️清群成员", @"🎯定向采集", @"清空已选"];
 CGFloat btnW = (width - 32 - 24) / 4.0;
 for (int i = 0; i < 4; i++) {
@@ -2993,7 +3006,7 @@ btn.tag = 600 + i;
 }
 [self.headerContainer addSubview:self.actionBar];
 // 手动群号采集条：仅在【群聊】面板显示，直接按外显群号/群ID 定向采集
-self.manualGroupBar = [[UIView alloc] initWithFrame:CGRectMake(16, 196, width - 32, 34)];
+self.manualGroupBar = [[UIView alloc] initWithFrame:CGRectMake(16, 222, width - 32, 34)];
 self.manualGroupBar.hidden = YES;
 CGFloat manualFieldW = width - 32 - 104;
 self.manualGroupField = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, manualFieldW, 34)];
@@ -3021,7 +3034,7 @@ manualFetchBtn.layer.cornerRadius = 8;
 [self.manualGroupBar addSubview:manualFetchBtn];
 [self.headerContainer addSubview:self.manualGroupBar];
 // 迎新控制条：两排布局（第一排 总开关+语音打招呼+全选群；第二排 文字+图片视频），避免拥挤
-self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 150, width - 32, 82)];
+self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 182, width - 32, 82)];
 self.welcomeControlBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
 self.welcomeControlBar.layer.cornerRadius = 10;
 self.welcomeControlBar.hidden = YES;
@@ -3073,7 +3086,7 @@ self.welcomeMediaSwitch.on = mgr.welcomeMediaEnabled;
 [self.welcomeMediaSwitch addTarget:self action:@selector(welcomeMediaSwitchChanged:) forControlEvents:UIControlEventValueChanged];
 [self.welcomeControlBar addSubview:self.welcomeMediaSwitch];
 [self.headerContainer addSubview:self.welcomeControlBar];
-self.autoReplyBar = [[UIView alloc] initWithFrame:CGRectMake(16, 156, width - 32, 38)];
+self.autoReplyBar = [[UIView alloc] initWithFrame:CGRectMake(16, 182, width - 32, 38)];
 self.autoReplyBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
 self.autoReplyBar.layer.cornerRadius = 10;
 self.autoReplyBar.hidden = YES;
@@ -3095,7 +3108,7 @@ self.autoReplySwitch.on = mgr.autoReplyEnabled;
 [self.autoReplySwitch addTarget:self action:@selector(autoReplySwitchChanged:) forControlEvents:UIControlEventValueChanged];
 [self.autoReplyBar addSubview:self.autoReplySwitch];
 [self.headerContainer addSubview:self.autoReplyBar];
-self.momentTaskBar = [[UIView alloc] initWithFrame:CGRectMake(16, 156, width - 32, 38)];
+self.momentTaskBar = [[UIView alloc] initWithFrame:CGRectMake(16, 182, width - 32, 38)];
 self.momentTaskBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
 self.momentTaskBar.layer.cornerRadius = 10;
 self.momentTaskBar.hidden = YES;
@@ -3121,7 +3134,7 @@ self.momentSwitch.on = mgr.autoMomentEnabled;
 [self.momentSwitch addTarget:self action:@selector(momentSwitchChanged:) forControlEvents:UIControlEventValueChanged];
 [self.momentTaskBar addSubview:self.momentSwitch];
 [self.headerContainer addSubview:self.momentTaskBar];
-self.autoCommentBar = [[UIView alloc] initWithFrame:CGRectMake(16, 200, width - 32, 38)];
+self.autoCommentBar = [[UIView alloc] initWithFrame:CGRectMake(16, 224, width - 32, 38)];
 self.autoCommentBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
 self.autoCommentBar.layer.cornerRadius = 10;
 self.autoCommentBar.hidden = YES;
@@ -3143,7 +3156,7 @@ self.autoCommentSwitch.on = mgr.autoCommentEnabled;
 [self.autoCommentSwitch addTarget:self action:@selector(autoCommentSwitchChanged:) forControlEvents:UIControlEventValueChanged];
 [self.autoCommentBar addSubview:self.autoCommentSwitch];
 [self.headerContainer addSubview:self.autoCommentBar];
-self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 244, width - 32, 24)];
+self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 270, width - 32, 24)];
 self.statusLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightMedium];
 self.statusLabel.textColor = [UIColor secondaryLabelColor];
 self.statusLabel.textAlignment = NSTextAlignmentCenter;
@@ -3188,7 +3201,7 @@ self.mediaBadgeLabel.hidden = YES;
 CGFloat width = self.view.bounds.size.width;
 CGFloat height = self.view.bounds.size.height;
 CGFloat topOffset = self.view.safeAreaInsets.top;
-CGFloat headerH = 276.0;
+CGFloat headerH = 304.0;
 self.headerContainer.frame = CGRectMake(0, topOffset, width, headerH);
 CGFloat tableY = topOffset + headerH;
 self.tableView.frame = CGRectMake(0, tableY, width, height - tableY);
@@ -3226,7 +3239,7 @@ btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translatio
 [pan setTranslation:CGPointZero inView:self.view];
 }
 - (void)textViewDidChange:(UITextView * _Nonnull)textView {
-if (self.tabControl.selectedSegmentIndex == 3) {
+if (self.ac_selectedTabIndex == 3) {
 [ACForwardHelperManager shared].welcomeMessageText = textView.text;
 [[ACForwardHelperManager shared] saveAllCustomSettings];
 }
@@ -3555,8 +3568,8 @@ weakSelf.statusLabel.text = finalMsg;
 }
 - (NSArray<ACContactItem *> *)currentItems {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-if (self.tabControl.selectedSegmentIndex == 0) return mgr.friendList;
-if (self.tabControl.selectedSegmentIndex == 1) return mgr.groupMemberList;
+if (self.ac_selectedTabIndex == 0) return mgr.friendList;
+if (self.ac_selectedTabIndex == 1) return mgr.groupMemberList;
 return mgr.groupList;
 }
 // 按外显群号/群ID 直接定向采集（无需先在列表里勾选）
@@ -3601,7 +3614,7 @@ self.statusLabel.text = @"🗑️ 已清空本地群成员缓存";
 [self.tableView reloadData];
 return;
 } else if (sender.tag == 602) {
-if (self.tabControl.selectedSegmentIndex == 2) {
+if (self.ac_selectedTabIndex == 2) {
 NSMutableArray<NSString *> *selectedGids = [NSMutableArray array];
 for (ACContactItem *g in mgr.groupList) {
 if (g.isSelected) [selectedGids addObject:g.targetId];
@@ -3638,11 +3651,27 @@ for (ACContactItem *i in mgr.groupList) i.isSelected = NO;
 [self updateUI];
 [self.tableView reloadData];
 }
+// 上排 Tab：好友/群员/群聊/迎新
+- (void)topTabChanged {
+NSInteger top = self.tabControl.selectedSegmentIndex;
+if (top == UISegmentedControlNoSegment) return;
+self.ac_selectedTabIndex = top;
+self.tabControlBottom.selectedSegmentIndex = UISegmentedControlNoSegment;
+[self tabChanged];
+}
+// 下排 Tab：回复(4)/动态(5)/工具(6)
+- (void)bottomTabChanged {
+NSInteger bottom = self.tabControlBottom.selectedSegmentIndex;
+if (bottom == UISegmentedControlNoSegment) return;
+self.ac_selectedTabIndex = 4 + bottom;
+self.tabControl.selectedSegmentIndex = UISegmentedControlNoSegment;
+[self tabChanged];
+}
 // 切换面板时，右上角的图片/视频预览框同步切换为该面板自己的独立槽位
 - (void)tabChanged {
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-NSInteger idx = self.tabControl.selectedSegmentIndex;
+NSInteger idx = self.ac_selectedTabIndex;
 self.actionBar.hidden = (idx >= 3);
 self.welcomeControlBar.hidden = (idx != 3);
 self.autoReplyBar.hidden = (idx != 4);
@@ -3688,9 +3717,9 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 [self.tabControl setTitle:[NSString stringWithFormat:@"群员(%lu)", (unsigned long)mgr.groupMemberList.count] forSegmentAtIndex:1];
 [self.tabControl setTitle:[NSString stringWithFormat:@"群聊(%lu)", (unsigned long)mgr.groupList.count] forSegmentAtIndex:2];
 [self.tabControl setTitle:[NSString stringWithFormat:@"🤖迎新(%@)", mgr.autoWelcomeEnabled ? @"开" : @"关"] forSegmentAtIndex:3];
-[self.tabControl setTitle:[NSString stringWithFormat:@"💬回复(%@)", mgr.autoReplyEnabled ? @"开" : @"关"] forSegmentAtIndex:4];
-[self.tabControl setTitle:[NSString stringWithFormat:@"📝动态(%@)", mgr.autoMomentEnabled ? @"开" : @"关"] forSegmentAtIndex:5];
-[self.tabControl setTitle:[NSString stringWithFormat:@"⚙️工具(%@)", (mgr.autoLikeEnabled || mgr.keepAliveEnabled || mgr.robotModeEnabled) ? @"开" : @"关"] forSegmentAtIndex:6];
+[self.tabControlBottom setTitle:[NSString stringWithFormat:@"💬回复(%@)", mgr.autoReplyEnabled ? @"开" : @"关"] forSegmentAtIndex:0];
+[self.tabControlBottom setTitle:[NSString stringWithFormat:@"📝动态(%@)", mgr.autoMomentEnabled ? @"开" : @"关"] forSegmentAtIndex:1];
+[self.tabControlBottom setTitle:[NSString stringWithFormat:@"⚙️工具(%@)", (mgr.autoLikeEnabled || mgr.keepAliveEnabled || mgr.robotModeEnabled) ? @"开" : @"关"] forSegmentAtIndex:2];
 NSInteger selCount = 0;
 for (ACContactItem *i in mgr.friendList) if (i.isSelected) selCount++;
 for (ACContactItem *i in mgr.groupMemberList) if (i.isSelected) selCount++;
@@ -3700,7 +3729,7 @@ for (ACContactItem *i in mgr.groupList) if (i.isSelected) selCount++;
 #pragma mark - 5.2 列表数据源与交互
 - (NSInteger)tableView:(UITableView * _Nonnull)tableView numberOfRowsInSection:(NSInteger)section {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-NSInteger idx = self.tabControl.selectedSegmentIndex;
+NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 4) return mgr.autoReplyRules.count;
 if (idx == 5) return mgr.momentTasks.count;
 if (idx == 6) return 6; // 自动点赞 / 语音打招呼 / 后台保活 / 机器人伪装 / 机器人名称 / 挂断秒数
@@ -3719,7 +3748,7 @@ cell.accessoryView = nil;
 cell.accessoryType = UITableViewCellAccessoryNone;
 cell.textLabel.textColor = [UIColor labelColor];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-NSInteger idx = self.tabControl.selectedSegmentIndex;
+NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 6) {
 if (indexPath.row == 0) {
 cell.textLabel.text = @"👍 自动点赞新动态";
@@ -3828,7 +3857,7 @@ preferredStyle:UIAlertControllerStyleAlert];
 [tableView deselectRowAtIndexPath:indexPath animated:YES];
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-NSInteger idx = self.tabControl.selectedSegmentIndex;
+NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 6) {
 if (indexPath.row == 1) {
 NSMutableArray<ACContactItem *> *targets = [NSMutableArray array];
@@ -3925,13 +3954,13 @@ item.isSelected = !item.isSelected;
 [self updateUI];
 }
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
-NSInteger idx = self.tabControl.selectedSegmentIndex;
+NSInteger idx = self.ac_selectedTabIndex;
 return (idx == 4 || idx == 5);
 }
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
 if (editingStyle == UITableViewCellEditingStyleDelete) {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-if (self.tabControl.selectedSegmentIndex == 4 && indexPath.row < mgr.autoReplyRules.count) {
+if (self.ac_selectedTabIndex == 4 && indexPath.row < mgr.autoReplyRules.count) {
 ACAutoReplyRule *rule = mgr.autoReplyRules[indexPath.row];
 if (rule.customMediaPath.length > 0) {
 [[NSFileManager defaultManager] removeItemAtPath:rule.customMediaPath error:nil];
@@ -3942,7 +3971,7 @@ if (rule.customThumbPath.length > 0) {
 [mgr.autoReplyRules removeObjectAtIndex:indexPath.row];
 [mgr saveAllCustomSettings];
 [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
-} else if (self.tabControl.selectedSegmentIndex == 5 && indexPath.row < mgr.momentTasks.count) {
+} else if (self.ac_selectedTabIndex == 5 && indexPath.row < mgr.momentTasks.count) {
 [mgr.momentTasks removeObjectAtIndex:indexPath.row];
 [mgr saveAllCustomSettings];
 [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
