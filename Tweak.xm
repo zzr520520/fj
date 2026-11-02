@@ -346,6 +346,8 @@ static NSString *__currentChatPeerId = nil;
 - (void)clearAllGroupMembersCache;
 - (void)saveAllCustomSettings;
 - (void)parseJSONWithContext:(id)jsonObj;
+- (BOOL)ac_isValidGroupId:(NSString *)gid;
+- (void)ac_fetchGroupListFromServer:(void(^)(NSInteger count))completion;
 - (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
 progress:(void(^)(NSString *progressMsg))progressBlock
 completion:(void(^)(NSString *finalMsg))completion;
@@ -1770,10 +1772,18 @@ if (chatMeType == 0) {
 return YES;
 }
 }
+- (BOOL)ac_isValidGroupId:(NSString *)gid {
+NSString *g = [ACSafeStr(gid) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+if (g.length < 3 || g.length > 128) return NO;
+if ([g isEqualToString:@"(null)"] || [g isEqualToString:@"<null>"] ||
+[g isEqualToString:@"0"] || [g isEqualToString:@"-1"] || [g isEqualToString:@"nil"]) return NO;
+// 同时支持腾讯 IM 的 @TGS# 群号和 AirChat 的 19 位数字群 ID
+if ([g rangeOfCharacterFromSet:[NSCharacterSet whitespaceCharacterSet]].location != NSNotFound) return NO;
+return YES;
+}
 - (void)addGroupWithId:(NSString *)gid name:(NSString *)name ban:(BOOL)ban {
 NSString *cleanId = [ACSafeStr(gid) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-if (cleanId.length < 3 || [cleanId isEqualToString:@"(null)"] || [cleanId isEqualToString:@"<null>"] || [cleanId isEqualToString:@"0"]) return;
-if (![cleanId hasPrefix:@"@TGS#"] && cleanId.length > 15) return;
+if (![self ac_isValidGroupId:cleanId]) return;
 NSString *cleanName = ACSafeStr(name);
 @synchronized (self) {
 self.groupBanStatusMap[cleanId] = @(ban);
@@ -1829,7 +1839,10 @@ self.capturedClientTypeV2 = v2Token;
 }
 }
 NSString *directId = ACSafeStr(dict[@"id"]);
-if ([directId hasPrefix:@"@TGS#"] && ACSafeStr(dict[@"name"]).length > 0) {
+// 旧逻辑只认 @TGS# 前缀，会把 App 自己的数字群 ID 全部丢掉。
+// 这里改为：ID 合法 + 具备群对象的特征字段（owner/ban/groupName/memberCount）才算群。
+if ([self ac_isValidGroupId:directId] && ACSafeStr(dict[@"name"]).length > 0 &&
+(dict[@"owner"] || dict[@"ban"] || dict[@"groupName"] || dict[@"memberCount"] || dict[@"groupNo"])) {
 BOOL isBan = [ACSafeStr(dict[@"ban"]) isEqualToString:@"true"];
 [self addGroupWithId:directId name:ACSafeStr(dict[@"name"]) ban:isBan];
 NSString *ownerId = ACSafeStr(dict[@"owner"]);
@@ -1838,7 +1851,8 @@ if (ownerId.length >= 5) {
 }
 }
 NSString *groupId = ACSafeStr(dict[@"groupId"]);
-if ([groupId hasPrefix:@"@TGS#"]) {
+if (groupId.length == 0) groupId = ACSafeStr(dict[@"groupNo"]);
+if ([self ac_isValidGroupId:groupId]) {
 BOOL isBan = [ACSafeStr(dict[@"ban"]) isEqualToString:@"true"];
 [self addGroupWithId:groupId name:ACSafeStr(dict[@"groupName"]) ban:isBan];
 NSDictionary *uInfo = ACSafeDict(dict[@"userInfo"]);
@@ -2067,6 +2081,69 @@ if (doneBlock) doneBlock();
 });
 });
 }
+#pragma mark - 2.4 云端群列表（HTTP 兜底，兼容 App 的数字群 ID）
+// 早期可用版本就是从该接口拿全量群列表的；后续重写只剩 IM SDK + 本地库扫描，
+// 并且用 @TGS# 前缀过滤，导致 App 自建的数字群 ID 全部被丢弃、群聊面板为空。
+- (void)ac_fetchGroupListFromServer:(void(^)(NSInteger count))completion {
+@try {
+NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
+if (token.length == 0) {
+ACLog(@"[群聊] 未捕获 token，跳过云端群列表");
+if (completion) completion(0);
+return;
+}
+NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
+[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/group/myJoinGroupPage?current=1&searchKey=&size=9999"]];
+req.HTTPMethod = @"GET";
+[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
+[self ac_applyCapturedHeadersToRequest:req];
+NSURLSession *session = ACDedicatedPluginSession();
+if (!session) { if (completion) completion(0); return; }
+acInternalRequest = YES;
+NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+NSInteger added = 0;
+@try {
+if (error) {
+ACLog(@"[群聊] 云端群列表失败：%@", error.localizedDescription);
+} else if (data.length > 0) {
+NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+NSArray *records = ACSafeArray(ACSafeDict(json[@"data"])[@"records"]);
+if (!records) records = ACSafeArray(json[@"records"]);
+if (!records) records = ACSafeArray(json[@"data"]);
+for (id obj in records) {
+NSDictionary *d = ACSafeDict(obj);
+if (!d) continue;
+NSString *gid = ACSafeStr(d[@"groupId"]);
+if (gid.length == 0) gid = ACSafeStr(d[@"groupNo"]);
+if (gid.length == 0) gid = ACSafeStr(d[@"id"]);
+if (![self ac_isValidGroupId:gid]) continue;
+NSString *gname = ACSafeStr(d[@"groupName"]);
+if (gname.length == 0) gname = ACSafeStr(d[@"name"]);
+BOOL ban = [ACSafeStr(d[@"ban"]) boolValue];
+[self addGroupWithId:gid name:gname ban:ban];
+added++;
+}
+} else {
+ACLog(@"[群聊] 云端群列表返回空数据");
+}
+} @catch (NSException *e) {
+ACLog(@"[群聊] 云端群列表解析异常 %@", e.reason);
+}
+ACLog(@"[群聊] 云端群列表：本次解析 %ld 个，累计 %lu 个群", (long)added, (unsigned long)self.groupList.count);
+dispatch_async(dispatch_get_main_queue(), ^{
+[self saveLocalPermanentCache];
+if (completion) completion(added);
+});
+}];
+acInternalRequest = NO;
+[task resume];
+} @catch (NSException *e) {
+acInternalRequest = NO;
+ACLog(@"[群聊] 云端群列表请求异常 %@", e.reason);
+if (completion) completion(0);
+}
+}
 - (void)reloadSelectedGroupsData:(NSArray<NSString *> *)targetGroupIds
 progress:(void(^)(NSString *progressMsg))progressBlock
 completion:(void(^)(NSString *finalMsg))completion {
@@ -2077,7 +2154,7 @@ return;
 }
 dispatch_group_t memberCrawlGroup = dispatch_group_create();
 for (NSString *gid in targetGroupIds) {
-if (![gid hasPrefix:@"@TGS#"]) continue;
+if (![self ac_isValidGroupId:gid]) continue;
 dispatch_group_enter(memberCrawlGroup);
 [self crawlGroupMembersPageForGroup:gid nextSeq:0 pageIndex:0 progress:progressBlock completion:^{
 dispatch_group_leave(memberCrawlGroup);
@@ -2106,6 +2183,14 @@ return;
 }
 id mgr = ((id (*)(id, SEL))objc_msgSend)(v2Cls, @selector(sharedInstance));
 dispatch_group_t baseGroup = dispatch_group_create();
+// 先走云端接口拉全量群列表（兼容数字群 ID；未捕获 token 时自动跳过）
+dispatch_group_enter(baseGroup);
+[self ac_fetchGroupListFromServer:^(NSInteger count) {
+if (count > 0 && progressBlock) {
+progressBlock([NSString stringWithFormat:@"⏳ 云端群列表：%ld 个群...", (long)count]);
+}
+dispatch_group_leave(baseGroup);
+}];
 SEL getGroupsSel = NSSelectorFromString(@"getJoinedGroupList:fail:");
 if ([mgr respondsToSelector:getGroupsSel]) {
 dispatch_group_enter(baseGroup);
@@ -2121,25 +2206,29 @@ NSString *gName = ACSafeStr([gInfo valueForKey:@"groupName"]);
 } @catch (NSException *e) {}
 }
 }
+ACLog(@"[群聊] getJoinedGroupList 返回 %lu 个群，累计 %lu 个", (unsigned long)safeGroups.count, (unsigned long)self.groupList.count);
 dispatch_group_leave(baseGroup);
 };
-void (^failBlock)(int, NSString *) = ^(int code,  NSString *desc) { dispatch_group_leave(baseGroup); };
+void (^failBlock)(int, NSString *) = ^(int code,  NSString *desc) { ACLog(@"[群聊] getJoinedGroupList 失败 code=%d %@", code, desc); dispatch_group_leave(baseGroup); };
 ((void (*)(id, SEL, id, id))objc_msgSend)(mgr, getGroupsSel, succBlock, failBlock);
 }
 dispatch_group_notify(baseGroup, dispatch_get_main_queue(), ^{
 NSArray<ACContactItem *> *allGroups = [self.groupList copy];
 if (allGroups.count == 0) {
 [self saveLocalPermanentCache];
-if (completion) completion([NSString stringWithFormat:@"已就绪：%lu 好友 | %lu 群员 | %lu 群聊",
+NSString *tip = ACHeaderValue(self.latestHTTPHeaders, @"token").length == 0
+? @"（未捕获到登录凭证，请先在 App 内切换一下页面再点刷新）"
+: @"（云端返回 0 个群，请确认该账号已加入群聊）";
+if (completion) completion([NSString stringWithFormat:@"已就绪：%lu 好友 | %lu 群员 | %lu 群聊 %@",
 (unsigned long)self.friendList.count,
 (unsigned long)self.groupMemberList.count,
-(unsigned long)self.groupList.count]);
+(unsigned long)self.groupList.count, tip]);
 return;
 }
 dispatch_group_t memberCrawlGroup = dispatch_group_create();
 for (ACContactItem *grp in allGroups) {
 NSString *gid = grp.targetId;
-if (![gid hasPrefix:@"@TGS#"]) continue;
+if (![self ac_isValidGroupId:gid]) continue;
 dispatch_group_enter(memberCrawlGroup);
 [self crawlGroupMembersPageForGroup:gid nextSeq:0 pageIndex:0 progress:progressBlock completion:^{
 dispatch_group_leave(memberCrawlGroup);
