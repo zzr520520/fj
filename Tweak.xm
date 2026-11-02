@@ -53,6 +53,16 @@ return ([k isEqualToString:@"全部"] || [k isEqualToString:@"任意"] || [k isE
 [k isEqualToString:@"*"] || [k isEqualToString:@"＊"] ||
 [lower isEqualToString:@"any"] || [lower isEqualToString:@"all"]);
 }
+// 只有 airchat 业务网关才允许用于发布/群列表请求；COS、CDN 等域名一律拒绝，
+// 否则 POST 会被重定向到对象存储并返回 HTTP 405 MethodNotAllowed
+static inline BOOL ACIsBusinessHost(NSString *host) {
+    NSString *h = ACSafeStr(host).lowercaseString;
+    if (h.length == 0) return NO;
+    if ([h containsString:@"myqcloud.com"] || [h containsString:@"cos."] ||
+        [h hasPrefix:@"cos"] || [h containsString:@"tencentcloud"] ||
+        [h containsString:@"cloudfront"] || [h containsString:@"aliyuncs"]) return NO;
+    return [h containsString:@"airchat"];
+}
 // 递归清洗：去掉 NSNull 等不可 plist/JSON 序列化对象，避免 writeToFile / dataWithJSONObject 静默失败
 static inline id ACJSONSafeObject(id obj, NSInteger depth) {
 if (depth > 8 || !obj) return nil;
@@ -275,6 +285,10 @@ static NSString *__currentChatPeerId = nil;
 // --- 1. 迎新配置 ---
 @property (nonatomic, assign) BOOL autoWelcomeEnabled;
 @property (nonatomic, copy) NSString *welcomeMessageText;
+// —— 迎新方式独立开关：文字 / 图片视频 / 1 秒语音打招呼 ——
+@property (nonatomic, assign) BOOL welcomeTextEnabled;
+@property (nonatomic, assign) BOOL welcomeMediaEnabled;
+@property (nonatomic, assign) BOOL welcomeVoiceCallEnabled;
 @property (nonatomic, strong) NSMutableSet<NSString *> *welcomeGroupIds;
 @property (nonatomic, strong) NSMutableSet<NSString *> *greetedUserIds;
 @property (nonatomic, assign) NSInteger greetedCount;
@@ -423,6 +437,9 @@ instance.capturedClientTypeV2 = @"79b3h7aOxJurSbzVhPK2Wal1cKQzfppVutid7[d]gEtuxY
 instance.welcomeGroupIds = [NSMutableSet set];
 instance.greetedUserIds = [NSMutableSet set];
 instance.lastGreetLog = @"等待新人进群...";
+instance.welcomeTextEnabled = YES;
+instance.welcomeMediaEnabled = YES;
+instance.welcomeVoiceCallEnabled = NO;
 instance.autoReplyRules = [NSMutableArray array];
 instance.autoReplyCooldownMap = [NSMutableDictionary dictionary];
 instance.lastAutoReplyLog = @"等待别人发来私信...";
@@ -569,6 +586,10 @@ return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Sa
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 [ud setBool:self.autoWelcomeEnabled forKey:@"AC_AutoWelcome_Enabled"];
 [ud setObject:self.welcomeMessageText ?: @"您好 {name}，欢迎进群！认识一下~" forKey:@"AC_AutoWelcome_Text"];
+// 迎新三种方式独立开关（文字 / 图片视频 / 1 秒语音）
+[ud setBool:self.welcomeTextEnabled forKey:@"AC_Welcome_Text_Enabled"];
+[ud setBool:self.welcomeMediaEnabled forKey:@"AC_Welcome_Media_Enabled"];
+[ud setBool:self.welcomeVoiceCallEnabled forKey:@"AC_Welcome_VoiceCall_Enabled"];
 [ud setObject:[self.welcomeGroupIds allObjects] forKey:@"AC_AutoWelcome_Groups"];
 if (self.capturedClientTypeV2) {
 [ud setObject:self.capturedClientTypeV2 forKey:@"AC_Captured_ClientTypeV2"];
@@ -621,6 +642,12 @@ NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 self.autoWelcomeEnabled = [ud boolForKey:@"AC_AutoWelcome_Enabled"];
 NSString *savedText = ACSafeStr([ud objectForKey:@"AC_AutoWelcome_Text"]);
 self.welcomeMessageText = (savedText.length > 0) ? savedText : @"您好 {name}，欢迎进群！认识一下~";
+// 旧版本没有这三个键时默认「文字+图片」开启、语音关闭，保持原有行为
+id savedTextFlag = [ud objectForKey:@"AC_Welcome_Text_Enabled"];
+id savedMediaFlag = [ud objectForKey:@"AC_Welcome_Media_Enabled"];
+self.welcomeTextEnabled = savedTextFlag ? [ud boolForKey:@"AC_Welcome_Text_Enabled"] : YES;
+self.welcomeMediaEnabled = savedMediaFlag ? [ud boolForKey:@"AC_Welcome_Media_Enabled"] : YES;
+self.welcomeVoiceCallEnabled = [ud boolForKey:@"AC_Welcome_VoiceCall_Enabled"];
 NSArray *savedGroups = ACSafeArray([ud objectForKey:@"AC_AutoWelcome_Groups"]);
 if (savedGroups) {
 for (id g in savedGroups) {
@@ -1645,10 +1672,14 @@ return;
 acInternalRequest = NO;
 self.momentPublishing = YES;
 self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-NSString *acPubHost = self.lastAirchatHost.length > 0 ? self.lastAirchatHost : @"apiv1.airchat.cn";
+// 405 修复：发布只允许命中 airchat 业务网关，绝不使用 COS/CDN 域名
+NSString *acPubHost = ACIsBusinessHost(self.lastAirchatHost) ? self.lastAirchatHost : @"apiv1.airchat.cn";
+ACLog(@"[发布] 目标主机 %@（嗅探值：%@）", acPubHost, self.lastAirchatHost ?: @"无");
 NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/publish", acPubHost]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
+req.timeoutInterval = 15.0;
+// Host 由 URLSession 按 URL 自动生成，这里绝不手动塞入 COS/上传请求的 Host，避免被网关误判为对象存储写入
 // 修复：Accept 必须是 *／*（通配符；注意注释里不要写半角星号+斜杠+星号，否则会被 Logos 当成块注释吞掉后续代码）；UA 必须固定为 App 原生 UA。
 // 旧版从全局 Header 池取值，会被 COS 上传请求污染成 cos-xml-ios-sdk + Accept "/"，
 // 网关直接返回 HTTP 500（空 body），这就是“发布没效果”的主因。
@@ -1842,7 +1873,45 @@ if (idx >= newTargetsToGreet.count) return;
 ACContactItem *newMember = newTargetsToGreet[idx];
 ACForwardHelperManager *m = weakSelf;
 if (!m) return;
-// ① 先语音打招呼：发起振铃并在 voiceHangupSeconds 后自动挂断
+// 三种迎新方式完全独立：📞语音 / 💬文字 / 🖼️图片视频，各自受开关控制
+BOOL wantVoice = m.welcomeVoiceCallEnabled;
+BOOL wantText = m.welcomeTextEnabled;
+BOOL wantMedia = m.welcomeMediaEnabled;
+NSString *templateText = m.welcomeMessageText ?: @"";
+NSString *displayNick = (newMember.name && ![newMember.name hasPrefix:@"群友_"]) ? newMember.name : @"新朋友";
+NSString *finalGreeting = [templateText stringByReplacingOccurrencesOfString:@"{name}" withString:displayNick];
+__block void (^advance)(void) = ^{
+idx++;
+NSTimeInterval delay = wantVoice ? (4.0 + (arc4random_uniform(31) / 10.0)) : (8.0 + (arc4random_uniform(71) / 10.0));
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+greetNext();
+});
+};
+__block void (^sendWelcomeMessage)(void) = ^{
+ACForwardHelperManager *m2 = weakSelf;
+if (!m2) return;
+BOOL hasText = wantText && finalGreeting.length > 0;
+BOOL hasMedia = wantMedia && [m2 mediaTypeForSlot:ACMediaSlotWelcome] != 0;
+if (!hasText && !hasMedia) {
+m2.lastGreetLog = [NSString stringWithFormat:@"⚪ 文字/图片/语音均关闭，跳过迎新 [%@]", newMember.name];
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+advance();
+return;
+}
+NSString *bodyText = hasText ? finalGreeting : @"";
+[m2 sendText:bodyText mediaSlot:ACMediaSlotWelcome attachMedia:hasMedia toItem:newMember completion:^(BOOL ok, NSString *detail) {
+if (ok) {
+m2.lastGreetLog = [NSString stringWithFormat:@"✅ 迎新送达 [%@]: %@%@ (共%ld人)",
+newMember.name, hasText ? @"文字" : @"", hasMedia ? @"+图片/视频" : @"", (long)m2.greetedCount];
+} else {
+m2.lastGreetLog = [NSString stringWithFormat:@"⚠️ 迎新 %@: %@", newMember.name, detail];
+}
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+advance();
+}];
+};
+if (wantVoice) {
+// ① 语音打招呼：振铃后在 voiceHangupSeconds（默认 1 秒）自动挂断
 [m triggerSingleVoiceCallForTarget:newMember.targetId nick:newMember.name completion:^{
 ACForwardHelperManager *m2 = weakSelf;
 if (!m2) return;
@@ -1850,27 +1919,12 @@ m2.greetedCount++;
 m2.lastGreetLog = [NSString stringWithFormat:@"📞 已对新成员 [%@] 执行 %.1f 秒语音打招呼 (累计%ld人)",
 newMember.name, (m2.voiceHangupSeconds >= 0.3f ? m2.voiceHangupSeconds : 1.0f), (long)m2.greetedCount];
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-// ② 若配置了欢迎文案，语音后再补一条文字/机器人消息
-NSString *templateText = m2.welcomeMessageText ?: @"";
-if (templateText.length > 0) {
-NSString *displayNick = (newMember.name && ![newMember.name hasPrefix:@"群友_"]) ? newMember.name : @"新朋友";
-NSString *finalGreeting = [templateText stringByReplacingOccurrencesOfString:@"{name}" withString:displayNick];
-[m2 sendText:finalGreeting mediaSlot:ACMediaSlotWelcome attachMedia:YES toItem:newMember completion:^(BOOL ok, NSString *detail) {
-if (ok) {
-m2.lastGreetLog = [NSString stringWithFormat:@"✅ 语音+文字迎新 [%@]: %@ (共%ld人)", newMember.name, detail, (long)m2.greetedCount];
+// ② 语音结束后，按文字/图片开关补发欢迎消息
+sendWelcomeMessage();
+}];
 } else {
-m2.lastGreetLog = [NSString stringWithFormat:@"⚠️ 语音已拨，文字迎新 %@: %@", newMember.name, detail];
+sendWelcomeMessage();
 }
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-}];
-}
-idx++;
-// 每次间隔 3~5 秒，避免连续呼叫被风控
-NSTimeInterval safeRandomDelay = 3.0 + (arc4random_uniform(21) / 10.0);
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(safeRandomDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-greetNext();
-});
-}];
 };
 // 首位新成员延迟 2 秒后发起语音呼叫
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -2264,7 +2318,7 @@ ACLog(@"[群聊] 未捕获 token，跳过云端群列表");
 if (completion) completion(0);
 return;
 }
-NSString *acGroupHost = self.lastAirchatHost.length > 0 ? self.lastAirchatHost : @"apiv1.airchat.cn";
+NSString *acGroupHost = ACIsBusinessHost(self.lastAirchatHost) ? self.lastAirchatHost : @"apiv1.airchat.cn";
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
 [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/group/myJoinGroupPage?current=1&searchKey=&size=9999", acGroupHost]]];
 req.HTTPMethod = @"GET";
@@ -2337,7 +2391,7 @@ if (progressBlock) progressBlock([NSString stringWithFormat:@"⏳ 正在采集�
 return;
 }
 if (progressBlock) progressBlock(@"🔍 正在解析群号...");
-NSString *acNumHost = self.lastAirchatHost.length > 0 ? self.lastAirchatHost : @"apiv1.airchat.cn";
+NSString *acNumHost = ACIsBusinessHost(self.lastAirchatHost) ? self.lastAirchatHost : @"apiv1.airchat.cn";
 NSString *path = [NSString stringWithFormat:@"https://%@/client/biz/group/get/by/number?number=%@&groupNumber=%@", acNumHost, num, num];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:path]];
 req.HTTPMethod = @"GET";
@@ -2782,6 +2836,9 @@ if (completion) completion(NO, @"发送异常");
 @property (nonatomic, strong) UIView *actionBar;
 @property (nonatomic, strong) UIView *welcomeControlBar;
 @property (nonatomic, strong) UISwitch *welcomeSwitch;
+@property (nonatomic, strong) UISwitch *welcomeTextSwitch;
+@property (nonatomic, strong) UISwitch *welcomeMediaSwitch;
+@property (nonatomic, strong) UISwitch *welcomeVoiceSwitch;
 @property (nonatomic, strong) UIView *autoReplyBar;
 @property (nonatomic, strong) UISwitch *autoReplySwitch;
 @property (nonatomic, strong) UIView *momentTaskBar;
@@ -2796,6 +2853,10 @@ if (completion) completion(NO, @"发送异常");
 @property (nonatomic, strong) UIView *manualGroupBar;
 @property (nonatomic, strong) UITextField *manualGroupField;
 - (UISwitch *)ac_toolSwitch:(BOOL)on tag:(NSInteger)tag;
+- (NSString *)ac_welcomeModeSummary;
+- (void)welcomeTextSwitchChanged:(UISwitch *)sw;
+- (void)welcomeMediaSwitchChanged:(UISwitch *)sw;
+- (void)welcomeVoiceSwitchChanged:(UISwitch *)sw;
 @end
 @implementation ACForwardAssistantVC
 // 根据当前选中的 Tab 决定右上角图片/视频框操作的是哪一个独立媒体槽位
@@ -2817,7 +2878,7 @@ default:                   return @"群发专属";
 - (void)viewDidLoad {
 [super viewDidLoad];
 @try {
-self.title = @"全能助手 (四套媒体独立隔离)";
+self.title = @"全能助手";
 self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
 self.edgesForExtendedLayout = UIRectEdgeNone;
 self.extendedLayoutIncludesOpaqueBars = NO;
@@ -2959,26 +3020,58 @@ manualFetchBtn.layer.cornerRadius = 8;
 [manualFetchBtn addTarget:self action:@selector(fetchByManualGroupNumberAction) forControlEvents:UIControlEventTouchUpInside];
 [self.manualGroupBar addSubview:manualFetchBtn];
 [self.headerContainer addSubview:self.manualGroupBar];
-self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 156, width - 32, 38)];
+// 迎新控制条：两排布局（第一排 总开关+语音打招呼+全选群；第二排 文字+图片视频），避免拥挤
+self.welcomeControlBar = [[UIView alloc] initWithFrame:CGRectMake(16, 150, width - 32, 82)];
 self.welcomeControlBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
 self.welcomeControlBar.layer.cornerRadius = 10;
 self.welcomeControlBar.hidden = YES;
-UILabel *wLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, width - 190, 38)];
+UILabel *wLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 4, 62, 32)];
 wLabel.font = [UIFont boldSystemFontOfSize:12];
-wLabel.text = @"🤖 迎新(独立图/视频 | 8-15s)";
+wLabel.text = @"🤖迎新";
 [self.welcomeControlBar addSubview:wLabel];
+self.welcomeSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(64, 5.5, 51, 31)];
+self.welcomeSwitch.transform = CGAffineTransformMakeScale(0.75, 0.75);
+self.welcomeSwitch.on = mgr.autoWelcomeEnabled;
+[self.welcomeSwitch addTarget:self action:@selector(welcomeSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+[self.welcomeControlBar addSubview:self.welcomeSwitch];
+UILabel *voiceLabel = [[UILabel alloc] initWithFrame:CGRectMake(112, 4, 62, 32)];
+voiceLabel.font = [UIFont boldSystemFontOfSize:12];
+voiceLabel.text = @"📞语音";
+[self.welcomeControlBar addSubview:voiceLabel];
+self.welcomeVoiceSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(166, 5.5, 51, 31)];
+self.welcomeVoiceSwitch.transform = CGAffineTransformMakeScale(0.75, 0.75);
+self.welcomeVoiceSwitch.on = mgr.welcomeVoiceCallEnabled;
+[self.welcomeVoiceSwitch addTarget:self action:@selector(welcomeVoiceSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+[self.welcomeControlBar addSubview:self.welcomeVoiceSwitch];
 UIButton *allWelcomeGrpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-allWelcomeGrpBtn.frame = CGRectMake(width - 32 - 118, 5, 56, 28);
+allWelcomeGrpBtn.frame = CGRectMake(width - 32 - 58, 8, 50, 26);
 [allWelcomeGrpBtn setTitle:@"全选群" forState:UIControlStateNormal];
-allWelcomeGrpBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+allWelcomeGrpBtn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
 allWelcomeGrpBtn.backgroundColor = [UIColor systemGroupedBackgroundColor];
 allWelcomeGrpBtn.layer.cornerRadius = 6;
 [allWelcomeGrpBtn addTarget:self action:@selector(selectAllWelcomeGroups) forControlEvents:UIControlEventTouchUpInside];
 [self.welcomeControlBar addSubview:allWelcomeGrpBtn];
-self.welcomeSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(width - 32 - 56, 3.5, 51, 31)];
-self.welcomeSwitch.on = mgr.autoWelcomeEnabled;
-[self.welcomeSwitch addTarget:self action:@selector(welcomeSwitchChanged:) forControlEvents:UIControlEventValueChanged];
-[self.welcomeControlBar addSubview:self.welcomeSwitch];
+UIView *welcomeRowLine = [[UIView alloc] initWithFrame:CGRectMake(10, 40, width - 52, 0.5)];
+welcomeRowLine.backgroundColor = [UIColor separatorColor];
+[self.welcomeControlBar addSubview:welcomeRowLine];
+UILabel *textLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 43, 52, 32)];
+textLabel.font = [UIFont boldSystemFontOfSize:12];
+textLabel.text = @"💬文字";
+[self.welcomeControlBar addSubview:textLabel];
+self.welcomeTextSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(58, 44.5, 51, 31)];
+self.welcomeTextSwitch.transform = CGAffineTransformMakeScale(0.75, 0.75);
+self.welcomeTextSwitch.on = mgr.welcomeTextEnabled;
+[self.welcomeTextSwitch addTarget:self action:@selector(welcomeTextSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+[self.welcomeControlBar addSubview:self.welcomeTextSwitch];
+UILabel *mediaLabel = [[UILabel alloc] initWithFrame:CGRectMake(110, 43, 82, 32)];
+mediaLabel.font = [UIFont boldSystemFontOfSize:12];
+mediaLabel.text = @"🖼️图/视频";
+[self.welcomeControlBar addSubview:mediaLabel];
+self.welcomeMediaSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(190, 44.5, 51, 31)];
+self.welcomeMediaSwitch.transform = CGAffineTransformMakeScale(0.75, 0.75);
+self.welcomeMediaSwitch.on = mgr.welcomeMediaEnabled;
+[self.welcomeMediaSwitch addTarget:self action:@selector(welcomeMediaSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+[self.welcomeControlBar addSubview:self.welcomeMediaSwitch];
 [self.headerContainer addSubview:self.welcomeControlBar];
 self.autoReplyBar = [[UIView alloc] initWithFrame:CGRectMake(16, 156, width - 32, 38)];
 self.autoReplyBar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
@@ -3181,15 +3274,57 @@ mgr.welcomeMessageText = self.contentTextView.text;
 [mgr saveAllCustomSettings];
 [mgr setupIMGroupWelcomeListener];
 if (sw.isOn) {
-NSInteger wType = [mgr mediaTypeForSlot:ACMediaSlotWelcome];
-NSString *mediaTip = wType == 2 ? @"+迎新专属视频" : (wType == 1 ? @"+迎新专属图" : @"纯文本");
 self.statusLabel.textColor = [UIColor systemGreenColor];
-self.statusLabel.text = [NSString stringWithFormat:@"🟢 迎新已开启(8-15s|%@) | 监控 %lu 群", mediaTip, (unsigned long)mgr.welcomeGroupIds.count];
+self.statusLabel.text = [NSString stringWithFormat:@"🟢 迎新已开启（%@）| 监控 %lu 群",
+[self ac_welcomeModeSummary], (unsigned long)mgr.welcomeGroupIds.count];
 } else {
 self.statusLabel.textColor = [UIColor secondaryLabelColor];
 self.statusLabel.text = @"⚪ 迎新已关闭";
 }
 [self updateUI];
+}
+// 迎新方式摘要，例如「📞语音+💬文字+🖼️图/视频」
+- (NSString *)ac_welcomeModeSummary {
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+NSMutableArray *parts = [NSMutableArray array];
+if (mgr.welcomeVoiceCallEnabled) [parts addObject:[NSString stringWithFormat:@"📞语音(%.1f秒)", mgr.voiceHangupSeconds]];
+if (mgr.welcomeTextEnabled) [parts addObject:@"💬文字"];
+if (mgr.welcomeMediaEnabled) {
+NSInteger wType = [mgr mediaTypeForSlot:ACMediaSlotWelcome];
+[parts addObject:(wType == 2 ? @"🖼️视频" : (wType == 1 ? @"🖼️图片" : @"🖼️图/视频"))];
+}
+return parts.count > 0 ? [parts componentsJoinedByString:@"+"] : @"未选择任何方式";
+}
+- (void)welcomeVoiceSwitchChanged:(UISwitch *)sw {
+[self.view endEditing:YES];
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.welcomeVoiceCallEnabled = sw.isOn;
+[mgr saveAllCustomSettings];
+self.statusLabel.textColor = sw.isOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+self.statusLabel.text = [NSString stringWithFormat:@"%@ | 当前方式：%@",
+sw.isOn ? @"🟢 迎新已加「1 秒语音打招呼」" : @"⚪ 迎新语音打招呼已关闭",
+[self ac_welcomeModeSummary]];
+}
+- (void)welcomeTextSwitchChanged:(UISwitch *)sw {
+[self.view endEditing:YES];
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.welcomeTextEnabled = sw.isOn;
+mgr.welcomeMessageText = self.contentTextView.text;
+[mgr saveAllCustomSettings];
+self.statusLabel.textColor = sw.isOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+self.statusLabel.text = [NSString stringWithFormat:@"%@ | 当前方式：%@",
+sw.isOn ? @"🟢 迎新已发送欢迎文字" : @"⚪ 迎新文字已关闭",
+[self ac_welcomeModeSummary]];
+}
+- (void)welcomeMediaSwitchChanged:(UISwitch *)sw {
+[self.view endEditing:YES];
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.welcomeMediaEnabled = sw.isOn;
+[mgr saveAllCustomSettings];
+self.statusLabel.textColor = sw.isOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+self.statusLabel.text = [NSString stringWithFormat:@"%@ | 当前方式：%@",
+sw.isOn ? @"🟢 迎新会附带图片/视频" : @"⚪ 迎新图片/视频已关闭",
+[self ac_welcomeModeSummary]];
 }
 - (void)autoReplySwitchChanged:(UISwitch *)sw {
 [self.view endEditing:YES];
@@ -3525,8 +3660,9 @@ self.statusLabel.text = @"💡 可在下方输入群号直接采集；也可勾�
 } else if (idx == 3) {
 self.contentTextView.text = mgr.welcomeMessageText ?: @"您好 {name}，欢迎进群！认识一下~";
 self.statusLabel.textColor = mgr.autoWelcomeEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-self.statusLabel.text = [NSString stringWithFormat:@"%@ | 右上角为【迎新专属图/视频】，不与群发互通",
-mgr.autoWelcomeEnabled ? @"🟢 8-15s迎新中" : @"⚪ 迎新未开启"];
+self.statusLabel.text = [NSString stringWithFormat:@"%@ | 当前方式：%@",
+mgr.autoWelcomeEnabled ? @"🟢 迎新监听中" : @"⚪ 迎新未开启",
+[self ac_welcomeModeSummary]];
 } else if (idx == 4) {
 self.contentTextView.text = @"价格=您好 {name}，具体介绍请看我发您的资料哦~";
 self.statusLabel.textColor = mgr.autoReplyEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
@@ -3944,8 +4080,8 @@ BOOL acIsAirChatHost = ([urlStr containsString:@"airchat.cc"] || [urlStr contain
 if (!acInternalRequest && acIsAirChatHost && request.allHTTPHeaderFields) {
 NSDictionary *headers = request.allHTTPHeaderFields;
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-// 记录 App 实际业务域名（.cn/.cc/.ltd），发布/群列表请求优先复用它
-if (request.URL.host.length > 0) mgr.lastAirchatHost = request.URL.host;
+// 记录 App 实际业务域名（.cn/.cc/.ltd）；COS/CDN 域名绝不记录，避免发布请求打到对象存储返回 405
+if (ACIsBusinessHost(request.URL.host)) mgr.lastAirchatHost = request.URL.host;
 // 原生发布请求：整份 Header 作为模板保存（UA/Accept/X-Lts-Id 都与该接口匹配）
 if ([urlStr containsString:@"/post/app/publish"]) {
 mgr.lastPublishHeaders = [headers mutableCopy];
