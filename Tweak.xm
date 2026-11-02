@@ -1108,7 +1108,7 @@ req.HTTPMethod = @"POST";
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (ltsId.length >= 140) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+if (ltsId.length > 50) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
 uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
 static uint64_t acReqSeq = 0;
 acReqSeq = (acReqSeq + 1) & 0x7F;
@@ -1172,9 +1172,9 @@ if ([self.likedPostIds containsObject:pid] || [self.likeQueue containsObject:pid
 NSTimeInterval ct = 0;
 NSDate *created = [df dateFromString:ACSafeStr(rec[@"createTime"])];
 if (created) ct = [created timeIntervalSince1970];
+// 开启后直接点赞当前最新一批动态（最多由队列节流处理），确保开关立刻可见效果
 if (!self.autoLikeSeeded) {
-// 刚开启功能：只点赞“开启之后”的新动态，避免把历史动态全部刷一遍
-if (ct >= self.autoLikeEnabledAt - 5.0) [fresh addObject:pid];
+if (ct >= self.autoLikeEnabledAt - 5.0 || fresh.count < 15) [fresh addObject:pid];
 continue;
 }
 [fresh addObject:pid];
@@ -1230,12 +1230,12 @@ req.HTTPMethod = @"POST";
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (ltsId.length >= 140) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+if (ltsId.length > 50) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
 uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
 static uint64_t acLikeSeq = 0;
 acLikeSeq = (acLikeSeq + 1) & 0x7F;
 [req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acLikeSeq] forHTTPHeaderField:@"X-Request-No"];
-NSDictionary *bodyDict = @{@"postId": postId ?: @"", @"id": postId ?: @"", @"likeStatus": @(1), @"type": @(1)};
+NSDictionary *bodyDict = @{@"postId": postId ?: @"", @"id": postId ?: @"", @"likeStatus": @(1)};
 NSData *body = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
 if (!body) { self.isLikeSending = NO; return; }
 req.HTTPBody = body;
@@ -1293,7 +1293,7 @@ NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
 if (token.length == 0) return;
 self.autoLikePolling = YES;
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
-[NSURL URLWithString:@"https://apiv1.airchat.cc/airchat/c/post/pageIds?channelType=1&current=1&size=30"]];
+[NSURL URLWithString:@"https://apiv1.airchat.cc/airchat/c/post/pageIds?channelType=1&current=1&size=50"]];
 req.HTTPMethod = @"GET";
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
@@ -1637,15 +1637,13 @@ self.lastMomentLog = @"⏳ 上一条动态仍在发布中，请稍后再试";
 if (completion) completion(NO, self.lastMomentLog);
 return;
 }
-// ① 优先走 App 原生发布（自动带全签名/环境头，规避 code:500）
+// ① 直接走业务网关 HTTP 发布：不再尝试原生桥接（原生桥接拿不到签名，反而拖 25 秒并导致后续超时）
 self.momentPublishing = YES;
 self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-if ([self ac_tryNativeMomentPublish:task completion:completion]) return;
-self.momentPublishing = NO;
-ACLog(@"[发布] 原生桥接不可用，使用 HTTP 兜底");
 // 修复：token 大小写无关，并允许等待 App 后续请求把 token 捕获进来
 NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
 if (token.length == 0) {
+self.momentPublishing = NO; // 等待 token 期间先释放发布锁，否则递归重试会被自己的锁挡住
 self.lastMomentLog = @"⏳ 正在获取登录凭证（最多等待 20 秒，请保持 App 前台）...";
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 __weak typeof(self) weakSelf = self;
@@ -1672,8 +1670,8 @@ return;
 acInternalRequest = NO;
 self.momentPublishing = YES;
 self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-// 405 修复：发布只允许命中 airchat 业务网关，绝不使用 COS/CDN 域名
-NSString *acPubHost = ACIsBusinessHost(self.lastAirchatHost) ? self.lastAirchatHost : @"apiv1.airchat.cn";
+// 405 修复：固定业务网关 apiv1.airchat.cc，绝不跟随嗅探值/COS 域名，避免 POST 被重定向到对象存储
+NSString *acPubHost = @"apiv1.airchat.cc";
 ACLog(@"[发布] 目标主机 %@（嗅探值：%@）", acPubHost, self.lastAirchatHost ?: @"无");
 NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/publish", acPubHost]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
@@ -1697,7 +1695,7 @@ req.timeoutInterval = 15.0;
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
 NSTimeInterval ltsAge = self.latestLtsAt > 0 ? [[NSDate date] timeIntervalSince1970] - self.latestLtsAt : -1;
-if (ltsId.length >= 140) {
+if (ltsId.length > 50) {
 [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
 }
 // 修复：X-Request-No 与 App 原生一致 = (毫秒时间戳 << 7) | 0~127 序号，15 位数字
