@@ -1855,7 +1855,7 @@ NSString *templateText = m2.welcomeMessageText ?: @"";
 if (templateText.length > 0) {
 NSString *displayNick = (newMember.name && ![newMember.name hasPrefix:@"群友_"]) ? newMember.name : @"新朋友";
 NSString *finalGreeting = [templateText stringByReplacingOccurrencesOfString:@"{name}" withString:displayNick];
-[m2 sendText:finalGreeting mediaSlot:ACMediaSlotWelcome attachMedia:YES toItem:newMember asRobot:m2.robotModeEnabled completion:^(BOOL ok, NSString *detail) {
+[m2 sendText:finalGreeting mediaSlot:ACMediaSlotWelcome attachMedia:YES toItem:newMember completion:^(BOOL ok, NSString *detail) {
 if (ok) {
 m2.lastGreetLog = [NSString stringWithFormat:@"✅ 语音+文字迎新 [%@]: %@ (共%ld人)", newMember.name, detail, (long)m2.greetedCount];
 } else {
