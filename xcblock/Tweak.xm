@@ -135,6 +135,104 @@ static BOOL XCIsSplashClass(NSString *name) {
 
 @end
 
+#pragma mark - 配置 JSON 重写（剥掉 Kuikly/KMP 开屏字段）
+
+static BOOL XCIsConfigHost(NSString *host) {
+    NSString *h = host.lowercaseString;
+    return ([h containsString:@"realtech-inc.com"] || [h containsString:@"xinyifm.cn"]);
+}
+
+static BOOL XCIsConfigPath(NSString *path) {
+    NSString *p = path.lowercaseString;
+    return ([p containsString:@"/configs/"] || [p hasSuffix:@".json"] || [p hasSuffix:@".jso"]);
+}
+
+static BOOL XCIsSplashKey(NSString *key) {
+    NSString *k = key.lowercaseString;
+    return ([k containsString:@"splash"] || [k containsString:@"openscreen"] ||
+            [k containsString:@"open_screen"] || [k containsString:@"launchad"] ||
+            [k containsString:@"launch_ad"] || [k containsString:@"ad_screen"] ||
+            [k containsString:@"boot_ad"] || [k containsString:@"bootad"] ||
+            [k containsString:@"start_ad"] || [k containsString:@"startad"]);
+}
+
+static NSInteger XCStripSplashFromObject(id obj, NSInteger depth) {
+    if (depth > 12 || !obj) return 0;
+    NSInteger removed = 0;
+    if ([obj isKindOfClass:[NSMutableDictionary class]]) {
+        NSMutableDictionary *dict = (NSMutableDictionary *)obj;
+        for (NSString *key in [dict allKeys]) {
+            if ([key isKindOfClass:[NSString class]] && XCIsSplashKey(key)) {
+                [dict removeObjectForKey:key];
+                removed++;
+            } else {
+                removed += XCStripSplashFromObject(dict[key], depth + 1);
+            }
+        }
+        return removed;
+    }
+    if ([obj isKindOfClass:[NSMutableArray class]]) {
+        for (id sub in (NSArray *)obj) removed += XCStripSplashFromObject(sub, depth + 1);
+        return removed;
+    }
+    return 0;
+}
+
+@interface XCConfigRewriteProtocol : NSURLProtocol
+@end
+
+@implementation XCConfigRewriteProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if ([NSURLProtocol propertyForKey:@"XCRewriteMark" inRequest:request]) return NO;
+    if (!XCIsConfigHost(request.URL.host)) return NO;
+    if (!XCIsConfigPath(request.URL.path ?: @"") && !XCIsConfigPath(request.URL.absoluteString ?: @"")) return NO;
+    return YES;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
+
+- (void)startLoading {
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:self.request.URL];
+    req.HTTPMethod = self.request.HTTPMethod;
+    req.timeoutInterval = 10.0;
+    [NSURLProtocol setProperty:@YES forKey:@"XCRewriteMark" inRequest:req];
+    __weak typeof(self) weakSelf = self;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) {
+            [weakSelf.client URLProtocol:weakSelf didFailWithError:error ?: [NSError errorWithDomain:@"XC" code:-1 userInfo:nil]];
+            return;
+        }
+        NSData *outData = data;
+        @try {
+            id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+            if (json) {
+                NSInteger removed = XCStripSplashFromObject(json, 0);
+                if (removed > 0) {
+                    NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                    if (newData) {
+                        outData = newData;
+                        XCLog(@"config %@ 剥除开屏字段 %ld 个", self.request.URL.lastPathComponent, (long)removed);
+                    }
+                }
+            }
+        } @catch (NSException *e) {}
+        NSHTTPURLResponse *httpResp = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+        NSDictionary *headers = httpResp.allHeaderFields ?: @{};
+        NSHTTPURLResponse *newResp = [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+                                                                statusCode:httpResp ? httpResp.statusCode : 200
+                                                               HTTPVersion:@"HTTP/1.1"
+                                                              headerFields:headers];
+        [weakSelf.client URLProtocol:weakSelf didReceiveResponse:newResp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        [weakSelf.client URLProtocol:weakSelf didLoadData:outData];
+        [weakSelf.client URLProtocolDidFinishLoading:weakSelf];
+    }] resume];
+}
+
+- (void)stopLoading {}
+
+@end
+
 #pragma mark - 跳过 / 自动点击
 
 static void XCInvokeVoidSelector(id obj, NSString *selName, BOOL withNilArg) {
@@ -326,6 +424,14 @@ static id XC_ephemeralConfig(id self, SEL _cmd) {
     return cfg;
 }
 
+static void (*XC_orig_setProtocols)(id, SEL, NSArray *) = NULL;
+static void XC_setProtocols(id self, SEL _cmd, NSArray *classes) {
+    NSMutableArray *arr = classes ? [classes mutableCopy] : [NSMutableArray array];
+    if (![arr containsObject:[XCAdURLProtocol class]]) [arr insertObject:[XCAdURLProtocol class] atIndex:0];
+    if (![arr containsObject:[XCConfigRewriteProtocol class]]) [arr insertObject:[XCConfigRewriteProtocol class] atIndex:0];
+    if (XC_orig_setProtocols) XC_orig_setProtocols(self, _cmd, arr);
+}
+
 static void XCInstallHooks(void) {
     Class vcCls = [UIViewController class];
     Method mDid = class_getInstanceMethod(vcCls, @selector(viewDidAppear:));
@@ -363,6 +469,11 @@ static void XCInstallHooks(void) {
     if (m3) {
         XC_orig_ephemeralConfig = (id (*)(id, SEL))method_getImplementation(m3);
         method_setImplementation(m3, (IMP)XC_ephemeralConfig);
+    }
+    Method m4 = class_getInstanceMethod(cfgCls, @selector(setProtocolClasses:));
+    if (m4) {
+        XC_orig_setProtocols = (void (*)(id, SEL, NSArray *))method_getImplementation(m4);
+        method_setImplementation(m4, (IMP)XC_setProtocols);
     }
 }
 
@@ -416,6 +527,7 @@ __attribute__((constructor)) static void XCInitialize(void) {
         XCInstallHooks();
         // 全局注册协议，任何 SDK 自建 Session 也会走拦截（gromore/pangolin 等）
         [NSURLProtocol registerClass:[XCAdURLProtocol class]];
+        [NSURLProtocol registerClass:[XCConfigRewriteProtocol class]];
         XCLog(@"init dylib");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCCreateOverlay();
