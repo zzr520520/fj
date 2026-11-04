@@ -3,20 +3,28 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-// 小蚕惠生活 开屏页跳过（纯净 dylib 版：不依赖 CydiaSubstrate，可随 IPA 重签）
-// 说明：上一版用 Theos 构建，会自动链接 CydiaSubstrate，在未越狱设备上 dyld 直接
-// 报 "Library not loaded: /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate" 闪退。
-// 本版全部改用 Objective-C Runtime 动态挂载，仅依赖 UIKit/Foundation。
+// 小蚕惠生活 开屏/插屏广告跳过（纯净 dylib：不依赖 CydiaSubstrate）
+// v4：除了「类名识别」外，增加
+//   1) viewWillAppear / viewDidAppear 双钩子（覆盖只实现 willAppear 或未调用 super 的页面）
+//   2) 启动后 10 秒内遍历所有窗口，自动点击「跳过 / Skip」按钮
+//   3) 递归检查 rootViewController 与 presentedViewController 链
+//   4) 扩充广告域名拦截
+
+static NSTimeInterval XCLaunchTime = 0;
 
 static BOOL XCIsSplashClass(NSString *name) {
     if (name.length == 0) return NO;
-    NSString *lower = [name lowercaseString];
-    if ([lower containsString:@"splash"] || [lower containsString:@"launchad"]) return YES;
+    NSString *lower = name.lowercaseString;
+    if ([lower containsString:@"splash"]) return YES;
+    if ([lower containsString:@"launchad"]) return YES;
     if ([lower containsString:@"launch"] && ![lower containsString:@"launchutil"]) return YES;
+    if ([lower containsString:@"advert"]) return YES;
+    if ([lower containsString:@"adviewcontroller"] || [lower containsString:@"adpage"]) return YES;
+    if ([lower containsString:@"interstitial"]) return YES;
     return NO;
 }
 
-#pragma mark - 广告域名拦截（返回 404，避免开屏素材与二次跳转）
+#pragma mark - 广告域名拦截
 
 @interface XCAdURLProtocol : NSURLProtocol
 @end
@@ -29,17 +37,20 @@ static BOOL XCIsSplashClass(NSString *name) {
     dispatch_once(&onceToken, ^{
         domains = @[
             @"leadmoad.com", @"adbiding.com", @"tobidad.cn", @"sigmob.cn",
-            @"pangolin-sdk-toutiao", @"pglstatp-toutiao.com", @"ctobsnssdk.com",
-            @"oceanengine.com", @"bdurl.net", @"gdt.qq.com", @"e.qq.com",
-            @"ugdtimg.com", @"tdid.m.qq.com", @"mobads.baidu.com",
-            @"mobads-logs.baidu.com", @"als.baidu.com", @"wn.pos.baidu.com",
-            @"bcebos.com", @"mentamob.com", @"advlion.com", @"vlion.cn",
-            @"beizi.biz", @"adn-plus.com.cn", @"ad-scope.com.cn",
+            @"pglstatp-toutiao.com", @"ctobsnssdk.com", @"oceanengine.com",
+            @"bdurl.net", @"gdt.qq.com", @"e.qq.com", @"ugdtimg.com",
+            @"tdid.m.qq.com", @"mobads.baidu.com", @"als.baidu.com",
+            @"wn.pos.baidu.com", @"bcebos.com", @"mentamob.com", @"advlion.com",
+            @"vlion.cn", @"beizi.biz", @"adn-plus.com.cn", @"ad-scope.com.cn",
             @"zhangyuyidong.cn", @"hubcloud.com.cn", @"adintl.cn", @"1rtb.net",
             @"1rtb.com", @"fancydsp.com", @"fancyapi.com", @"yunxish.com",
             @"58iclick.com", @"iggrowth.cn", @"innotechx.com", @"dmrtb.com",
             @"richmob.cn", @"shunchangzhixing.com", @"ubixioe.com", @"xwpbj.com",
-            @"baihemob.com", @"etoolads.cn", @"tanx.com", @"fibo.cn"
+            @"baihemob.com", @"etoolads.cn", @"tanx.com", @"fibo.cn",
+            @"windmill", @"windmill-sdk", @"msad", @"octopus", @"youtui",
+            @"csjprotocol.com", @"ksad", @"kuaishou.com/ad", @"gdtimg.com",
+            @"pangolin-sdk", @"admaster.com.cn", @"miaozhen.com", @"sensortower",
+            @"applovin.com", @"unityads", @"vungle.com", @"chartboost.com"
         ];
     });
     return domains;
@@ -83,7 +94,7 @@ static BOOL XCIsSplashClass(NSString *name) {
 
 @end
 
-#pragma mark - 跳过开屏控制器
+#pragma mark - 跳过 / 自动点击
 
 static void XCInvokeVoidSelector(id obj, NSString *selName, BOOL withNilArg) {
     if (!obj || selName.length == 0) return;
@@ -133,9 +144,53 @@ static void XCSkipSplashViewController(UIViewController *vc) {
     }
 }
 
+// 递归点击「跳过 / Skip」按钮（广告 SDK 自绘页面通常都有）
+static BOOL XCTapSkipButtonInView(UIView *view, NSInteger depth) {
+    if (!view || depth > 24) return NO;
+    if ([view isKindOfClass:[UIButton class]]) {
+        UIButton *btn = (UIButton *)view;
+        NSString *title = [btn titleForState:UIControlStateNormal];
+        if (!title.length) title = btn.currentTitle;
+        if (!title.length) title = btn.titleLabel.text;
+        NSString *lower = title.lowercaseString;
+        if (title.length > 0 && ([title containsString:@"跳过"] || [lower containsString:@"skip"])) {
+            [btn sendActionsForControlEvents:UIControlEventTouchUpInside];
+            return YES;
+        }
+    }
+    for (UIView *sub in view.subviews) {
+        if (XCTapSkipButtonInView(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static void XCTapSkipButtonsInWindows(void) {
+    for (UIWindow *win in [UIApplication sharedApplication].windows) {
+        if (!win.hidden && win.alpha > 0.01) {
+            XCTapSkipButtonInView(win, 0);
+        }
+    }
+}
+
+static void XCHandleViewController(UIViewController *vc) {
+    if (!vc) return;
+    if (XCIsSplashClass(NSStringFromClass([vc class]))) {
+        XCSkipSplashViewController(vc);
+    }
+    UIViewController *presented = vc.presentedViewController;
+    while (presented) {
+        if (XCIsSplashClass(NSStringFromClass([presented class]))) {
+            XCSkipSplashViewController(presented);
+        }
+        presented = presented.presentedViewController;
+    }
+}
+
 #pragma mark - Runtime 挂载
 
 static void (*XC_orig_viewDidAppear)(id, SEL, BOOL) = NULL;
+static void (*XC_orig_viewWillAppear)(id, SEL, BOOL) = NULL;
+static void (*XC_orig_presentVC)(id, SEL, UIViewController *, BOOL, void (^)(void)) = NULL;
 
 static void XC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (XC_orig_viewDidAppear) XC_orig_viewDidAppear(self, _cmd, animated);
@@ -145,6 +200,28 @@ static void XC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCSkipSplashViewController(vc);
         });
+    }
+}
+
+static void XC_viewWillAppear(id self, SEL _cmd, BOOL animated) {
+    if (XC_orig_viewWillAppear) XC_orig_viewWillAppear(self, _cmd, animated);
+    if (XCIsSplashClass(NSStringFromClass([self class]))) {
+        UIViewController *vc = (UIViewController *)self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            XCSkipSplashViewController(vc);
+        });
+    }
+}
+
+static void XC_presentViewController(id self, SEL _cmd, UIViewController *vcToPresent, BOOL animated, void (^completion)(void)) {
+    // 启动 10 秒内，广告 / 开屏类控制器直接不呈现
+    if (vcToPresent && ([[NSDate date] timeIntervalSince1970] - XCLaunchTime < 10.0) &&
+        XCIsSplashClass(NSStringFromClass([vcToPresent class]))) {
+        if (completion) completion();
+        return;
+    }
+    if (XC_orig_presentVC) {
+        XC_orig_presentVC(self, _cmd, vcToPresent, animated, completion);
     }
 }
 
@@ -168,10 +245,20 @@ static id XC_ephemeralConfig(id self, SEL _cmd) {
 
 static void XCInstallHooks(void) {
     Class vcCls = [UIViewController class];
-    Method m1 = class_getInstanceMethod(vcCls, @selector(viewDidAppear:));
-    if (m1) {
-        XC_orig_viewDidAppear = (void (*)(id, SEL, BOOL))method_getImplementation(m1);
-        method_setImplementation(m1, (IMP)XC_viewDidAppear);
+    Method mDid = class_getInstanceMethod(vcCls, @selector(viewDidAppear:));
+    if (mDid) {
+        XC_orig_viewDidAppear = (void (*)(id, SEL, BOOL))method_getImplementation(mDid);
+        method_setImplementation(mDid, (IMP)XC_viewDidAppear);
+    }
+    Method mWill = class_getInstanceMethod(vcCls, @selector(viewWillAppear:));
+    if (mWill) {
+        XC_orig_viewWillAppear = (void (*)(id, SEL, BOOL))method_getImplementation(mWill);
+        method_setImplementation(mWill, (IMP)XC_viewWillAppear);
+    }
+    Method mPresent = class_getInstanceMethod(vcCls, @selector(presentViewController:animated:completion:));
+    if (mPresent) {
+        XC_orig_presentVC = (void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))method_getImplementation(mPresent);
+        method_setImplementation(mPresent, (IMP)XC_presentViewController);
     }
     Class cfgCls = [NSURLSessionConfiguration class];
     Method m2 = class_getClassMethod(cfgCls, @selector(defaultSessionConfiguration));
@@ -188,15 +275,14 @@ static void XCInstallHooks(void) {
 
 __attribute__((constructor)) static void XCInitialize(void) {
     @autoreleasepool {
+        XCLaunchTime = [[NSDate date] timeIntervalSince1970];
         XCInstallHooks();
-        // 启动后 3 秒内持续巡检窗口根控制器，兜底跳过延迟出现的开屏
-        for (NSInteger i = 1; i <= 6; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // 启动后 10 秒内：每 0.2 秒巡检窗口，跳过开屏控制器 + 自动点「跳过」
+        for (NSInteger i = 1; i <= 50; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                XCTapSkipButtonsInWindows();
                 for (UIWindow *win in [UIApplication sharedApplication].windows) {
-                    UIViewController *vc = win.rootViewController;
-                    if (XCIsSplashClass(NSStringFromClass([vc class]))) {
-                        XCSkipSplashViewController(vc);
-                    }
+                    if (!win.hidden) XCHandleViewController(win.rootViewController);
                 }
             });
         }
