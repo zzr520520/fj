@@ -861,354 +861,467 @@ static void XCDumpSuspectClassNames(void) {
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 元宝乐园自动任务引擎
+#pragma mark - 元宝乐园 一键领取引擎 v19
 
 /*
- * 发现的关键接口：
- *   SKMPSilkwormService — Silkworm 服务定位器（sharedService）
- *   ActivityTaskMobileService.UserTaskV2        — 拉任务列表
- *   ActivityTaskMobileService.CompleteTask      — 完成任务领奖
- *   ActivityTaskMobileService.SignIn            — 签到
- *   ActivityTaskMobileService.WaitClaimedPoints — 等领积分
- *   ActivityTaskMobileService.GetUnReceivedPointRecords
- *
- * 关键方法签名（Kotlin/Native 暴露到 ObjC）：
- *   getUserTaskV2PagerId:completionHandler:
- *   signInNodePagerId:completionHandler:
- *   userSignInDaysPagerId:completionHandler:
- *   getUnReceivedPointRecordsPagerId:completionHandler:
- *   fetchUserUnReceivedPointSilkId:completionHandler:
- *
- * 触发入口：VipPointsParkHostScene (元宝乐园主页面)
- *
- * 策略：
- *   1) 运行时枚举所有类，探测 Silkworm Service Locator 和 ActivityTaskMobileService 实例
- *   2) 在 VipPointsParkHostScene 出现时启动自动任务循环
- *   3) 通用 postPagerId:service:params:completionHandler: 调用任意服务方法
- *   4) Hook AdTaskRewardDialog 自动关掉广告奖励弹窗
+ * v19 方案（UI 级自动化）：
+ *  - 会员 Tab 的「轻松赚元宝」弹层由 Lynx 渲染，不是独立 VC，之前按类名触发的方案全部落空
+ *  - 任务按钮（去完成/去浏览/去关注/去邀请/领取…）是原生 UILabel + 手势/Control 实现的
+ *  - 引擎：递归扫描窗口树，找到这些文字对应的视图，模拟触发 UIControl action /
+ *    UITapGestureRecognizer target-action / accessibilityActivate
+ *  - 「一键领取」悬浮按钮：点按立即跑一轮；长按切换自动模式（每 6 秒自动点一个）
+ *  - 浏览类任务点击后停留 32 秒再返回（满足 30s 时长），其它 5 秒返回继续下一个
+ *  - 同时 swizzle getUserTaskV2PagerId: 等方法记录真实服务类名（为下一版直调做准备）
  */
 
-static NSMutableDictionary *XCTaskServiceCache = nil;   // 探测到的服务 {name: instance}
-static NSLock *XCTaskLock = nil;
-static BOOL XCTaskEngineReady = NO;
-static BOOL XCTaskRunning = NO;
-static NSInteger XCTaskRunCount = 0;
+static NSMutableDictionary *XCTappedLog = nil;      // 已点按钮去重 {key: timestamp}
+static NSLock *XCEngineLock = nil;
+static BOOL XCEngineBusy = NO;
+static BOOL XCAutoClickEnabled = YES;
+static dispatch_source_t XCEngineTimer = nil;
+static UIWindow *XCFloatWin = nil;
+static UIButton *XCFloatBtn = nil;
+static UILabel *XCFloatState = nil;
+static NSMutableDictionary *XCOrigTaskIMPs = nil;
+static NSLock *XCTaskSwizzleLock = nil;
+static NSInteger XCTapCount = 0;
 
-static void XCDiscoverServices(void) {
-    if (XCTaskEngineReady) return;
+static void XCFileLog(NSString *fmt, ...) {
     @autoreleasepool {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-            if (!XCTaskServiceCache) {
-                XCTaskServiceCache = [NSMutableDictionary dictionary];
-                XCTaskLock = [[NSLock alloc] init];
+        va_list ap; va_start(ap, fmt);
+        NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+        va_end(ap);
+        @try {
+            static NSString *path = nil;
+            static dispatch_once_t onceT;
+            dispatch_once(&onceT, ^{
+                path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"xc_dylib_log.txt"];
+            });
+            NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                              [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                                            dateFormatterStyle:NSDateFormatterShortStyle
+                                                              timeFormatterStyle:NSDateFormatterMediumStyle], msg];
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (!fh) {
+                [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            } else {
+                [fh seekToEndOfFile];
+                [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                [fh closeFile];
             }
-            int count = objc_getClassList(NULL, 0);
-            if (count <= 0) return;
-            Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
-            if (!classes) return;
-            count = objc_getClassList(classes, count);
-
-            NSMutableArray *silkwormServiceLocators = [NSMutableArray array];
-            NSMutableArray *candidates = [NSMutableArray array];
-
-            for (int i = 0; i < count; i++) {
-                Class c = classes[i];
-                NSString *name = NSStringFromClass(c);
-                if ([name hasPrefix:@"SKMP"]) {
-                    Method m = class_getClassMethod(c, @selector(sharedService));
-                    if (m) [silkwormServiceLocators addObject:c];
-
-                    // 找有 task API 的类
-                    unsigned int mc = 0;
-                    Method *ml = class_copyMethodList(c, &mc);
-                    BOOL hasTaskAPI = NO;
-                    for (unsigned int j = 0; j < mc; j++) {
-                        NSString *selName = NSStringFromSelector(method_getName(ml[j]));
-                        if ([selName containsString:@"getUserTaskV2"] ||
-                            [selName containsString:@"CompleteTask"] ||
-                            [selName containsString:@"SignIn"] ||
-                            [selName containsString:@"signInNode"] ||
-                            [selName containsString:@"postPagerId"]) {
-                            hasTaskAPI = YES;
-                            break;
-                        }
-                    }
-                    free(ml);
-                    if (hasTaskAPI) [candidates addObject:c];
-                }
-            }
-            free(classes);
-
-            [XCTaskLock lock];
-            for (Class locCls in silkwormServiceLocators) {
-                @try {
-                    id svc = [locCls performSelector:@selector(sharedService)];
-                    if (svc) {
-                        NSString *cn = NSStringFromClass(locCls);
-                        XCTaskServiceCache[cn] = svc;
-                        XCLog(@"[Task] found locator: %@ -> %@", cn, NSStringFromClass([svc class]));
-                    }
-                } @catch (NSException *e) {}
-            }
-            for (Class candCls in candidates) {
-                NSString *cn = NSStringFromClass(candCls);
-                // 有些类本身可以当服务实例（Kotlin object）
-                id candInstance = nil;
-                @try {
-                    candInstance = [candCls performSelector:@selector(sharedInstance)];
-                } @catch (NSException *e) {}
-                if (!candInstance) {
-                    @try { candInstance = [candCls performSelector:@selector(sharedService)]; }
-                    @catch (NSException *e) {}
-                }
-                if (candInstance) {
-                    XCTaskServiceCache[cn] = candInstance;
-                    XCLog(@"[Task] candidate: %@", cn);
-                }
-            }
-            XCTaskEngineReady = YES;
-            [XCTaskLock unlock];
-            XCLog(@"[Task] discovery done, cache keys: %@", XCTaskServiceCache.allKeys);
-        });
+        } @catch (NSException *e) {}
     }
 }
 
-static id XCTaskGetLocator(void) {
-    [XCTaskLock lock];
-    id loc = XCTaskServiceCache[@"SKMPSilkwormService"];
-    [XCTaskLock unlock];
-    return loc;
-}
-
-/* 生成唯一 pagerId（Silkworm 追踪用，只要每次调用不同即可） */
-static NSString *XCPagerId(void) {
-    static atomic_int seq = 0;
-    int s = atomic_fetch_add(&seq, 1);
-    return [NSString stringWithFormat:@"auto_xc_%ld_%d", (long)([[NSDate date] timeIntervalSince1970] * 1000), s];
-}
-
-/* 通用 Silkworm 服务调用：service 格式为 "ActivityTaskMobileService.UserTaskV2" */
-static void XCPostService(id locator, NSString *service, NSDictionary *params, void (^cb)(id, NSError *)) {
-    if (!locator || service.length == 0) {
-        if (cb) cb(nil, [NSError errorWithDomain:@"XC" code:-1 userInfo:@{@"msg": @"no locator"}]);
-        return;
+static UIViewController *XCTopViewController(void) {
+    UIViewController *root = nil;
+    for (UIWindow *w in XCAllWindows()) {
+        if (w.isKeyWindow && w.rootViewController) { root = w.rootViewController; break; }
     }
-    NSString *pagerId = XCPagerId();
-    SEL sel = NSSelectorFromString(@"postPagerId:service:params:completionHandler:");
-    if (![locator respondsToSelector:sel]) {
-        XCLog(@"[Task] locator doesn't respond to postPagerId, locator=%@", NSStringFromClass([locator class]));
-        if (cb) cb(nil, [NSError errorWithDomain:@"XC" code:-2 userInfo:@{@"msg": @"no post method"}]);
-        return;
-    }
-    XCLog(@"[Task] CALL %@", service);
-    id paramsArg = params ?: @{};
-    void *blk = (__bridge void *)^(id result, NSError *error) {
-        if (error) {
-            XCLog(@"[Task] %@ ERR: %@", service, error.localizedDescription ?: error);
-        } else {
-            XCLog(@"[Task] %@ OK: %@", service, [result isKindOfClass:[NSDictionary class]] ? [(NSDictionary *)result allKeys] : NSStringFromClass([result class]));
+    if (!root) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.rootViewController) { root = w.rootViewController; break; }
         }
-        if (cb) cb(result, error);
-    };
-    NSMethodSignature *sig = [locator methodSignatureForSelector:sel];
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    [inv setTarget:locator];
-    [inv setSelector:sel];
-    [inv setArgument:&pagerId atIndex:2];
-    [inv setArgument:&service atIndex:3];
-    [inv setArgument:&paramsArg atIndex:4];
-    [inv setArgument:&blk atIndex:5];
-    [inv invoke];
-    // block 被 inv retain，但 inv 是局部变量会释放，所以要手动 retain
-    // 实际上 block 本身会在 Silkworm 内部被 retain（completionHandler 语义），这里我们不管理
-}
-
-/*
- * 自动任务主循环：
- *   1) 签到（每日一次）
- *   2) 拉任务列表
- *   3) 对每个未完成的任务调 CompleteTask
- *   4) 领未接收的积分
- */
-static void XCRunAutoTaskCycle(void) {
-    if (XCTaskRunning) return;
-    XCTaskRunning = YES;
-    XCTaskRunCount++;
-    XCLog(@"[Task] ======== 自动任务循环 #%ld 启动 ========", (long)XCTaskRunCount);
-
-    id locator = XCTaskGetLocator();
-    if (!locator) {
-        XCLog(@"[Task] 没有 Silkworm locator，跳过");
-        XCTaskRunning = NO;
-        return;
     }
-
-    // ============ 步骤 1：签到 ============
-    void (^doSignIn)(void (^)(void)) = ^(void (^next)(void)) {
-        XCPostService(locator, @"ActivityTaskMobileService.SignIn", nil, ^(id r, NSError *e) {
-            if (e) XCLog(@"[Task] SignIn 失败: %@", e);
-            else XCLog(@"[Task] SignIn 成功");
-            next();
-        });
-    };
-
-    // ============ 步骤 2：拉任务列表 ============
-    void (^doFetchTasks)(void (^)(NSDictionary *)) = ^(void (^got)(NSDictionary *)) {
-        XCPostService(locator, @"ActivityTaskMobileService.UserTaskV2", nil, ^(id r, NSError *e) {
-            if (e) { got(nil); return; }
-            if ([r isKindOfClass:[NSDictionary class]]) {
-                XCLog(@"[Task] UserTaskV2 keys: %@", [(NSDictionary *)r allKeys]);
-            }
-            got([r isKindOfClass:[NSDictionary class]] ? (NSDictionary *)r : nil);
-        });
-    };
-
-    // ============ 步骤 3：逐个 CompleteTask ============
-    void (^doCompleteAll)(NSArray *, void (^)(void)) = ^(NSArray *tasks, void (^done)(void)) {
-        if (tasks.count == 0) { done(); return; }
-        __block NSInteger idx = 0;
-        void (^oneMore)(void) = nil;
-        oneMore = ^{
-            if (idx >= (NSInteger)tasks.count) { done(); return; }
-            id t = tasks[idx++];
-            NSDictionary *td = [t isKindOfClass:[NSDictionary class]] ? (NSDictionary *)t : nil;
-            NSString *taskId = nil;
-            id rawId = td[@"taskId"] ?: td[@"task_id"] ?: td[@"id"] ?: td[@"TaskId"];
-            if ([rawId isKindOfClass:[NSString class]]) taskId = rawId;
-            else if ([rawId respondsToSelector:@selector(stringValue)]) taskId = [rawId stringValue];
-            if (taskId.length == 0) { XCLog(@"[Task] 跳过无 taskId 的任务"); oneMore(); return; }
-
-            // 检查任务状态（完成的就跳过）
-            id state = td[@"taskState"] ?: td[@"task_state"] ?: td[@"state"];
-            if ([state respondsToSelector:@selector(integerValue)]) {
-                NSInteger s = [state integerValue];
-                if (s == 2 || s == 3 || s == 4) { // 常见：2=已完成 3=已领取
-                    XCLog(@"[Task] 跳过已完成 taskId=%@ state=%ld", taskId, (long)s);
-                    oneMore();
-                    return;
-                }
-            }
-            XCLog(@"[Task] 尝试完成 taskId=%@", taskId);
-            // params 可能需要 taskId，不同服务参数名可能不同，都试试
-            for (NSDictionary *params in @[
-                @{@"taskId": taskId},
-                @{@"task_id": taskId},
-                @{@"id": taskId}
-            ]) {
-                XCPostService(locator, @"ActivityTaskMobileService.CompleteTask", params, ^(id r, NSError *e) {
-                    if (!e) {
-                        XCLog(@"[Task] CompleteTask 成功 taskId=%@", taskId);
-                        // 成功了就 break 出循环
-                        idx++;
-                        oneMore();
-                    } else {
-                        XCLog(@"[Task] CompleteTask 失败 taskId=%@ err=%@", taskId, e);
-                    }
-                });
-                break; // 每次只试一种 params
-            }
-        };
-        oneMore();
-    };
-
-    // ============ 步骤 4：领积分 ============
-    void (^doClaimPoints)(void (^)(void)) = ^(void (^next)(void)) {
-        XCPostService(locator, @"ActivityTaskMobileService.WaitClaimedPoints", nil, ^(id r, NSError *e) {
-            if (!e) XCLog(@"[Task] WaitClaimedPoints: %@", r);
-            XCPostService(locator, @"ActivityTaskMobileService.GetUnReceivedPointRecords", nil, ^(id r2, NSError *e2) {
-                if (!e2) XCLog(@"[Task] GetUnReceivedPointRecords: %@", r2);
-                next();
-            });
-        });
-    };
-
-    // ============ 串行执行 ============
-    dispatch_async(dispatch_get_main_queue(), ^{
-        doSignIn(^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                doFetchTasks(^(NSDictionary *taskDict) {
-                    NSArray *tasks = nil;
-                    if (taskDict) {
-                        for (NSString *k in taskDict.allKeys) {
-                            id v = taskDict[k];
-                            if ([v isKindOfClass:[NSArray class]] && ((NSArray *)v).count > 0 &&
-                                [[(NSArray *)v firstObject] isKindOfClass:[NSDictionary class]]) {
-                                tasks = v;
-                                break;
-                            }
-                        }
-                    }
-                    XCLog(@"[Task] 解析出任务数: %ld", (long)tasks.count);
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        doCompleteAll(tasks, ^{
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                                doClaimPoints(^{
-                                    XCLog(@"[Task] ======== 自动任务循环 #%ld 完成 ========", (long)XCTaskRunCount);
-                                    XCTaskRunning = NO;
-                                });
-                            });
-                        });
-                    });
-                });
-            });
-        });
-    });
+    UIViewController *top = root;
+    int guard = 0;
+    while (top.presentedViewController && guard++ < 12) top = top.presentedViewController;
+    return top;
 }
 
-/* 自动任务触发 — 定时看门狗：发现元宝乐园场景就跑 */
-static dispatch_source_t XCTaskTimer = nil;
-static BOOL XCTaskPointsParkSeen = NO;
+static NSString *XCTextOfView(UIView *v) {
+    @try {
+        if ([v isKindOfClass:[UILabel class]]) return [(UILabel *)v text];
+        if ([v isKindOfClass:[UIButton class]]) return [(UIButton *)v titleForState:UIControlStateNormal];
+        if ([v isKindOfClass:[UITextView class]]) return [(UITextView *)v text];
+        if ([v isKindOfClass:[UITextField class]]) return [(UITextField *)v text];
+        NSString *al = v.accessibilityLabel;
+        if (al.length > 0 && al.length <= 24) return al;
+    } @catch (NSException *e) {}
+    return nil;
+}
 
-static BOOL XCIsPointsParkClass(NSString *cls) {
-    // Swift runtime 类名可能是 xiaocan.VipPointsParkHostScene 或 _TtC7xiaocan22VipPointsParkHostScene
-    NSString *c = cls.lowercaseString;
-    if ([c containsString:@"pointspark"]) return YES;
-    if ([c containsString:@"vipspark"]) return YES;
-    if ([c containsString:@"points_park"]) return YES;
+static BOOL XCIsTaskActionText(NSString *text) {
+    if (text.length == 0 || text.length > 24) return NO;
+    if ([text containsString:@"已领取"] || [text containsString:@"已完成"]) return NO;
+    NSArray *pats = @[@"去完成", @"去浏览", @"去关注", @"去邀请", @"去下单", @"去参与",
+                      @"去抽奖", @"去签到", @"立即签到", @"立即领取", @"去领取", @"领取"];
+    for (NSString *p in pats) {
+        if ([text containsString:p]) return YES;
+    }
     return NO;
 }
 
-static void XCTaskWatchdogTick(void) {
-    // 找当前顶层 VC
-    UIViewController *topVC = nil;
-    for (UIWindow *w in XCAllWindows()) {
-        if (w.isKeyWindow && !w.hidden) { topVC = w.rootViewController; break; }
-    }
-    if (!topVC) { XCTaskRunning = NO; return; }
-    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
+#pragma mark 模拟点击
 
-    NSString *cls = NSStringFromClass([topVC class]);
-    BOOL inPointsPark = XCIsPointsParkClass(cls);
-    if (inPointsPark) {
-        if (!XCTaskPointsParkSeen) {
-            XCLog(@"[Task] ✅ 进入元宝乐园 (%@)，触发自动任务", cls);
-            XCTaskPointsParkSeen = YES;
-            // 刚进入，延迟一下让页面初始化完
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                XCRunAutoTaskCycle();
-            });
-        } else if (!XCTaskRunning) {
-            // 在元宝乐园页面停留期间每 25 秒自动跑一次（防止有延迟加载的新任务）
-            if (XCTaskRunCount == 0 || XCTaskRunCount % 4 == 0) {
-                XCRunAutoTaskCycle();
+static BOOL XCInvokeGestureTargets(UITapGestureRecognizer *g) {
+    NSArray *targets = nil;
+    @try { targets = [g valueForKey:@"targets"]; } @catch (NSException *e) {}
+    if (![targets isKindOfClass:[NSArray class]] || targets.count == 0) return NO;
+    BOOL fired = NO;
+    for (id t in targets) {
+        @try {
+            id target = nil;
+            id actionRaw = nil;
+            @try { target = [t valueForKey:@"_target"]; } @catch (NSException *e) {}
+            @try { actionRaw = [t valueForKey:@"_action"]; } @catch (NSException *e) {}
+            if (!target) { @try { target = [t valueForKey:@"target"]; } @catch (NSException *e) {} }
+            if (!actionRaw) { @try { actionRaw = [t valueForKey:@"action"]; } @catch (NSException *e) {} }
+            SEL action = NULL;
+            if ([actionRaw isKindOfClass:[NSString class]]) {
+                action = NSSelectorFromString(actionRaw);
+            } else if ([actionRaw isKindOfClass:[NSValue class]]) {
+                action = (SEL)[(NSValue *)actionRaw pointerValue];
             }
-        }
-    } else if (XCTaskPointsParkSeen) {
-        XCLog(@"[Task] 离开元宝乐园 (%@)", cls);
-        XCTaskPointsParkSeen = NO;
+            if (!target || !action) continue;
+            if (![target respondsToSelector:action]) continue;
+            void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))[target methodForSelector:action];
+            imp(target, action, g);
+            fired = YES;
+            XCLog(@"[tap] gesture -> %@ (%@)", NSStringFromClass([target class]), NSStringFromSelector(action));
+        } @catch (NSException *e) {}
     }
+    return fired;
 }
 
-static void XCStartTaskWatchdog(void) {
-    if (XCTaskTimer) return;
-    XCLog(@"[Task] 启动自动任务看门狗");
-    XCTaskTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    uint64_t interval = 5 * NSEC_PER_SEC;
-    dispatch_source_set_timer(XCTaskTimer, DISPATCH_TIME_NOW, interval, interval);
-    dispatch_source_set_event_handler(XCTaskTimer, ^{
-        XCTaskWatchdogTick();
+static BOOL XCSmartTap(UIView *view, NSString *text) {
+    if (!view) return NO;
+    // 1) UIControl（含 UIButton）：直接发 action
+    UIView *v = view;
+    for (int up = 0; v && up < 4; up++, v = v.superview) {
+        if ([v isKindOfClass:[UIControl class]]) {
+            UIControl *c = (UIControl *)v;
+            if (c.enabled && !c.hidden) {
+                [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+                XCLog(@"[tap] control %@ text=%@", NSStringFromClass([c class]), text);
+                return YES;
+            }
+        }
+    }
+    // 2) UITapGestureRecognizer target-action（沿父视图向上找 5 层）
+    v = view;
+    for (int up = 0; v && up < 5; up++, v = v.superview) {
+        NSArray *ges = v.gestureRecognizers;
+        for (UIGestureRecognizer *g in ges) {
+            if ([g isKindOfClass:[UITapGestureRecognizer class]] && g.enabled) {
+                if (XCInvokeGestureTargets((UITapGestureRecognizer *)g)) {
+                    XCLog(@"[tap] gesture on %@ text=%@", NSStringFromClass([v class]), text);
+                    return YES;
+                }
+            }
+        }
+    }
+    // 3) 无障碍激活
+    @try {
+        if ([view respondsToSelector:@selector(accessibilityActivate)]) {
+            BOOL r = [view accessibilityActivate];
+            if (r) {
+                XCLog(@"[tap] a11y %@ text=%@", NSStringFromClass([view class]), text);
+                return YES;
+            }
+        }
+    } @catch (NSException *e) {}
+    // 4) 再试 view 自身的 touchesBegan/Ended 无法构造 UITouch，跳过
+    XCLog(@"[tap] FAILED 没有可触发方式 text=%@ cls=%@", text, NSStringFromClass([view class]));
+    return NO;
+}
+
+#pragma mark 页面判定
+
+static BOOL XCIsPointsParkClass(NSString *cls) {
+    NSString *c = cls.lowercaseString;
+    return ([c containsString:@"pointspark"] || [c containsString:@"points_park"] ||
+            [c containsString:@"taskcenter"] || [c containsString:@"earningtask"]);
+}
+
+static BOOL XCVisibleTextContains(NSArray<NSString *> *keys) {
+    for (UIWindow *w in XCAllWindows()) {
+        if (w.hidden || w.alpha < 0.05) continue;
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+        int visited = 0;
+        while (stack.count > 0 && visited < 2500) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            visited++;
+            if (v.hidden || v.alpha < 0.05) continue;
+            NSString *t = XCTextOfView(v);
+            if (t.length) {
+                for (NSString *k in keys) {
+                    if ([t containsString:k]) return YES;
+                }
+            }
+            for (UIView *sub in v.subviews) [stack addObject:sub];
+        }
+    }
+    return NO;
+}
+
+static BOOL XCOnTaskPage(void) {
+    UIViewController *top = XCTopViewController();
+    if (top && XCIsPointsParkClass(NSStringFromClass([top class]))) return YES;
+    return XCVisibleTextContains(@[@"轻松赚元宝", @"元宝乐园", @"元宝余额"]);
+}
+
+#pragma mark 一轮点击
+
+static void XCUpdateFloatState(NSString *s) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (XCFloatState) XCFloatState.text = s;
     });
-    dispatch_resume(XCTaskTimer);
+}
+
+static void XCGoBack(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *top = XCTopViewController();
+        if (!top) return;
+        @try {
+            if (top.presentingViewController && ![top isKindOfClass:[UINavigationController class]]) {
+                [top dismissViewControllerAnimated:YES completion:nil];
+                XCLog(@"[nav] dismiss %@", NSStringFromClass([top class]));
+                return;
+            }
+            UINavigationController *nav = top.navigationController;
+            if (nav && nav.viewControllers.count > 1) {
+                [nav popViewControllerAnimated:YES];
+                XCLog(@"[nav] pop from %@", NSStringFromClass([top class]));
+                return;
+            }
+            UIBarButtonItem *bb = top.navigationItem.leftBarButtonItem;
+            if (bb && bb.enabled && bb.target && bb.action) {
+                void (*imp)(id, SEL, id) = (void (*)(id, SEL, id))[bb.target methodForSelector:bb.action];
+                imp(bb.target, bb.action, bb);
+                XCLog(@"[nav] tap back bar");
+            }
+        } @catch (NSException *e) {}
+    });
+}
+
+static void XCDoOneClickPass(BOOL force) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (XCEngineBusy && !force) return;
+        if (!XCOnTaskPage()) {
+            if (force) XCUpdateFloatState(@"请先进元宝乐园页");
+            return;
+        }
+        if (!XCTappedLog) { XCTappedLog = [NSMutableDictionary dictionary]; XCEngineLock = [[NSLock alloc] init]; }
+
+        // 收集候选按钮
+        NSMutableArray *cands = [NSMutableArray array]; // @(YES)=claim优先, dict{view,text}
+        for (UIWindow *w in XCAllWindows()) {
+            if (w.hidden || w.alpha < 0.05) continue;
+            NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
+            int visited = 0;
+            while (stack.count > 0 && visited < 3000) {
+                UIView *v = stack.lastObject;
+                [stack removeLastObject];
+                visited++;
+                if (v.hidden || v.alpha < 0.05 || v.frame.size.width < 12 || v.frame.size.height < 10) continue;
+                NSString *t = XCTextOfView(v);
+                if (XCIsTaskActionText(t)) {
+                    BOOL isClaim = [t containsString:@"领取"];
+                    [cands addObject:@[@(isClaim), @{@"v": v, @"t": t}]];
+                }
+                for (UIView *sub in v.subviews) [stack addObject:sub];
+            }
+        }
+        if (cands.count == 0) {
+            if (force) XCUpdateFloatState(@"没有可点的任务按钮");
+            XCLog(@"[一键领取] 无候选按钮");
+            return;
+        }
+
+        // 领取类优先，取第一个未被 45 秒冷却拦住的
+        NSString *pickedText = nil;
+        UIView *pickedView = nil;
+        for (int pass = 0; pass < 2 && !pickedView; pass++) {
+            for (NSDictionary *c in cands) {
+                BOOL isClaim = [c[0] boolValue];
+                if ((pass == 0) != isClaim) continue;
+                NSDictionary *info = c[1];
+                UIView *v = info[@"v"];
+                NSString *t = info[@"t"];
+                NSString *key = [NSString stringWithFormat:@"%@|%.0f|%.0f", t, v.center.x / 8.0, v.center.y / 8.0];
+                NSNumber *last = XCTappedLog[key];
+                if (last && ([[NSDate date] timeIntervalSince1970] - last.doubleValue) < 45.0) continue;
+                pickedView = v;
+                pickedText = t;
+                break;
+            }
+        }
+        if (!pickedView) {
+            if (force) XCUpdateFloatState(@"任务都在冷却中");
+            XCLog(@"[一键领取] 全部冷却中");
+            return;
+        }
+
+        NSString *key = [NSString stringWithFormat:@"%@|%.0f|%.0f", pickedText, pickedView.center.x / 8.0, pickedView.center.y / 8.0];
+        XCTappedLog[key] = @([[NSDate date] timeIntervalSince1970]);
+        XCLog(@"[一键领取] 点击 #%ld 「%@」", (long)++XCTapCount, pickedText);
+        XCFileLog(@"tap #%ld text=%@", (long)XCTapCount, pickedText);
+        XCUpdateFloatState([NSString stringWithFormat:@"已点: %@", pickedText]);
+
+        BOOL ok = XCSmartTap(pickedView, pickedText);
+        XCEngineBusy = YES;
+
+        // 停留时长：浏览/视频 32 秒，签到 8 秒，其它 5 秒
+        NSTimeInterval wait = 5.0;
+        if ([pickedText containsString:@"浏览"] || [pickedText containsString:@"视频"] || [pickedText containsString:@"看"]) wait = 32.0;
+        else if ([pickedText containsString:@"签到"]) wait = 8.0;
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!ok) {
+                XCLog(@"[一键领取] 点击失败，不返回继续尝试其它按钮");
+            } else {
+                XCGoBack();
+            }
+            XCEngineBusy = NO;
+            XCUpdateFloatState(@"待命 · 点我继续");
+        });
+    });
+}
+
+#pragma mark 服务调用观测（swizzle 记录真实类名，为直调做准备）
+
+static void XC_taskLogIMP4(id self, SEL _cmd, id a1, id a2) {
+    NSString *key = nil;
+    @try {
+        key = [NSStringFromClass([self class]) stringByAppendingString:NSStringFromSelector(_cmd)];
+        XCLog(@"[Task] 观测到调用 %@", key);
+        XCFileLog(@"svc call %@", key);
+    } @catch (NSException *e) {}
+    void (*orig)(id, SEL, id, id) = NULL;
+    @try {
+        [XCTaskSwizzleLock lock];
+        NSValue *v = XCOrigTaskIMPs[key];
+        [XCTaskSwizzleLock unlock];
+        if (v) orig = (void (*)(id, SEL, id, id))[v pointerValue];
+    } @catch (NSException *e) {}
+    if (orig) orig(self, _cmd, a1, a2);
+}
+
+static void XCSwizzlePagerMethods(void) {
+    if (!XCOrigTaskIMPs) {
+        XCOrigTaskIMPs = [NSMutableDictionary dictionary];
+        XCTaskSwizzleLock = [[NSLock alloc] init];
+    }
+    NSArray<NSString *> *sels = @[
+        @"getUserTaskV2PagerId:completionHandler:",
+        @"signInNodePagerId:completionHandler:",
+        @"userSignInDaysPagerId:completionHandler:",
+        @"getUnReceivedPointRecordsPagerId:completionHandler:",
+        @"pointsParkTask:callback:"
+    ];
+    NSInteger hooked = 0;
+    @try {
+        int count = objc_getClassList(NULL, 0);
+        if (count <= 0) return;
+        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+        if (!classes) return;
+        count = objc_getClassList(classes, count);
+        for (int i = 0; i < count; i++) {
+            Class c = classes[i];
+            if (!c) continue;
+            NSString *cn = NSStringFromClass(c);
+            if ([cn hasPrefix:@"XC"] || [cn hasPrefix:@"UI"]) continue;
+            for (NSString *selName in sels) {
+                SEL sel = NSSelectorFromString(selName);
+                Method m = class_getInstanceMethod(c, sel);
+                if (!m) continue;
+                NSString *key = [cn stringByAppendingString:selName];
+                if (XCOrigTaskIMPs[key]) continue;
+                IMP orig = method_getImplementation(m);
+                [XCTaskSwizzleLock lock];
+                XCOrigTaskIMPs[key] = [NSValue valueWithPointer:(void *)orig];
+                [XCTaskSwizzleLock unlock];
+                method_setImplementation(m, (IMP)XC_taskLogIMP4);
+                hooked++;
+                XCLog(@"[Task] swizzle hook %@ -> %@", cn, selName);
+                XCFileLog(@"hook %@ %@", cn, selName);
+            }
+        }
+        free(classes);
+    } @catch (NSException *e) {}
+    XCLog(@"[Task] 观测 hook 安装 %ld 个", (long)hooked);
+}
+
+#pragma mark 悬浮「一键领取」按钮
+
+static void XCFloatButtonAction(void) {
+    XCLog(@"[一键领取] ===== 手动触发 =====");
+    XCDoOneClickPass(YES);
+}
+
+static void XCCreateFloatButton(void) {
+    if (XCFloatWin) return;
+    UIWindow *key = nil;
+    for (UIWindow *w in XCAllWindows()) {
+        if (w.isKeyWindow) { key = w; break; }
+    }
+    if (!key) return;
+    XCFloatWin = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 108, 56)];
+    XCFloatWin.windowLevel = 6100;
+    if (@available(iOS 13.0, *)) {
+        XCFloatWin.windowScene = key.windowScene;
+    }
+    XCFloatWin.backgroundColor = [UIColor clearColor];
+    XCFloatWin.hidden = NO;
+
+    XCFloatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    XCFloatBtn.frame = CGRectMake(4, 6, 100, 30);
+    XCFloatBtn.backgroundColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.1 alpha:0.92];
+    XCFloatBtn.layer.cornerRadius = 15;
+    XCFloatBtn.layer.masksToBounds = YES;
+    XCFloatBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [XCFloatBtn setTitle:@"一键领取" forState:UIControlStateNormal];
+    [XCFloatBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [XCFloatBtn addTarget:[NSBlockOperation blockOperationWithBlock:^{ XCFloatButtonAction(); }]
+                   action:@selector(main)
+         forControlEvents:UIControlEventTouchUpInside];
+    [XCFloatWin addSubview:XCFloatBtn];
+
+    XCFloatState = [[UILabel alloc] initWithFrame:CGRectMake(0, 38, 108, 14)];
+    XCFloatState.text = @"待命 · 点我继续";
+    XCFloatState.font = [UIFont systemFontOfSize:9];
+    XCFloatState.textColor = [UIColor whiteColor];
+    XCFloatState.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+    XCFloatState.textAlignment = NSTextAlignmentCenter;
+    XCFloatState.layer.cornerRadius = 4;
+    XCFloatState.layer.masksToBounds = YES;
+    [XCFloatWin addSubview:XCFloatState];
+
+    // 长按 = 切换自动模式
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+            XCAutoClickEnabled = !XCAutoClickEnabled;
+            XCLog(@"[一键领取] 自动模式切换为 %@", XCAutoClickEnabled ? @"开" : @"关");
+            XCUpdateFloatState(XCAutoClickEnabled ? @"自动模式:开" : @"自动模式:关");
+        }]
+        action:@selector(main)];
+    lp.minimumPressDuration = 0.8;
+    [XCFloatBtn addGestureRecognizer:lp];
+
+    // 默认位置：屏幕右侧 40% 高度（固定位置，不影响功能）
+    CGFloat sw = key.bounds.size.width, sh = key.bounds.size.height;
+    XCFloatWin.center = CGPointMake(sw - 62, sh * 0.42);
+    XCLog(@"[一键领取] 悬浮按钮已创建");
+}
+
+#pragma mark 引擎定时器
+
+static void XCStartEngineTimer(void) {
+    if (XCEngineTimer) return;
+    XCLog(@"[Task] 一键领取引擎定时器启动 (6s 轮询)");
+    XCEngineTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    uint64_t interval = 6 * NSEC_PER_SEC;
+    dispatch_source_set_timer(XCEngineTimer, DISPATCH_TIME_NOW, interval, interval);
+    dispatch_source_set_event_handler(XCEngineTimer, ^{
+        @try {
+            if (XCAutoClickEnabled) XCDoOneClickPass(NO);
+        } @catch (NSException *e) {
+            XCLog(@"[Task] 引擎异常: %@", e);
+        }
+    });
+    dispatch_resume(XCEngineTimer);
 }
 
 __attribute__((constructor)) static void XCInitialize(void) {
@@ -1222,19 +1335,12 @@ __attribute__((constructor)) static void XCInitialize(void) {
         XCInstallKuiklyHooks();
         XCLog(@"init dylib");
 
-        // 元宝乐园自动任务引擎启动
-        XCDiscoverServices();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (!XCTaskEngineReady) {
-                XCLog(@"[Task] 10s 后仍未发现服务，强制再扫一次");
-                XCDiscoverServices();
-            }
-            XCStartTaskWatchdog();
+        // v19: 一键领取引擎（悬浮按钮 + UI 自动点击 + 服务调用观测）
+        XCSwizzlePagerMethods();
+        XCStartEngineTimer();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            XCCreateFloatButton();
         });
-
-        // 在 XC_presentViewController 中加入广告奖励弹窗自动关闭
-        // （XCInstallHooks 已经把 presentViewController 的实现换成 XC_presentViewController 了，
-        //  我们只需修改 XC_presentViewController 函数体。下面在该函数中补充逻辑。）
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCCreateWhiteCover();
