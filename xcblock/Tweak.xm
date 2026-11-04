@@ -306,11 +306,55 @@ static BOOL XCTapSkipButtonInView(UIView *view, NSInteger depth) {
     return NO;
 }
 
+static NSArray<UIWindow *> *XCAllWindows(void) {
+    NSMutableArray *arr = [NSMutableArray array];
+    @try {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (w) [arr addObject:w];
+            }
+        }
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (![arr containsObject:w]) [arr addObject:w];
+        }
+    } @catch (NSException *e) {}
+    return arr;
+}
+
 static void XCTapSkipButtonsInWindows(void) {
-    for (UIWindow *win in [UIApplication sharedApplication].windows) {
+    for (UIWindow *win in XCAllWindows()) {
         if (!win.hidden && win.alpha > 0.01) {
             XCTapSkipButtonInView(win, 0);
         }
+    }
+}
+
+// 启动阶段强制隐藏全屏图片 / SVGA 播放视图（新人红包开屏由原生图片+SVGA 构成）
+static void XCHideSplashLayersInView(UIView *view, CGFloat sw, CGFloat sh, NSInteger depth) {
+    if (!view || depth > 12) return;
+    for (UIView *sub in view.subviews) {
+        CGRect f = sub.frame;
+        NSString *lower = NSStringFromClass([sub class]).lowercaseString;
+        BOOL bigImage = [sub isKindOfClass:[UIImageView class]] && f.size.width >= sw * 0.85 && f.size.height >= sh * 0.5;
+        BOOL svgaLike = ([lower containsString:@"svga"] || [lower containsString:@"yyanimated"] || [lower containsString:@"lottie"]);
+        if (bigImage || svgaLike) {
+            if (!sub.hidden || sub.alpha > 0.01) {
+                XCLog(@"hide layer %@ %.0fx%.0f", NSStringFromClass([sub class]), f.size.width, f.size.height);
+            }
+            sub.hidden = YES;
+            sub.alpha = 0;
+        }
+        XCHideSplashLayersInView(sub, sw, sh, depth + 1);
+    }
+}
+
+static void XCHideSplashLayersInWindows(void) {
+    UIWindow *key = nil;
+    for (UIWindow *w in XCAllWindows()) if (w.isKeyWindow) { key = w; break; }
+    CGFloat sw = key ? key.bounds.size.width : 430, sh = key ? key.bounds.size.height : 932;
+    for (UIWindow *w in XCAllWindows()) {
+        XCHideSplashLayersInView(w, sw, sh, 0);
     }
 }
 
@@ -334,7 +378,7 @@ static BOOL XCRemoveSplashViewsInView(UIView *view, NSInteger depth) {
 }
 
 static void XCRemoveSplashViewsInWindows(void) {
-    for (UIWindow *win in [UIApplication sharedApplication].windows) {
+    for (UIWindow *win in XCAllWindows()) {
         if (win.hidden || win.alpha < 0.01) continue;
         XCRemoveSplashViewsInView(win, 0);
     }
@@ -623,8 +667,7 @@ static void XCDumpFullScreenViewClasses(void) {
     }
     if (!mainWin) mainWin = [UIApplication sharedApplication].windows.firstObject;
     CGFloat sw = mainWin.bounds.size.width, sh = mainWin.bounds.size.height;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.hidden) continue;
+    for (UIWindow *w in XCAllWindows()) {
         XCDumpFSInView(w, sw, sh, 0);
     }
 }
@@ -664,7 +707,10 @@ __attribute__((constructor)) static void XCInitialize(void) {
                 XCTapSkipButtonsInWindows();
                 XCRemoveSplashViewsInWindows();
                 XCScanWindows();
-                if (i <= 30) XCDumpFullScreenViewClasses();
+                if (i <= 30) {
+                    XCHideSplashLayersInWindows();
+                    XCDumpFullScreenViewClasses();
+                }
                 if (i == 155) {
                     if (XCOverlay) XCOverlay.hidden = YES;
                 }
