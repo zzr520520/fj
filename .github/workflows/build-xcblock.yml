@@ -27,6 +27,7 @@ jobs:
             -miphoneos-version-min=14.0 \
             -install_name "@executable_path/XCNoAdJump.dylib" \
             -framework UIKit -framework Foundation \
+            -x objective-c \
             -o out/XCNoAdJump.dylib xcblock/Tweak.xm
           xcrun codesign --force --sign - out/XCNoAdJump.dylib || true
 
