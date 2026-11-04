@@ -688,6 +688,59 @@ static void XCInstallSessionConfHooks(void) {
     XCLog(@"conf hooks installed");
 }
 
+static IMP XC_orig_kPageName = NULL;
+static IMP XC_orig_kOpenPage = NULL;
+static IMP XC_orig_kFramePage = NULL;
+
+static id XC_kPageName(id self, SEL _cmd, NSString *name, id data) {
+    XCLog(@"kuikly page: %@", name);
+    return ((id (*)(id, SEL, id, id))XC_orig_kPageName)(self, _cmd, name, data);
+}
+
+static void XC_kOpenPage(id self, SEL _cmd, NSString *name, id data, id ctrl) {
+    XCLog(@"kuikly open: %@", name);
+    if (XC_orig_kOpenPage) ((void (*)(id, SEL, id, id, id))XC_orig_kOpenPage)(self, _cmd, name, data, ctrl);
+}
+
+static id XC_kFramePage(id self, SEL _cmd, CGRect frame, NSString *name, id data, id delegate, id framework) {
+    XCLog(@"kuikly frame page: %@", name);
+    return ((id (*)(id, SEL, CGRect, id, id, id, id))XC_orig_kFramePage)(self, _cmd, frame, name, data, delegate, framework);
+}
+
+static void XCInstallKuiklyHooks(void) {
+    NSInteger foundCls = 0;
+    @try {
+        int count = objc_getClassList(NULL, 0);
+        if (count <= 0) return;
+        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+        if (!classes) return;
+        count = objc_getClassList(classes, count);
+        for (int i = 0; i < count; i++) {
+            Class c = classes[i];
+            SEL s1 = NSSelectorFromString(@"initWithPageName:pageData:");
+            SEL s2 = NSSelectorFromString(@"openPageWithName:pageData:controller:");
+            SEL s3 = NSSelectorFromString(@"initWithFrame:pageName:pageData:delegate:frameworkName:");
+            if (class_getInstanceMethod(c, s1) && !XC_orig_kPageName) {
+                XC_orig_kPageName = method_getImplementation(class_getInstanceMethod(c, s1));
+                class_replaceMethod(c, s1, (IMP)XC_kPageName, method_getTypeEncoding(class_getInstanceMethod(c, s1)));
+                foundCls++;
+            }
+            if (class_getInstanceMethod(c, s2) && !XC_orig_kOpenPage) {
+                XC_orig_kOpenPage = method_getImplementation(class_getInstanceMethod(c, s2));
+                class_replaceMethod(c, s2, (IMP)XC_kOpenPage, method_getTypeEncoding(class_getInstanceMethod(c, s2)));
+                foundCls++;
+            }
+            if (class_getInstanceMethod(c, s3) && !XC_orig_kFramePage) {
+                XC_orig_kFramePage = method_getImplementation(class_getInstanceMethod(c, s3));
+                class_replaceMethod(c, s3, (IMP)XC_kFramePage, method_getTypeEncoding(class_getInstanceMethod(c, s3)));
+                foundCls++;
+            }
+        }
+        free(classes);
+    } @catch (NSException *e) {}
+    XCLog(@"kuikly hooks: %ld", (long)foundCls);
+}
+
 __attribute__((constructor)) static void XCInitialize(void) {
     @autoreleasepool {
         XCLaunchTime = [[NSDate date] timeIntervalSince1970];
@@ -696,6 +749,7 @@ __attribute__((constructor)) static void XCInitialize(void) {
         [NSURLProtocol registerClass:[XCAdURLProtocol class]];
         [NSURLProtocol registerClass:[XCConfigRewriteProtocol class]];
         XCInstallSessionConfHooks();
+        XCInstallKuiklyHooks();
         XCLog(@"init dylib");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCCreateOverlay();
