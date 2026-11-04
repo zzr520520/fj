@@ -12,7 +12,10 @@
 static BOOL XCIsSplashClass(NSString *name) {
     if (name.length == 0) return NO;
     NSString *lower = [name lowercaseString];
-    return [lower containsString:@"splash"] || [lower containsString:@"launchad"];
+    if ([lower containsString:@"splash"] || [lower containsString:@"launchad"]) return YES;
+    // 部分 App 的启动页控制器叫 LaunchViewController / LaunchScreenController
+    if ([lower containsString:@"launch"] && ![lower containsString:@"launchutil"]) return YES;
+    return NO;
 }
 
 #pragma mark - 广告域名拦截
