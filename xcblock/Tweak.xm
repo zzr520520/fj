@@ -574,6 +574,45 @@ static void XCScanWindows(void) {
     }
 }
 
+static void XCInjectProtocols(NSURLSessionConfiguration *cfg) {
+    if (!cfg) return;
+    NSMutableArray *arr = [[cfg protocolClasses] mutableCopy] ?: [NSMutableArray array];
+    if (![arr containsObject:[XCAdURLProtocol class]]) [arr insertObject:[XCAdURLProtocol class] atIndex:0];
+    if (![arr containsObject:[XCConfigRewriteProtocol class]]) [arr insertObject:[XCConfigRewriteProtocol class] atIndex:0];
+    cfg.protocolClasses = arr;
+}
+
+static NSURLSessionConfiguration *(*XC_orig_defaultConf)(id, SEL) = NULL;
+static NSURLSessionConfiguration *(*XC_orig_ephemeralConf)(id, SEL) = NULL;
+
+static NSURLSessionConfiguration *XC_conf_default(id self, SEL _cmd) {
+    NSURLSessionConfiguration *cfg = XC_orig_defaultConf ? XC_orig_defaultConf(self, _cmd) : nil;
+    XCInjectProtocols(cfg);
+    return cfg;
+}
+
+static NSURLSessionConfiguration *XC_conf_ephemeral(id self, SEL _cmd) {
+    NSURLSessionConfiguration *cfg = XC_orig_ephemeralConf ? XC_orig_ephemeralConf(self, _cmd) : nil;
+    XCInjectProtocols(cfg);
+    return cfg;
+}
+
+static void XCInstallSessionConfHooks(void) {
+    Class cls = NSClassFromString(@"NSURLSessionConfiguration");
+    if (!cls) return;
+    Method m1 = class_getClassMethod(cls, @selector(defaultSessionConfiguration));
+    if (m1 && !XC_orig_defaultConf) {
+        XC_orig_defaultConf = (void *)method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)XC_conf_default);
+    }
+    Method m2 = class_getClassMethod(cls, @selector(ephemeralSessionConfiguration));
+    if (m2 && !XC_orig_ephemeralConf) {
+        XC_orig_ephemeralConf = (void *)method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)XC_conf_ephemeral);
+    }
+    XCLog(@"conf hooks installed");
+}
+
 __attribute__((constructor)) static void XCInitialize(void) {
     @autoreleasepool {
         XCLaunchTime = [[NSDate date] timeIntervalSince1970];
@@ -581,6 +620,7 @@ __attribute__((constructor)) static void XCInitialize(void) {
         // 全局注册协议，任何 SDK 自建 Session 也会走拦截（gromore/pangolin 等）
         [NSURLProtocol registerClass:[XCAdURLProtocol class]];
         [NSURLProtocol registerClass:[XCConfigRewriteProtocol class]];
+        XCInstallSessionConfHooks();
         XCLog(@"init dylib");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCCreateOverlay();
