@@ -597,6 +597,38 @@ static NSURLSessionConfiguration *XC_conf_ephemeral(id self, SEL _cmd) {
     return cfg;
 }
 
+static NSMutableSet *XCSeenFSClasses = nil;
+
+static void XCDumpFSInView(UIView *v, CGFloat sw, CGFloat sh, NSInteger depth) {
+    if (!v || depth > 5) return;
+    for (UIView *sub in v.subviews) {
+        CGRect f = sub.frame;
+        NSString *cn = NSStringFromClass([sub class]);
+        if (f.size.width >= sw * 0.9 && f.size.height >= sh * 0.5 &&
+            ![cn containsString:@"XCNoAd"] && ![cn containsString:@"UIWindow"]) {
+            if (!XCSeenFSClasses) XCSeenFSClasses = [NSMutableSet set];
+            if (![XCSeenFSClasses containsObject:cn]) {
+                [XCSeenFSClasses addObject:cn];
+                XCLog(@"fs: %@ %.0fx%.0f", cn, f.size.width, f.size.height);
+            }
+        }
+        XCDumpFSInView(sub, sw, sh, depth + 1);
+    }
+}
+
+static void XCDumpFullScreenViewClasses(void) {
+    UIWindow *mainWin = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow) { mainWin = w; break; }
+    }
+    if (!mainWin) mainWin = [UIApplication sharedApplication].windows.firstObject;
+    CGFloat sw = mainWin.bounds.size.width, sh = mainWin.bounds.size.height;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.hidden) continue;
+        XCDumpFSInView(w, sw, sh, 0);
+    }
+}
+
 static void XCInstallSessionConfHooks(void) {
     Class cls = NSClassFromString(@"NSURLSessionConfiguration");
     if (!cls) return;
@@ -632,6 +664,7 @@ __attribute__((constructor)) static void XCInitialize(void) {
                 XCTapSkipButtonsInWindows();
                 XCRemoveSplashViewsInWindows();
                 XCScanWindows();
+                if (i <= 30) XCDumpFullScreenViewClasses();
                 if (i == 155) {
                     if (XCOverlay) XCOverlay.hidden = YES;
                 }
