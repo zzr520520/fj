@@ -741,6 +741,55 @@ static void XCInstallKuiklyHooks(void) {
     XCLog(@"kuikly hooks: %ld", (long)foundCls);
 }
 
+static BOOL XCIsSuspectNewUserClass(NSString *name) {
+    NSString *lower = [name lowercaseString];
+    NSArray *keys = @[@"newuser", @"new_user", @"receive", @"redpack", @"red_pack", @"invite", @"firsttask", @"welcome", @"newbie", @"rookie"];
+    for (NSString *k in keys) if ([lower containsString:k]) return YES;
+    return NO;
+}
+
+static void XCHideSuspectViewsInView(UIView *view, NSInteger depth) {
+    if (!view || depth > 14) return;
+    for (UIView *sub in view.subviews) {
+        if (XCIsSuspectNewUserClass(NSStringFromClass([sub class]))) {
+            if (!sub.hidden || sub.alpha > 0.01) {
+                XCLog(@"hide cls %@ %.0fx%.0f", NSStringFromClass([sub class]), sub.frame.size.width, sub.frame.size.height);
+            }
+            sub.hidden = YES;
+            sub.alpha = 0;
+        }
+        XCHideSuspectViewsInView(sub, depth + 1);
+    }
+}
+
+static void XCHideSuspectViewsInWindows(void) {
+    for (UIWindow *w in XCAllWindows()) {
+        XCHideSuspectViewsInView(w, 0);
+    }
+}
+
+static void XCDumpSuspectClassNames(void) {
+    NSInteger shown = 0;
+    @try {
+        int count = objc_getClassList(NULL, 0);
+        if (count <= 0) return;
+        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+        if (!classes) return;
+        count = objc_getClassList(classes, count);
+        NSMutableArray *names = [NSMutableArray array];
+        for (int i = 0; i < count; i++) {
+            NSString *n = NSStringFromClass(classes[i]);
+            if (n.length < 8) continue;
+            if (XCIsSuspectNewUserClass(n)) [names addObject:n];
+        }
+        free(classes);
+        for (NSString *n in names) {
+            if (shown++ >= 25) break;
+            XCLog(@"cls: %@", n);
+        }
+    } @catch (NSException *e) {}
+}
+
 __attribute__((constructor)) static void XCInitialize(void) {
     @autoreleasepool {
         XCLaunchTime = [[NSDate date] timeIntervalSince1970];
@@ -761,8 +810,10 @@ __attribute__((constructor)) static void XCInitialize(void) {
                 XCTapSkipButtonsInWindows();
                 XCRemoveSplashViewsInWindows();
                 XCScanWindows();
-                if (i <= 30) {
+                if (i == 8) XCDumpSuspectClassNames();
+                if (i <= 40) {
                     XCHideSplashLayersInWindows();
+                    XCHideSuspectViewsInWindows();
                     XCDumpFullScreenViewClasses();
                 }
                 if (i == 155) {
