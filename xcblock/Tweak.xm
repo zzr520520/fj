@@ -342,6 +342,30 @@ static void XCRemoveSplashViewsInWindows(void) {
 
 #pragma mark - Runtime 挂载
 
+static void XCHideFullScreenImagesInView(UIView *view, NSInteger depth, CGFloat sw, CGFloat sh) {
+    if (!view) return;
+    for (UIView *sub in view.subviews) {
+        CGRect f = sub.frame;
+        if ([sub isKindOfClass:[UIImageView class]] && f.size.width >= sw * 0.6 && f.size.height >= sh * 0.25) {
+            sub.hidden = YES;
+            sub.alpha = 0;
+            XCLog(@"hide img %@ %.0fx%.0f", NSStringFromClass([sub class]), f.size.width, f.size.height);
+        }
+        if (depth < 2) XCHideFullScreenImagesInView(sub, depth + 1, sw, sh);
+    }
+}
+
+static void XCDumpHomeSceneTree(UIViewController *vc) {
+    CGFloat sw = vc.view.bounds.size.width;
+    CGFloat sh = vc.view.bounds.size.height;
+    NSMutableString *sb = [NSMutableString string];
+    for (UIView *sub in vc.view.subviews) {
+        [sb appendFormat:@"%@(%.0fx%.0f) ", NSStringFromClass([sub class]), sub.frame.size.width, sub.frame.size.height];
+    }
+    if (sb.length > 0) XCLog(@"homescene sub: %@", sb);
+    XCHideFullScreenImagesInView(vc.view, 0, sw, sh);
+}
+
 static void (*XC_orig_viewDidAppear)(id, SEL, BOOL) = NULL;
 static void (*XC_orig_viewWillAppear)(id, SEL, BOOL) = NULL;
 static void (*XC_orig_presentVC)(id, SEL, UIViewController *, BOOL, void (^)(void)) = NULL;
@@ -357,6 +381,14 @@ static void XC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCSkipSplashViewController(vc);
         });
+    }
+    if ([cls containsString:@"HomeScene"]) {
+        UIViewController *vc = (UIViewController *)self;
+        for (NSInteger i = 0; i <= 10; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.1 + 0.2 * i) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                XCDumpHomeSceneTree(vc);
+            });
+        }
     }
 }
 
