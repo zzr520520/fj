@@ -595,6 +595,41 @@ static void XCCreateOverlay(void) {
     XCRefreshOverlay();
 }
 
+static UIWindow *XCWhiteCoverWindow = nil;
+
+static void XCCreateWhiteCover(void) {
+    if (XCWhiteCoverWindow) return;
+    UIApplication *app = [UIApplication sharedApplication];
+    UIWindow *keyWin = nil;
+    for (UIWindow *w in app.windows) {
+        if (!w.hidden) { keyWin = w; break; }
+    }
+    if (!keyWin) keyWin = app.windows.firstObject;
+    if (!keyWin) return;
+    XCWhiteCoverWindow = [[UIWindow alloc] initWithFrame:keyWin.bounds];
+    XCWhiteCoverWindow.windowLevel = 6000;
+    if (@available(iOS 13.0, *)) {
+        XCWhiteCoverWindow.windowScene = keyWin.windowScene;
+    }
+    XCWhiteCoverWindow.backgroundColor = [UIColor whiteColor];
+    XCWhiteCoverWindow.hidden = NO;
+    UIView *white = [[UIView alloc] initWithFrame:XCWhiteCoverWindow.bounds];
+    white.backgroundColor = [UIColor whiteColor];
+    white.userInteractionEnabled = YES;
+    [XCWhiteCoverWindow addSubview:white];
+}
+
+static void XCRemoveWhiteCover(void) {
+    if (!XCWhiteCoverWindow) return;
+    UIWindow *w = XCWhiteCoverWindow;
+    XCWhiteCoverWindow = nil;
+    [UIView animateWithDuration:0.12 animations:^{
+        w.alpha = 0;
+    } completion:^(BOOL finished) {
+        w.hidden = YES;
+    }];
+}
+
 static void XCScanWindows(void) {
     static NSString *lastWindowDesc = nil;
     static NSString *lastRootDesc = nil;
@@ -803,24 +838,19 @@ __attribute__((constructor)) static void XCInitialize(void) {
         XCInstallKuiklyHooks();
         XCLog(@"init dylib");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            XCCreateOverlay();
-            XCScanWindows();
+            XCCreateWhiteCover();
         });
         for (NSInteger i = 1; i <= 160; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (!XCOverlay) XCCreateOverlay();
+                if (i <= 4 && !XCWhiteCoverWindow) XCCreateWhiteCover();
                 XCTapSkipButtonsInWindows();
                 XCRemoveSplashViewsInWindows();
                 XCScanWindows();
-                if (i == 8) XCDumpSuspectClassNames();
-                if (i >= 5 && i <= 20) XCLog(@"kui hooks: %ld", (long)XCKuiklyHooksCount);
                 if (i <= 40) {
                     XCHideSplashLayersInWindows();
-                    XCHideSuspectViewsInWindows();
-                    XCDumpFullScreenViewClasses();
                 }
-                if (i == 155) {
-                    if (XCOverlay) XCOverlay.hidden = YES;
+                if (i == 10) {
+                    XCRemoveWhiteCover();
                 }
             });
         }
