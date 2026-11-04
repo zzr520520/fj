@@ -2,6 +2,8 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dispatch/dispatch.h>
+#import <stdatomic.h>
 
 // 小蚕惠生活 开屏页处理 v5（诊断版）
 // - 继续自动跳过 splash / launch / ad 类控制器
@@ -463,6 +465,38 @@ static void XC_presentViewController(id self, SEL _cmd, UIViewController *vcToPr
     if (XC_orig_presentVC) {
         XC_orig_presentVC(self, _cmd, vcToPresent, animated, completion);
     }
+
+    // ====== 广告奖励弹窗自动关闭 ======
+    if (!vcToPresent) return;
+    NSString *cls = NSStringFromClass([vcToPresent class]);
+    NSString *c = cls.lowercaseString;
+    BOOL isRewardAd = (([c containsString:@"reward"] || [c containsString:@"detective"]) &&
+                       ([c containsString:@"dialog"] || [c containsString:@"view"] || [c containsString:@"task"])) ||
+                      [c containsString:@"rewarddialog"];
+    if (isRewardAd) {
+        XCLog(@"[Task] 🎯 广告/奖励弹窗: %@ — 3 秒后自动处理", cls);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // 触发奖励回调（字符串里见过 rewardVideoAdTaskRewardDidSucceed）
+            SEL rewardSel = NSSelectorFromString(@"rewardVideoAdTaskRewardDidSucceed");
+            if ([vcToPresent respondsToSelector:rewardSel]) {
+                XCLog(@"[Task] 触发 rewardVideoAdTaskRewardDidSucceed");
+                @try { [vcToPresent performSelector:rewardSel]; } @catch (NSException *e) {}
+            }
+            // 尝试多种关闭方式
+            for (NSString *selName in @[@"close", @"dismiss", @"finish", @"completeReward", @"claimReward"]) {
+                SEL s = NSSelectorFromString(selName);
+                if ([vcToPresent respondsToSelector:s]) {
+                    XCLog(@"[Task] 调 %@ 关闭弹窗", selName);
+                    @try { [vcToPresent performSelector:s]; } @catch (NSException *e) {}
+                    break;
+                }
+            }
+            if (vcToPresent.presentingViewController) {
+                XCLog(@"[Task] 强制 dismiss 弹窗");
+                [vcToPresent dismissViewControllerAnimated:NO completion:nil];
+            }
+        });
+    }
 }
 
 static id (*XC_orig_imageNamed)(id, SEL, NSString *) = NULL;
@@ -827,6 +861,356 @@ static void XCDumpSuspectClassNames(void) {
     } @catch (NSException *e) {}
 }
 
+#pragma mark - 元宝乐园自动任务引擎
+
+/*
+ * 发现的关键接口：
+ *   SKMPSilkwormService — Silkworm 服务定位器（sharedService）
+ *   ActivityTaskMobileService.UserTaskV2        — 拉任务列表
+ *   ActivityTaskMobileService.CompleteTask      — 完成任务领奖
+ *   ActivityTaskMobileService.SignIn            — 签到
+ *   ActivityTaskMobileService.WaitClaimedPoints — 等领积分
+ *   ActivityTaskMobileService.GetUnReceivedPointRecords
+ *
+ * 关键方法签名（Kotlin/Native 暴露到 ObjC）：
+ *   getUserTaskV2PagerId:completionHandler:
+ *   signInNodePagerId:completionHandler:
+ *   userSignInDaysPagerId:completionHandler:
+ *   getUnReceivedPointRecordsPagerId:completionHandler:
+ *   fetchUserUnReceivedPointSilkId:completionHandler:
+ *
+ * 触发入口：VipPointsParkHostScene (元宝乐园主页面)
+ *
+ * 策略：
+ *   1) 运行时枚举所有类，探测 Silkworm Service Locator 和 ActivityTaskMobileService 实例
+ *   2) 在 VipPointsParkHostScene 出现时启动自动任务循环
+ *   3) 通用 postPagerId:service:params:completionHandler: 调用任意服务方法
+ *   4) Hook AdTaskRewardDialog 自动关掉广告奖励弹窗
+ */
+
+static NSMutableDictionary *XCTaskServiceCache = nil;   // 探测到的服务 {name: instance}
+static NSLock *XCTaskLock = nil;
+static BOOL XCTaskEngineReady = NO;
+static BOOL XCTaskRunning = NO;
+static NSInteger XCTaskRunCount = 0;
+
+static void XCDiscoverServices(void) {
+    if (XCTaskEngineReady) return;
+    @autoreleasepool {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            if (!XCTaskServiceCache) {
+                XCTaskServiceCache = [NSMutableDictionary dictionary];
+                XCTaskLock = [[NSLock alloc] init];
+            }
+            int count = objc_getClassList(NULL, 0);
+            if (count <= 0) return;
+            Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+            if (!classes) return;
+            count = objc_getClassList(classes, count);
+
+            NSMutableArray *silkwormServiceLocators = [NSMutableArray array];
+            NSMutableArray *candidates = [NSMutableArray array];
+
+            for (int i = 0; i < count; i++) {
+                Class c = classes[i];
+                NSString *name = NSStringFromClass(c);
+                if ([name hasPrefix:@"SKMP"]) {
+                    Method m = class_getClassMethod(c, @selector(sharedService));
+                    if (m) [silkwormServiceLocators addObject:c];
+
+                    // 找有 task API 的类
+                    unsigned int mc = 0;
+                    Method *ml = class_copyMethodList(c, &mc);
+                    BOOL hasTaskAPI = NO;
+                    for (unsigned int j = 0; j < mc; j++) {
+                        NSString *selName = NSStringFromSelector(method_getName(ml[j]));
+                        if ([selName containsString:@"getUserTaskV2"] ||
+                            [selName containsString:@"CompleteTask"] ||
+                            [selName containsString:@"SignIn"] ||
+                            [selName containsString:@"signInNode"] ||
+                            [selName containsString:@"postPagerId"]) {
+                            hasTaskAPI = YES;
+                            break;
+                        }
+                    }
+                    free(ml);
+                    if (hasTaskAPI) [candidates addObject:c];
+                }
+            }
+            free(classes);
+
+            [XCTaskLock lock];
+            for (Class locCls in silkwormServiceLocators) {
+                @try {
+                    id svc = [locCls performSelector:@selector(sharedService)];
+                    if (svc) {
+                        NSString *cn = NSStringFromClass(locCls);
+                        XCTaskServiceCache[cn] = svc;
+                        XCLog(@"[Task] found locator: %@ -> %@", cn, NSStringFromClass([svc class]));
+                    }
+                } @catch (NSException *e) {}
+            }
+            for (Class candCls in candidates) {
+                NSString *cn = NSStringFromClass(candCls);
+                // 有些类本身可以当服务实例（Kotlin object）
+                id candInstance = nil;
+                @try {
+                    candInstance = [candCls performSelector:@selector(sharedInstance)];
+                } @catch (NSException *e) {}
+                if (!candInstance) {
+                    @try { candInstance = [candCls performSelector:@selector(sharedService)]; }
+                    @catch (NSException *e) {}
+                }
+                if (candInstance) {
+                    XCTaskServiceCache[cn] = candInstance;
+                    XCLog(@"[Task] candidate: %@", cn);
+                }
+            }
+            XCTaskEngineReady = YES;
+            [XCTaskLock unlock];
+            XCLog(@"[Task] discovery done, cache keys: %@", XCTaskServiceCache.allKeys);
+        });
+    }
+}
+
+static id XCTaskGetLocator(void) {
+    [XCTaskLock lock];
+    id loc = XCTaskServiceCache[@"SKMPSilkwormService"];
+    [XCTaskLock unlock];
+    return loc;
+}
+
+/* 生成唯一 pagerId（Silkworm 追踪用，只要每次调用不同即可） */
+static NSString *XCPagerId(void) {
+    static atomic_int seq = 0;
+    int s = atomic_fetch_add(&seq, 1);
+    return [NSString stringWithFormat:@"auto_xc_%ld_%d", (long)([[NSDate date] timeIntervalSince1970] * 1000), s];
+}
+
+/* 通用 Silkworm 服务调用：service 格式为 "ActivityTaskMobileService.UserTaskV2" */
+static void XCPostService(id locator, NSString *service, NSDictionary *params, void (^cb)(id, NSError *)) {
+    if (!locator || service.length == 0) {
+        if (cb) cb(nil, [NSError errorWithDomain:@"XC" code:-1 userInfo:@{@"msg": @"no locator"}]);
+        return;
+    }
+    NSString *pagerId = XCPagerId();
+    SEL sel = NSSelectorFromString(@"postPagerId:service:params:completionHandler:");
+    if (![locator respondsToSelector:sel]) {
+        XCLog(@"[Task] locator doesn't respond to postPagerId, locator=%@", NSStringFromClass([locator class]));
+        if (cb) cb(nil, [NSError errorWithDomain:@"XC" code:-2 userInfo:@{@"msg": @"no post method"}]);
+        return;
+    }
+    XCLog(@"[Task] CALL %@", service);
+    id paramsArg = params ?: @{};
+    void *blk = (__bridge void *)^(id result, NSError *error) {
+        if (error) {
+            XCLog(@"[Task] %@ ERR: %@", service, error.localizedDescription ?: error);
+        } else {
+            XCLog(@"[Task] %@ OK: %@", service, [result isKindOfClass:[NSDictionary class]] ? [(NSDictionary *)result allKeys] : NSStringFromClass([result class]));
+        }
+        if (cb) cb(result, error);
+    };
+    NSMethodSignature *sig = [locator methodSignatureForSelector:sel];
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:locator];
+    [inv setSelector:sel];
+    [inv setArgument:&pagerId atIndex:2];
+    [inv setArgument:&service atIndex:3];
+    [inv setArgument:&paramsArg atIndex:4];
+    [inv setArgument:&blk atIndex:5];
+    [inv invoke];
+    // block 被 inv retain，但 inv 是局部变量会释放，所以要手动 retain
+    // 实际上 block 本身会在 Silkworm 内部被 retain（completionHandler 语义），这里我们不管理
+}
+
+/*
+ * 自动任务主循环：
+ *   1) 签到（每日一次）
+ *   2) 拉任务列表
+ *   3) 对每个未完成的任务调 CompleteTask
+ *   4) 领未接收的积分
+ */
+static void XCRunAutoTaskCycle(void) {
+    if (XCTaskRunning) return;
+    XCTaskRunning = YES;
+    XCTaskRunCount++;
+    XCLog(@"[Task] ======== 自动任务循环 #%ld 启动 ========", (long)XCTaskRunCount);
+
+    id locator = XCTaskGetLocator();
+    if (!locator) {
+        XCLog(@"[Task] 没有 Silkworm locator，跳过");
+        XCTaskRunning = NO;
+        return;
+    }
+
+    // ============ 步骤 1：签到 ============
+    void (^doSignIn)(void (^)(void)) = ^(void (^next)(void)) {
+        XCPostService(locator, @"ActivityTaskMobileService.SignIn", nil, ^(id r, NSError *e) {
+            if (e) XCLog(@"[Task] SignIn 失败: %@", e);
+            else XCLog(@"[Task] SignIn 成功");
+            next();
+        });
+    };
+
+    // ============ 步骤 2：拉任务列表 ============
+    void (^doFetchTasks)(void (^)(NSDictionary *)) = ^(void (^got)(NSDictionary *)) {
+        XCPostService(locator, @"ActivityTaskMobileService.UserTaskV2", nil, ^(id r, NSError *e) {
+            if (e) { got(nil); return; }
+            if ([r isKindOfClass:[NSDictionary class]]) {
+                XCLog(@"[Task] UserTaskV2 keys: %@", [(NSDictionary *)r allKeys]);
+            }
+            got([r isKindOfClass:[NSDictionary class]] ? (NSDictionary *)r : nil);
+        });
+    };
+
+    // ============ 步骤 3：逐个 CompleteTask ============
+    void (^doCompleteAll)(NSArray *, void (^)(void)) = ^(NSArray *tasks, void (^done)(void)) {
+        if (tasks.count == 0) { done(); return; }
+        __block NSInteger idx = 0;
+        void (^oneMore)(void) = nil;
+        oneMore = ^{
+            if (idx >= (NSInteger)tasks.count) { done(); return; }
+            id t = tasks[idx++];
+            NSDictionary *td = [t isKindOfClass:[NSDictionary class]] ? (NSDictionary *)t : nil;
+            NSString *taskId = nil;
+            id rawId = td[@"taskId"] ?: td[@"task_id"] ?: td[@"id"] ?: td[@"TaskId"];
+            if ([rawId isKindOfClass:[NSString class]]) taskId = rawId;
+            else if ([rawId respondsToSelector:@selector(stringValue)]) taskId = [rawId stringValue];
+            if (taskId.length == 0) { XCLog(@"[Task] 跳过无 taskId 的任务"); oneMore(); return; }
+
+            // 检查任务状态（完成的就跳过）
+            id state = td[@"taskState"] ?: td[@"task_state"] ?: td[@"state"];
+            if ([state respondsToSelector:@selector(integerValue)]) {
+                NSInteger s = [state integerValue];
+                if (s == 2 || s == 3 || s == 4) { // 常见：2=已完成 3=已领取
+                    XCLog(@"[Task] 跳过已完成 taskId=%@ state=%ld", taskId, (long)s);
+                    oneMore();
+                    return;
+                }
+            }
+            XCLog(@"[Task] 尝试完成 taskId=%@", taskId);
+            // params 可能需要 taskId，不同服务参数名可能不同，都试试
+            for (NSDictionary *params in @[
+                @{@"taskId": taskId},
+                @{@"task_id": taskId},
+                @{@"id": taskId}
+            ]) {
+                XCPostService(locator, @"ActivityTaskMobileService.CompleteTask", params, ^(id r, NSError *e) {
+                    if (!e) {
+                        XCLog(@"[Task] CompleteTask 成功 taskId=%@", taskId);
+                        // 成功了就 break 出循环
+                        idx++;
+                        oneMore();
+                    } else {
+                        XCLog(@"[Task] CompleteTask 失败 taskId=%@ err=%@", taskId, e);
+                    }
+                });
+                break; // 每次只试一种 params
+            }
+        };
+        oneMore();
+    };
+
+    // ============ 步骤 4：领积分 ============
+    void (^doClaimPoints)(void (^)(void)) = ^(void (^next)(void)) {
+        XCPostService(locator, @"ActivityTaskMobileService.WaitClaimedPoints", nil, ^(id r, NSError *e) {
+            if (!e) XCLog(@"[Task] WaitClaimedPoints: %@", r);
+            XCPostService(locator, @"ActivityTaskMobileService.GetUnReceivedPointRecords", nil, ^(id r2, NSError *e2) {
+                if (!e2) XCLog(@"[Task] GetUnReceivedPointRecords: %@", r2);
+                next();
+            });
+        });
+    };
+
+    // ============ 串行执行 ============
+    dispatch_async(dispatch_get_main_queue(), ^{
+        doSignIn(^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                doFetchTasks(^(NSDictionary *taskDict) {
+                    NSArray *tasks = nil;
+                    if (taskDict) {
+                        for (NSString *k in taskDict.allKeys) {
+                            id v = taskDict[k];
+                            if ([v isKindOfClass:[NSArray class]] && ((NSArray *)v).count > 0 &&
+                                [[(NSArray *)v firstObject] isKindOfClass:[NSDictionary class]]) {
+                                tasks = v;
+                                break;
+                            }
+                        }
+                    }
+                    XCLog(@"[Task] 解析出任务数: %ld", (long)tasks.count);
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        doCompleteAll(tasks, ^{
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                                doClaimPoints(^{
+                                    XCLog(@"[Task] ======== 自动任务循环 #%ld 完成 ========", (long)XCTaskRunCount);
+                                    XCTaskRunning = NO;
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+}
+
+/* 自动任务触发 — 定时看门狗：发现元宝乐园场景就跑 */
+static dispatch_source_t XCTaskTimer = nil;
+static BOOL XCTaskPointsParkSeen = NO;
+
+static BOOL XCIsPointsParkClass(NSString *cls) {
+    // Swift runtime 类名可能是 xiaocan.VipPointsParkHostScene 或 _TtC7xiaocan22VipPointsParkHostScene
+    NSString *c = cls.lowercaseString;
+    if ([c containsString:@"pointspark"]) return YES;
+    if ([c containsString:@"vipspark"]) return YES;
+    if ([c containsString:@"points_park"]) return YES;
+    return NO;
+}
+
+static void XCTaskWatchdogTick(void) {
+    // 找当前顶层 VC
+    UIViewController *topVC = nil;
+    for (UIWindow *w in XCAllWindows()) {
+        if (w.isKeyWindow && !w.hidden) { topVC = w.rootViewController; break; }
+    }
+    if (!topVC) { XCTaskRunning = NO; return; }
+    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
+
+    NSString *cls = NSStringFromClass([topVC class]);
+    BOOL inPointsPark = XCIsPointsParkClass(cls);
+    if (inPointsPark) {
+        if (!XCTaskPointsParkSeen) {
+            XCLog(@"[Task] ✅ 进入元宝乐园 (%@)，触发自动任务", cls);
+            XCTaskPointsParkSeen = YES;
+            // 刚进入，延迟一下让页面初始化完
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                XCRunAutoTaskCycle();
+            });
+        } else if (!XCTaskRunning) {
+            // 在元宝乐园页面停留期间每 25 秒自动跑一次（防止有延迟加载的新任务）
+            if (XCTaskRunCount == 0 || XCTaskRunCount % 4 == 0) {
+                XCRunAutoTaskCycle();
+            }
+        }
+    } else if (XCTaskPointsParkSeen) {
+        XCLog(@"[Task] 离开元宝乐园 (%@)", cls);
+        XCTaskPointsParkSeen = NO;
+    }
+}
+
+static void XCStartTaskWatchdog(void) {
+    if (XCTaskTimer) return;
+    XCLog(@"[Task] 启动自动任务看门狗");
+    XCTaskTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    uint64_t interval = 5 * NSEC_PER_SEC;
+    dispatch_source_set_timer(XCTaskTimer, DISPATCH_TIME_NOW, interval, interval);
+    dispatch_source_set_event_handler(XCTaskTimer, ^{
+        XCTaskWatchdogTick();
+    });
+    dispatch_resume(XCTaskTimer);
+}
+
 __attribute__((constructor)) static void XCInitialize(void) {
     @autoreleasepool {
         XCLaunchTime = [[NSDate date] timeIntervalSince1970];
@@ -837,6 +1221,21 @@ __attribute__((constructor)) static void XCInitialize(void) {
         XCInstallSessionConfHooks();
         XCInstallKuiklyHooks();
         XCLog(@"init dylib");
+
+        // 元宝乐园自动任务引擎启动
+        XCDiscoverServices();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!XCTaskEngineReady) {
+                XCLog(@"[Task] 10s 后仍未发现服务，强制再扫一次");
+                XCDiscoverServices();
+            }
+            XCStartTaskWatchdog();
+        });
+
+        // 在 XC_presentViewController 中加入广告奖励弹窗自动关闭
+        // （XCInstallHooks 已经把 presentViewController 的实现换成 XC_presentViewController 了，
+        //  我们只需修改 XC_presentViewController 函数体。下面在该函数中补充逻辑。）
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCCreateWhiteCover();
         });
