@@ -1,0 +1,47 @@
+name: Build XCBlock Dylib
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'xcblock/**'
+      - '.github/workflows/build-xcblock.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      THEOS: /Users/runner/theos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos and iOS SDK
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p "$THEOS/sdks"
+          cp -R /tmp/sdks/iPhoneOS*.sdk "$THEOS/sdks/"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+          ls -1 "$THEOS/sdks"
+
+      - name: Install ldid
+        run: brew install ldid || true
+
+      - name: Build dylib
+        run: make -C xcblock -j"$(sysctl -n hw.ncpu)"
+
+      - name: Inspect output
+        if: always()
+        run: find xcblock/.theos/obj -name '*.dylib' -exec file {} \; || true
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcblock-dylib
+          path: xcblock/.theos/obj/**/*.dylib
+          if-no-files-found: error
