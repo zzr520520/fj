@@ -83,7 +83,8 @@ static BOOL XCIsSplashClass(NSString *name) {
             @"baihemob.com", @"etoolads.cn", @"tanx.com", @"fibo.cn",
             @"windmill", @"msad", @"octopus", @"youtui",
             @"csjprotocol.com", @"ksad", @"gdtimg.com",
-            @"pangolin-sdk", @"admaster.com.cn", @"miaozhen.com",
+            @"pangolin-sdk", @"gromore", @"pangolin", @"pangle",
+            @"admaster.com.cn", @"miaozhen.com",
             @"applovin.com", @"unityads", @"vungle.com", @"chartboost.com"
         ];
     });
@@ -92,8 +93,14 @@ static BOOL XCIsSplashClass(NSString *name) {
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     NSString *host = request.URL.host.lowercaseString;
+    NSString *path = request.URL.path.lowercaseString;
     if (host.length == 0) return NO;
     if ([NSURLProtocol propertyForKey:@"XCAdBlocked" inRequest:request]) return NO;
+    // 路径命中开屏广告素材 / 配置（不动普通业务接口）
+    if ([path containsString:@"splash"] || [path containsString:@"openscreen"] ||
+        [path containsString:@"launchad"] || [path containsString:@"boot_ad"]) {
+        return YES;
+    }
     for (NSString *domain in [self blockedDomains]) {
         if ([host containsString:domain]) return YES;
     }
@@ -197,6 +204,32 @@ static void XCTapSkipButtonsInWindows(void) {
         if (!win.hidden && win.alpha > 0.01) {
             XCTapSkipButtonInView(win, 0);
         }
+    }
+}
+
+// 移除原生开屏广告视图（GroMore/穿山甲 BUSplashAdView 等，它们是 UIView 而非 VC）
+static BOOL XCRemoveSplashViewsInView(UIView *view, NSInteger depth) {
+    if (!view || depth > 18) return NO;
+    BOOL removed = NO;
+    for (UIView *sub in [view.subviews copy]) {
+        NSString *lower = NSStringFromClass([sub class]).lowercaseString;
+        BOOL splashLike = ([lower containsString:@"splash"] || [lower containsString:@"busplash"] ||
+                           [lower containsString:@"csjsplash"] || [lower containsString:@"gmsplash"]);
+        if (splashLike) {
+            XCLog(@"remove splash view %@", NSStringFromClass([sub class]));
+            [sub removeFromSuperview];
+            removed = YES;
+            continue;
+        }
+        if (XCRemoveSplashViewsInView(sub, depth + 1)) removed = YES;
+    }
+    return removed;
+}
+
+static void XCRemoveSplashViewsInWindows(void) {
+    for (UIWindow *win in [UIApplication sharedApplication].windows) {
+        if (win.hidden || win.alpha < 0.01) continue;
+        XCRemoveSplashViewsInView(win, 0);
     }
 }
 
@@ -381,6 +414,8 @@ __attribute__((constructor)) static void XCInitialize(void) {
     @autoreleasepool {
         XCLaunchTime = [[NSDate date] timeIntervalSince1970];
         XCInstallHooks();
+        // 全局注册协议，任何 SDK 自建 Session 也会走拦截（gromore/pangolin 等）
+        [NSURLProtocol registerClass:[XCAdURLProtocol class]];
         XCLog(@"init dylib");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCCreateOverlay();
@@ -389,6 +424,7 @@ __attribute__((constructor)) static void XCInitialize(void) {
         for (NSInteger i = 1; i <= 80; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 XCTapSkipButtonsInWindows();
+                XCRemoveSplashViewsInWindows();
                 XCScanWindows();
                 if (i == 75) {
                     if (XCOverlay) XCOverlay.hidden = YES;
