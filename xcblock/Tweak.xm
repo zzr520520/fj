@@ -691,6 +691,7 @@ static void XCInstallSessionConfHooks(void) {
 static IMP XC_orig_kPageName = NULL;
 static IMP XC_orig_kOpenPage = NULL;
 static IMP XC_orig_kFramePage = NULL;
+static NSInteger XCKuiklyHooksCount = -1;
 
 static id XC_kPageName(id self, SEL _cmd, NSString *name, id data) {
     XCLog(@"kuikly page: %@", name);
@@ -738,6 +739,7 @@ static void XCInstallKuiklyHooks(void) {
         }
         free(classes);
     } @catch (NSException *e) {}
+    XCKuiklyHooksCount = foundCls;
     XCLog(@"kuikly hooks: %ld", (long)foundCls);
 }
 
@@ -811,6 +813,7 @@ __attribute__((constructor)) static void XCInitialize(void) {
                 XCRemoveSplashViewsInWindows();
                 XCScanWindows();
                 if (i == 8) XCDumpSuspectClassNames();
+                if (i >= 5 && i <= 20) XCLog(@"kui hooks: %ld", (long)XCKuiklyHooksCount);
                 if (i <= 40) {
                     XCHideSplashLayersInWindows();
                     XCHideSuspectViewsInWindows();
