@@ -153,7 +153,11 @@ static BOOL XCIsSplashKey(NSString *key) {
             [k containsString:@"open_screen"] || [k containsString:@"launchad"] ||
             [k containsString:@"launch_ad"] || [k containsString:@"ad_screen"] ||
             [k containsString:@"boot_ad"] || [k containsString:@"bootad"] ||
-            [k containsString:@"start_ad"] || [k containsString:@"startad"]);
+            [k containsString:@"start_ad"] || [k containsString:@"startad"] ||
+            [k containsString:@"new_user"] || [k containsString:@"newuser"] ||
+            [k containsString:@"popup"] || [k containsString:@"first_head"] ||
+            [k containsString:@"newcomer"] || [k containsString:@"redpacket"] ||
+            [k containsString:@"red_packet"] || [k containsString:@"activity_pop"]);
 }
 
 static NSInteger XCStripSplashFromObject(id obj, NSInteger depth) {
@@ -207,12 +211,17 @@ static NSInteger XCStripSplashFromObject(id obj, NSInteger depth) {
         @try {
             id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
             if (json) {
+                if ([json isKindOfClass:[NSDictionary class]]) {
+                    NSArray *keys = [(NSDictionary *)json allKeys];
+                    NSString *preview = [keys count] > 12 ? [[keys subarrayWithRange:NSMakeRange(0, 12)] componentsJoinedByString:@","] : [keys componentsJoinedByString:@","];
+                    XCLog(@"cfg %@ keys: %@", self.request.URL.lastPathComponent, preview);
+                }
                 NSInteger removed = XCStripSplashFromObject(json, 0);
                 if (removed > 0) {
                     NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
                     if (newData) {
                         outData = newData;
-                        XCLog(@"config %@ 剥除开屏字段 %ld 个", self.request.URL.lastPathComponent, (long)removed);
+                        XCLog(@"cfg %@ 剥除字段 %ld 个", self.request.URL.lastPathComponent, (long)removed);
                     }
                 }
             }
