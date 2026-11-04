@@ -897,10 +897,8 @@ static void XCFileLog(NSString *fmt, ...) {
             dispatch_once(&onceT, ^{
                 path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"xc_dylib_log.txt"];
             });
-            NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
-                              [NSDateFormatter localizedStringFromDate:[NSDate date]
-                                                            dateFormatterStyle:NSDateFormatterShortStyle
-                                                              timeFormatterStyle:NSDateFormatterMediumStyle], msg];
+            NSString *line = [NSString stringWithFormat:@"[%ld] %@\n",
+                              (long)[[NSDate date] timeIntervalSince1970], msg];
             NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
             if (!fh) {
                 [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -1134,7 +1132,7 @@ static void XCDoOneClickPass(BOOL force) {
         NSString *pickedText = nil;
         UIView *pickedView = nil;
         for (int pass = 0; pass < 2 && !pickedView; pass++) {
-            for (NSDictionary *c in cands) {
+            for (NSArray *c in cands) {
                 BOOL isClaim = [c[0] boolValue];
                 if ((pass == 0) != isClaim) continue;
                 NSDictionary *info = c[1];
