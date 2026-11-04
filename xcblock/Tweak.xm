@@ -486,15 +486,27 @@ static void XCInstallHooks(void) {
     }
 }
 
+static UIWindow *XCOverlayWindow = nil;
+
 static void XCCreateOverlay(void) {
     if (XCOverlay) return;
-    UIWindow *win = nil;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (!w.hidden) { win = w; break; }
+    UIApplication *app = [UIApplication sharedApplication];
+    UIWindow *keyWin = nil;
+    for (UIWindow *w in app.windows) {
+        if (!w.hidden) { keyWin = w; break; }
     }
-    if (!win) return;
-    CGFloat h = win.bounds.size.height * 0.32;
-    CGRect frame = CGRectMake(0, win.bounds.size.height - h, win.bounds.size.width, h);
+    if (!keyWin) return;
+    if (!XCOverlayWindow) {
+        XCOverlayWindow = [[UIWindow alloc] initWithFrame:keyWin.bounds];
+        XCOverlayWindow.windowLevel = 5000;
+        if (@available(iOS 13.0, *)) {
+            XCOverlayWindow.windowScene = keyWin.windowScene;
+        }
+        XCOverlayWindow.backgroundColor = [UIColor clearColor];
+        XCOverlayWindow.hidden = NO;
+    }
+    CGFloat h = keyWin.bounds.size.height * 0.32;
+    CGRect frame = CGRectMake(0, keyWin.bounds.size.height - h, keyWin.bounds.size.width, h);
     XCOverlay = [[UITextView alloc] initWithFrame:frame];
     XCOverlay.backgroundColor = [UIColor colorWithWhite:0 alpha:0.78];
     XCOverlay.textColor = [UIColor greenColor];
@@ -503,7 +515,7 @@ static void XCCreateOverlay(void) {
     XCOverlay.scrollEnabled = YES;
     XCOverlay.userInteractionEnabled = NO;
     XCOverlay.text = @"【诊断】请截图此区域发回\n";
-    [win addSubview:XCOverlay];
+    [XCOverlayWindow addSubview:XCOverlay];
     XCRefreshOverlay();
 }
 
@@ -538,16 +550,17 @@ __attribute__((constructor)) static void XCInitialize(void) {
         [NSURLProtocol registerClass:[XCAdURLProtocol class]];
         [NSURLProtocol registerClass:[XCConfigRewriteProtocol class]];
         XCLog(@"init dylib");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCCreateOverlay();
             XCScanWindows();
         });
-        for (NSInteger i = 1; i <= 80; i++) {
+        for (NSInteger i = 1; i <= 160; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (!XCOverlay) XCCreateOverlay();
                 XCTapSkipButtonsInWindows();
                 XCRemoveSplashViewsInWindows();
                 XCScanWindows();
-                if (i == 75) {
+                if (i == 155) {
                     if (XCOverlay) XCOverlay.hidden = YES;
                 }
             });
