@@ -147,47 +147,7 @@ static void XCSkipSplashViewController(UIViewController *vc) {
 
 %end
 
-#pragma mark - 聚合广告 SDK 展示方法置空
-
-static void XCNoopIMP(id self, SEL _cmd) {}
-
-static void XCNoopShowMethods(NSString *className) {
-    Class cls = NSClassFromString(className);
-    if (!cls) return;
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList(cls, &count);
-    if (!methods) return;
-    for (unsigned int i = 0; i < count; i++) {
-        Method m = methods[i];
-        const char *types = method_getTypeEncoding(m);
-        if (!types || types[0] != 'v') continue; // 只清空 void 方法，避免返回值错乱
-        NSString *selName = NSStringFromSelector(method_getName(m));
-        NSString *lower = selName.lowercaseString;
-        if ([lower hasPrefix:@"show"] || [lower hasPrefix:@"present"]) {
-            method_setImplementation(m, (IMP)XCNoopIMP);
-        }
-    }
-    free(methods);
-}
-
-static void XCApplySDKHooks(void) {
-    NSArray<NSString *> *classes = @[
-        @"AdScopeADNSplashAd", @"CXHAdSDKSplashAd", @"CXHChannelSplashAd",
-        @"AdbidSplashAd", @"ABUSplashAd", @"ABUSplashAdLoader",
-        @"BTPSplashAdHelper", @"AdSplash", @"AdSplashBU", @"AdSplashMS", @"AdSplashWM",
-        @"MSSplashAdViewController", @"CSJSplashAd", @"GDTSplashAd",
-        @"KSAdSplashManager", @"QMSplashAd", @"OctSplashAd", @"MSAdSplash",
-        @"BeiZiSplash", @"WindSplashAdManager", @"WindMillSplashAdManager",
-        @"YTSplashViewController", @"SCCSJSplashViewController",
-        @"WindMillSDK.WindMillSplashAdManager", @"WindMillSDK.TB1WithSplashAdManager",
-        @"_TtC11WindMillSDK22WindMillSplashAdManager",
-        @"_TtC11WindMillSDK22TB1WithSplashAdManager",
-        @"_TtC7LynxAds15SplashAdManager"
-    ];
-    for (NSString *cls in classes) {
-        XCNoopShowMethods(cls);
-    }
-}
+#pragma mark - NSURLSession 统一注入拦截协议
 
 %hook NSURLSessionConfiguration
 
@@ -207,12 +167,16 @@ static void XCApplySDKHooks(void) {
 
 %ctor {
     @autoreleasepool {
-        XCApplySDKHooks();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            XCApplySDKHooks();
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            XCApplySDKHooks();
-        });
+        // 启动后再兜底巡检几秒，处理延迟创建的开屏控制器
+        for (NSInteger i = 1; i <= 6; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                for (UIWindow *win in [UIApplication sharedApplication].windows) {
+                    UIViewController *vc = win.rootViewController;
+                    if (XCIsSplashClass(NSStringFromClass([vc class]))) {
+                        XCSkipSplashViewController(vc);
+                    }
+                }
+            });
+        }
     }
 }
