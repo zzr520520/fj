@@ -3,14 +3,48 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-// 小蚕惠生活 开屏/插屏广告跳过（纯净 dylib：不依赖 CydiaSubstrate）
-// v4：除了「类名识别」外，增加
-//   1) viewWillAppear / viewDidAppear 双钩子（覆盖只实现 willAppear 或未调用 super 的页面）
-//   2) 启动后 10 秒内遍历所有窗口，自动点击「跳过 / Skip」按钮
-//   3) 递归检查 rootViewController 与 presentedViewController 链
-//   4) 扩充广告域名拦截
+// 小蚕惠生活 开屏页处理 v5（诊断版）
+// - 继续自动跳过 splash / launch / ad 类控制器
+// - 继续拦截广告域名
+// - 新增：启动后屏幕下方显示「诊断浮层」，列出出现的控制器类名、窗口类名、
+//   可疑图片名与网络请求路径。请安装后打开 App 等待约 10 秒，截图该浮层发回。
 
 static NSTimeInterval XCLaunchTime = 0;
+static NSMutableArray<NSString *> *XCLogLines = nil;
+static UITextView *XCOverlay = nil;
+static NSLock *XCLock = nil;
+
+static void XCRefreshOverlay(void) {
+    if (!XCOverlay) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSArray *lines = [XCLogLines copy];
+        NSMutableString *text = [NSMutableString stringWithString:@"【诊断】请截图此区域发回\n"];
+        NSInteger start = MAX(0, (NSInteger)lines.count - 26);
+        for (NSInteger i = start; i < (NSInteger)lines.count; i++) {
+            [text appendFormat:@"%@\n", lines[(NSUInteger)i]];
+        }
+        XCOverlay.text = text;
+    });
+}
+
+static void XCLog(NSString *fmt, ...) {
+    @autoreleasepool {
+        va_list ap; va_start(ap, fmt);
+        NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+        va_end(ap);
+        if (!XCLogLines) {
+            XCLogLines = [NSMutableArray array];
+            XCLock = [[NSLock alloc] init];
+        }
+        NSString *line = [NSString stringWithFormat:@"%.1fs %@", [[NSDate date] timeIntervalSince1970] - XCLaunchTime, msg];
+        [XCLock lock];
+        [XCLogLines addObject:line];
+        if (XCLogLines.count > 200) [XCLogLines removeObjectAtIndex:0];
+        [XCLock unlock];
+        NSLog(@"[XCAd] %@", line);
+        XCRefreshOverlay();
+    }
+}
 
 static BOOL XCIsSplashClass(NSString *name) {
     if (name.length == 0) return NO;
@@ -47,9 +81,9 @@ static BOOL XCIsSplashClass(NSString *name) {
             @"58iclick.com", @"iggrowth.cn", @"innotechx.com", @"dmrtb.com",
             @"richmob.cn", @"shunchangzhixing.com", @"ubixioe.com", @"xwpbj.com",
             @"baihemob.com", @"etoolads.cn", @"tanx.com", @"fibo.cn",
-            @"windmill", @"windmill-sdk", @"msad", @"octopus", @"youtui",
-            @"csjprotocol.com", @"ksad", @"kuaishou.com/ad", @"gdtimg.com",
-            @"pangolin-sdk", @"admaster.com.cn", @"miaozhen.com", @"sensortower",
+            @"windmill", @"msad", @"octopus", @"youtui",
+            @"csjprotocol.com", @"ksad", @"gdtimg.com",
+            @"pangolin-sdk", @"admaster.com.cn", @"miaozhen.com",
             @"applovin.com", @"unityads", @"vungle.com", @"chartboost.com"
         ];
     });
@@ -122,29 +156,22 @@ static void XCSkipSplashViewController(UIViewController *vc) {
     ];
     for (NSString *sel in noArgSelectors) {
         if ([vc respondsToSelector:NSSelectorFromString(sel)]) {
+            XCLog(@"skip %@ via %@", NSStringFromClass([vc class]), sel);
             XCInvokeVoidSelector(vc, sel, NO);
             return;
         }
     }
-    NSArray<NSString *> *oneArgSelectors = @[
-        @"splashSkipClick:", @"skipAd:", @"dismissSplash:", @"closeAd:"
-    ];
-    for (NSString *sel in oneArgSelectors) {
-        if ([vc respondsToSelector:NSSelectorFromString(sel)]) {
-            XCInvokeVoidSelector(vc, sel, YES);
-            return;
-        }
-    }
     if (vc.presentingViewController) {
+        XCLog(@"dismiss presented %@", NSStringFromClass([vc class]));
         [vc dismissViewControllerAnimated:NO completion:nil];
     } else if (vc.parentViewController) {
+        XCLog(@"remove child %@", NSStringFromClass([vc class]));
         [vc willMoveToParentViewController:nil];
         [vc.view removeFromSuperview];
         [vc removeFromParentViewController];
     }
 }
 
-// 递归点击「跳过 / Skip」按钮（广告 SDK 自绘页面通常都有）
 static BOOL XCTapSkipButtonInView(UIView *view, NSInteger depth) {
     if (!view || depth > 24) return NO;
     if ([view isKindOfClass:[UIButton class]]) {
@@ -154,6 +181,7 @@ static BOOL XCTapSkipButtonInView(UIView *view, NSInteger depth) {
         if (!title.length) title = btn.titleLabel.text;
         NSString *lower = title.lowercaseString;
         if (title.length > 0 && ([title containsString:@"跳过"] || [lower containsString:@"skip"])) {
+            XCLog(@"tap skip button '%@'", title);
             [btn sendActionsForControlEvents:UIControlEventTouchUpInside];
             return YES;
         }
@@ -172,20 +200,6 @@ static void XCTapSkipButtonsInWindows(void) {
     }
 }
 
-static void XCHandleViewController(UIViewController *vc) {
-    if (!vc) return;
-    if (XCIsSplashClass(NSStringFromClass([vc class]))) {
-        XCSkipSplashViewController(vc);
-    }
-    UIViewController *presented = vc.presentedViewController;
-    while (presented) {
-        if (XCIsSplashClass(NSStringFromClass([presented class]))) {
-            XCSkipSplashViewController(presented);
-        }
-        presented = presented.presentedViewController;
-    }
-}
-
 #pragma mark - Runtime 挂载
 
 static void (*XC_orig_viewDidAppear)(id, SEL, BOOL) = NULL;
@@ -195,6 +209,9 @@ static void (*XC_orig_presentVC)(id, SEL, UIViewController *, BOOL, void (^)(voi
 static void XC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (XC_orig_viewDidAppear) XC_orig_viewDidAppear(self, _cmd, animated);
     NSString *cls = NSStringFromClass([self class]);
+    if ([[NSDate date] timeIntervalSince1970] - XCLaunchTime < 20.0) {
+        XCLog(@"didAppear %@", cls);
+    }
     if (XCIsSplashClass(cls)) {
         UIViewController *vc = (UIViewController *)self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -205,7 +222,11 @@ static void XC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
 
 static void XC_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     if (XC_orig_viewWillAppear) XC_orig_viewWillAppear(self, _cmd, animated);
-    if (XCIsSplashClass(NSStringFromClass([self class]))) {
+    NSString *cls = NSStringFromClass([self class]);
+    if ([[NSDate date] timeIntervalSince1970] - XCLaunchTime < 20.0) {
+        XCLog(@"willAppear %@", cls);
+    }
+    if (XCIsSplashClass(cls)) {
         UIViewController *vc = (UIViewController *)self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             XCSkipSplashViewController(vc);
@@ -214,15 +235,44 @@ static void XC_viewWillAppear(id self, SEL _cmd, BOOL animated) {
 }
 
 static void XC_presentViewController(id self, SEL _cmd, UIViewController *vcToPresent, BOOL animated, void (^completion)(void)) {
-    // 启动 10 秒内，广告 / 开屏类控制器直接不呈现
+    if ([[NSDate date] timeIntervalSince1970] - XCLaunchTime < 20.0) {
+        XCLog(@"present %@ (from %@)", NSStringFromClass([vcToPresent class]), NSStringFromClass([self class]));
+    }
     if (vcToPresent && ([[NSDate date] timeIntervalSince1970] - XCLaunchTime < 10.0) &&
         XCIsSplashClass(NSStringFromClass([vcToPresent class]))) {
+        XCLog(@"block present %@", NSStringFromClass([vcToPresent class]));
         if (completion) completion();
         return;
     }
     if (XC_orig_presentVC) {
         XC_orig_presentVC(self, _cmd, vcToPresent, animated, completion);
     }
+}
+
+static id (*XC_orig_imageNamed)(id, SEL, NSString *) = NULL;
+static id XC_imageNamed(id self, SEL _cmd, NSString *name) {
+    NSString *lower = name.lowercaseString;
+    if ([lower containsString:@"splash"] || [lower containsString:@"launch"] ||
+        [lower containsString:@"start"] || [lower containsString:@"ad_"] ||
+        [lower containsString:@"open"]) {
+        XCLog(@"img %@", name);
+    }
+    return XC_orig_imageNamed ? XC_orig_imageNamed(self, _cmd, name) : nil;
+}
+
+static id (*XC_orig_dataTask)(id, SEL, NSURLRequest *) = NULL;
+static id XC_dataTask(id self, SEL _cmd, NSURLRequest *request) {
+    NSString *urlStr = request.URL.absoluteString;
+    NSString *lower = urlStr.lowercaseString;
+    if ([lower containsString:@"splash"] || [lower containsString:@"launch"] ||
+        [lower containsString:@"start"] || [lower containsString:@"advert"] ||
+        [lower containsString:@"openscreen"] || [lower containsString:@"boot"] ||
+        [lower containsString:@"qiping"] || [lower containsString:@"config"]) {
+        NSString *path = request.URL.path ?: @"";
+        if (path.length > 60) path = [path substringToIndex:60];
+        XCLog(@"net %@%@", request.URL.host ?: @"", path);
+    }
+    return XC_orig_dataTask ? XC_orig_dataTask(self, _cmd, request) : nil;
 }
 
 static id (*XC_orig_defaultConfig)(id, SEL) = NULL;
@@ -260,6 +310,16 @@ static void XCInstallHooks(void) {
         XC_orig_presentVC = (void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))method_getImplementation(mPresent);
         method_setImplementation(mPresent, (IMP)XC_presentViewController);
     }
+    Method mImg = class_getClassMethod([UIImage class], @selector(imageNamed:));
+    if (mImg) {
+        XC_orig_imageNamed = (id (*)(id, SEL, NSString *))method_getImplementation(mImg);
+        method_setImplementation(mImg, (IMP)XC_imageNamed);
+    }
+    Method mTask = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:));
+    if (mTask) {
+        XC_orig_dataTask = (id (*)(id, SEL, NSURLRequest *))method_getImplementation(mTask);
+        method_setImplementation(mTask, (IMP)XC_dataTask);
+    }
     Class cfgCls = [NSURLSessionConfiguration class];
     Method m2 = class_getClassMethod(cfgCls, @selector(defaultSessionConfiguration));
     if (m2) {
@@ -273,16 +333,65 @@ static void XCInstallHooks(void) {
     }
 }
 
+static void XCCreateOverlay(void) {
+    if (XCOverlay) return;
+    UIWindow *win = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (!w.hidden) { win = w; break; }
+    }
+    if (!win) return;
+    CGFloat h = win.bounds.size.height * 0.32;
+    CGRect frame = CGRectMake(0, win.bounds.size.height - h, win.bounds.size.width, h);
+    XCOverlay = [[UITextView alloc] initWithFrame:frame];
+    XCOverlay.backgroundColor = [UIColor colorWithWhite:0 alpha:0.78];
+    XCOverlay.textColor = [UIColor greenColor];
+    XCOverlay.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+    XCOverlay.editable = NO;
+    XCOverlay.scrollEnabled = YES;
+    XCOverlay.userInteractionEnabled = NO;
+    XCOverlay.text = @"【诊断】请截图此区域发回\n";
+    [win addSubview:XCOverlay];
+    XCRefreshOverlay();
+}
+
+static void XCScanWindows(void) {
+    static NSString *lastWindowDesc = nil;
+    static NSString *lastRootDesc = nil;
+    NSMutableString *desc = [NSMutableString string];
+    for (UIWindow *win in [UIApplication sharedApplication].windows) {
+        if (win.hidden) continue;
+        NSString *rootCls = NSStringFromClass([win.rootViewController class]);
+        [desc appendFormat:@"%@(%@) ", NSStringFromClass([win class]), rootCls];
+        UIViewController *vc = win.rootViewController;
+        while (vc) {
+            if (XCIsSplashClass(NSStringFromClass([vc class]))) {
+                XCSkipSplashViewController(vc);
+                break;
+            }
+            vc = vc.presentedViewController;
+        }
+    }
+    if (desc.length && ![desc isEqualToString:lastWindowDesc]) {
+        XCLog(@"windows: %@", desc);
+        lastWindowDesc = [desc copy];
+    }
+}
+
 __attribute__((constructor)) static void XCInitialize(void) {
     @autoreleasepool {
         XCLaunchTime = [[NSDate date] timeIntervalSince1970];
         XCInstallHooks();
-        // 启动后 10 秒内：每 0.2 秒巡检窗口，跳过开屏控制器 + 自动点「跳过」
-        for (NSInteger i = 1; i <= 50; i++) {
+        XCLog(@"init dylib");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            XCCreateOverlay();
+            XCScanWindows();
+        });
+        for (NSInteger i = 1; i <= 80; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 XCTapSkipButtonsInWindows();
-                for (UIWindow *win in [UIApplication sharedApplication].windows) {
-                    if (!win.hidden) XCHandleViewController(win.rootViewController);
+                XCScanWindows();
+                if (i == 75) {
+                    if (XCOverlay) XCOverlay.hidden = YES;
                 }
             });
         }
