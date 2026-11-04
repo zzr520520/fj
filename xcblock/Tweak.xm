@@ -1,24 +1,22 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
-// 小蚕惠生活 开屏广告拦截 + 秒进
-// 替换原包内 @executable_path/XCNoAdJump.dylib（保持同名、同加载路径）
-// 思路：
-//  1) 广告域名网络层直接返回 404，阻断开屏素材（沿用原包的拦截清单）
-//  2) 拦截所有类名含 Splash/LaunchAd 的控制器：出现后 0.1 秒立即调用跳过/关闭
-//  3) 常见聚合广告 SDK 的 show/present 方法置空，避免任何开屏/插屏被展示
+// 小蚕惠生活 开屏页跳过（纯净 dylib 版：不依赖 CydiaSubstrate，可随 IPA 重签）
+// 说明：上一版用 Theos 构建，会自动链接 CydiaSubstrate，在未越狱设备上 dyld 直接
+// 报 "Library not loaded: /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate" 闪退。
+// 本版全部改用 Objective-C Runtime 动态挂载，仅依赖 UIKit/Foundation。
 
 static BOOL XCIsSplashClass(NSString *name) {
     if (name.length == 0) return NO;
     NSString *lower = [name lowercaseString];
     if ([lower containsString:@"splash"] || [lower containsString:@"launchad"]) return YES;
-    // 部分 App 的启动页控制器叫 LaunchViewController / LaunchScreenController
     if ([lower containsString:@"launch"] && ![lower containsString:@"launchutil"]) return YES;
     return NO;
 }
 
-#pragma mark - 广告域名拦截
+#pragma mark - 广告域名拦截（返回 404，避免开屏素材与二次跳转）
 
 @interface XCAdURLProtocol : NSURLProtocol
 @end
@@ -126,7 +124,6 @@ static void XCSkipSplashViewController(UIViewController *vc) {
             return;
         }
     }
-    // 兜底：模态的直接关掉；作为子控制器的移除
     if (vc.presentingViewController) {
         [vc dismissViewControllerAnimated:NO completion:nil];
     } else if (vc.parentViewController) {
@@ -136,41 +133,63 @@ static void XCSkipSplashViewController(UIViewController *vc) {
     }
 }
 
-%hook UIViewController
+#pragma mark - Runtime 挂载
 
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
+static void (*XC_orig_viewDidAppear)(id, SEL, BOOL) = NULL;
+
+static void XC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (XC_orig_viewDidAppear) XC_orig_viewDidAppear(self, _cmd, animated);
     NSString *cls = NSStringFromClass([self class]);
     if (XCIsSplashClass(cls)) {
+        UIViewController *vc = (UIViewController *)self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            XCSkipSplashViewController(self);
+            XCSkipSplashViewController(vc);
         });
     }
 }
 
-%end
-
-#pragma mark - NSURLSession 统一注入拦截协议
-
-%hook NSURLSessionConfiguration
-
-+ (instancetype)defaultSessionConfiguration {
-    id cfg = %orig;
-    [cfg setProtocolClasses:[XCAdURLProtocol ac_injectIntoProtocols:[cfg protocolClasses]]];
+static id (*XC_orig_defaultConfig)(id, SEL) = NULL;
+static id XC_defaultConfig(id self, SEL _cmd) {
+    id cfg = XC_orig_defaultConfig ? XC_orig_defaultConfig(self, _cmd) : nil;
+    if (cfg) {
+        [cfg setProtocolClasses:[XCAdURLProtocol ac_injectIntoProtocols:[cfg protocolClasses]]];
+    }
     return cfg;
 }
 
-+ (instancetype)ephemeralSessionConfiguration {
-    id cfg = %orig;
-    [cfg setProtocolClasses:[XCAdURLProtocol ac_injectIntoProtocols:[cfg protocolClasses]]];
+static id (*XC_orig_ephemeralConfig)(id, SEL) = NULL;
+static id XC_ephemeralConfig(id self, SEL _cmd) {
+    id cfg = XC_orig_ephemeralConfig ? XC_orig_ephemeralConfig(self, _cmd) : nil;
+    if (cfg) {
+        [cfg setProtocolClasses:[XCAdURLProtocol ac_injectIntoProtocols:[cfg protocolClasses]]];
+    }
     return cfg;
 }
 
-%end
+static void XCInstallHooks(void) {
+    Class vcCls = [UIViewController class];
+    Method m1 = class_getInstanceMethod(vcCls, @selector(viewDidAppear:));
+    if (m1) {
+        XC_orig_viewDidAppear = (void (*)(id, SEL, BOOL))method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)XC_viewDidAppear);
+    }
+    Class cfgCls = [NSURLSessionConfiguration class];
+    Method m2 = class_getClassMethod(cfgCls, @selector(defaultSessionConfiguration));
+    if (m2) {
+        XC_orig_defaultConfig = (id (*)(id, SEL))method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)XC_defaultConfig);
+    }
+    Method m3 = class_getClassMethod(cfgCls, @selector(ephemeralSessionConfiguration));
+    if (m3) {
+        XC_orig_ephemeralConfig = (id (*)(id, SEL))method_getImplementation(m3);
+        method_setImplementation(m3, (IMP)XC_ephemeralConfig);
+    }
+}
 
-%ctor {
+__attribute__((constructor)) static void XCInitialize(void) {
     @autoreleasepool {
-        // 启动后再兜底巡检几秒，处理延迟创建的开屏控制器
+        XCInstallHooks();
+        // 启动后 3 秒内持续巡检窗口根控制器，兜底跳过延迟出现的开屏
         for (NSInteger i = 1; i <= 6; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 for (UIWindow *win in [UIApplication sharedApplication].windows) {

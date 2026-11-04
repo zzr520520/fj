@@ -14,34 +14,30 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    env:
-      THEOS: /Users/runner/theos
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Theos and iOS SDK
+      - name: Build plain dylib (no CydiaSubstrate dependency)
         run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
-          git clone --depth 1 https://github.com/theos/sdks.git /tmp/sdks
-          mkdir -p "$THEOS/sdks"
-          cp -R /tmp/sdks/iPhoneOS*.sdk "$THEOS/sdks/"
-          echo "$THEOS/bin" >> "$GITHUB_PATH"
-          ls -1 "$THEOS/sdks"
+          mkdir -p out
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -arch arm64e \
+            -dynamiclib -fobjc-arc \
+            -miphoneos-version-min=14.0 \
+            -install_name "@executable_path/XCNoAdJump.dylib" \
+            -framework UIKit -framework Foundation \
+            -o out/XCNoAdJump.dylib xcblock/Tweak.xm
+          xcrun codesign --force --sign - out/XCNoAdJump.dylib || true
 
-      - name: Install ldid
-        run: brew install ldid || true
-
-      - name: Build dylib
-        run: make -C xcblock -j"$(sysctl -n hw.ncpu)"
-
-      - name: Inspect output
-        if: always()
-        run: find xcblock/.theos/obj -name '*.dylib' -exec file {} \; || true
+      - name: Verify dependencies
+        run: |
+          xcrun otool -L out/XCNoAdJump.dylib
+          xcrun otool -l out/XCNoAdJump.dylib | grep -A4 LC_LOAD || true
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: xcblock-dylib
-          path: xcblock/.theos/obj/**/*.dylib
+          path: out/XCNoAdJump.dylib
           if-no-files-found: error
