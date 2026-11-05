@@ -1458,7 +1458,7 @@ SEL gAct = NULL;
 if (!gTarget) {
 @try {
 id tlist = [g valueForKey:@"_targets"];
-if ([tlist isKindOfClass:[NSArray class]] && tlist.count > 0) {
+if ([tlist isKindOfClass:[NSArray class]] && ((NSArray *)tlist).count > 0) {
 id entry = ((NSArray *)tlist)[0];
 if ([entry isKindOfClass:[NSObject class]]) {
 @try { gTarget = [entry valueForKey:@"target"]; } @catch (NSException *e) { gTarget = entry; }
