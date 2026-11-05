@@ -1410,7 +1410,7 @@ ACLog(@"[原生自动点赞] 屏幕搜寻到 %lu 张卡片但无可点目标（p
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 
 // 节流 2~3.5 秒处理下一张卡片
-NSTimeInterval delay = 2.0 + (arc4random_uniform(16) / 10.0);
+NSTimeInterval delay = 0.2 + (arc4random_uniform(6) / 10.0); // 秒点：亚秒级节流
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 [mgr ac_pumpAutoLikeQueue];
 });
@@ -1758,22 +1758,169 @@ ACLog(@"[发布] 原生桥接 25 秒未回调，回落 HTTP");
 });
 return YES;
 }
+// —— 终极原生自动发动态引擎：驱动 App 官方发布页（雷达实证 AirMomentsViewController → AirMomentPublishOptionsViewController），
+// 由 App 原生链路自产一次性 X-Lts-Id，彻底告别自拼请求 500 ——
+static UITextView *ACFindTextViewDeep(UIView *view) {
+if (!view) return nil;
+for (UIView *sub in view.subviews) {
+if ([sub isKindOfClass:[UITextView class]]) return (UITextView *)sub;
+UITextView *deep = ACFindTextViewDeep(sub);
+if (deep) return deep;
+}
+return nil;
+}
+
+- (void)ac_finishMomentPublish:(ACMomentTaskItem *)task ok:(BOOL)ok msg:(NSString *)msg completion:(void(^)(BOOL ok, NSString *msg))completion {
+self.momentPublishing = NO;
+if (ok) {
+task.sentCount++;
+NSDateFormatter *df = [[NSDateFormatter alloc] init];
+df.dateFormat = @"HH:mm:ss";
+task.lastSentTimeStr = [df stringFromDate:[NSDate date]];
+msg = [msg stringByAppendingFormat:@" | 累计%ld次", (long)task.sentCount];
+[self saveAllCustomSettings];
+}
+self.lastMomentLog = msg;
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(ok, msg);
+}
+
+- (void)ac_publishViaNativeUI:(ACMomentTaskItem *)task retryLeft:(NSInteger)retryLeft completion:(void(^)(BOOL ok, NSString *msg))completion {
+ACLog(@"[原生发布] 尝试原生通道 retry=%ld", (long)retryLeft);
+// 1. 顶层 VC（keyWindow → Scene → windows 三级兜底）
+UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+if (@available(iOS 13.0, *)) {
+if (!keyWin) {
+@try {
+for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+if ([sc isKindOfClass:[UIWindowScene class]] && sc.activationState == UISceneActivationStateForegroundActive) {
+keyWin = ((UIWindowScene *)sc).keyWindow;
+if (keyWin) break;
+}
+}
+} @catch (NSException *e) {}
+}
+}
+if (!keyWin) {
+for (UIWindow *w in [UIApplication sharedApplication].windows) {
+if (w.isKeyWindow) { keyWin = w; break; }
+}
+}
+UIViewController *topVC = keyWin.rootViewController;
+while (topVC.presentedViewController && !topVC.presentedViewController.isBeingDismissed) {
+topVC = topVC.presentedViewController;
+}
+
+Class pubOptsCls = NSClassFromString(@"airchat.AirMomentPublishOptionsViewController") ?: NSClassFromString(@"AirMomentPublishOptionsViewController");
+Class pubVCCls = NSClassFromString(@"airchat.AirMomentPublishViewController") ?: pubOptsCls;
+Class momentsCls = NSClassFromString(@"airchat.AirMomentsViewController") ?: NSClassFromString(@"AirMomentsViewController");
+SEL pubSel = NSSelectorFromString(@"publishButtonTapped");
+SEL pubSelWithSender = NSSelectorFromString(@"publishButtonTapped:");
+
+// A. 当前已在原生发布页：注入文案 → 触发发布
+id pubVC = nil;
+if (pubOptsCls && [topVC isKindOfClass:pubOptsCls]) pubVC = topVC;
+if (!pubVC && pubVCCls && pubVCCls != pubOptsCls && [topVC isKindOfClass:pubVCCls]) pubVC = topVC;
+if (pubVC) {
+@try {
+UITextView *tv = nil;
+@try { tv = [pubVC valueForKey:@"textView"]; } @catch(NSException *e) {}
+if (!tv) { @try { tv = [pubVC valueForKey:@"contentTextView"]; } @catch(NSException *e) {} }
+if (!tv) { @try { tv = [pubVC valueForKey:@"editorTextView"]; } @catch(NSException *e) {} }
+if (!tv) tv = ACFindTextViewDeep(((UIViewController *)pubVC).view) ?: ACFindTextViewDeep(keyWin);
+if (!tv && retryLeft > 0) {
+ACLog(@"[原生发布] 发布页已打开但编辑框未就绪，1.2 秒后重试");
+__weak typeof(self) w = self;
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[w ac_publishViaNativeUI:task retryLeft:retryLeft - 1 completion:completion];
+});
+return;
+}
+if (tv) {
+tv.text = task.contentText;
+// 触发 delegate 同步（Swift VM 可能监听 textViewDidChange）
+id del = tv.delegate;
+if (del && [del respondsToSelector:@selector(textViewDidChange:)]) {
+((void (*)(id, SEL, id))objc_msgSend)(del, @selector(textViewDidChange:), tv);
+}
+ACLog(@"[原生发布] 文案已注入原生编辑框");
+}
+if ([pubVC respondsToSelector:pubSel]) {
+ACLog(@"🎯 [原生发布] 触发发布页 publishButtonTapped");
+((void (*)(id, SEL))objc_msgSend)(pubVC, pubSel);
+[self ac_finishMomentPublish:task ok:YES msg:@"✅ 原生动态发布已提交" completion:completion];
+return;
+} else if ([pubVC respondsToSelector:pubSelWithSender]) {
+ACLog(@"🎯 [原生发布] 触发发布页 publishButtonTapped:");
+((void (*)(id, SEL, id))objc_msgSend)(pubVC, pubSelWithSender, nil);
+[self ac_finishMomentPublish:task ok:YES msg:@"✅ 原生动态发布已提交" completion:completion];
+return;
+}
+} @catch (NSException *e) {
+ACLog(@"[原生发布] 发布页注入异常 %@", e.reason);
+}
+}
+
+// B. 在飞行圈主页：触发主界面发动态按钮唤起发布页，稍后回来注入发布
+BOOL onMoments = (momentsCls && [topVC isKindOfClass:momentsCls]) || [NSStringFromClass([topVC class]) containsString:@"Moment"];
+if (onMoments && ([topVC respondsToSelector:pubSel] || [topVC respondsToSelector:pubSelWithSender])) {
+ACLog(@"🎯 [原生发布] 触发主界面发动态按钮，唤起原生发布页");
+@try {
+if ([topVC respondsToSelector:pubSel]) ((void (*)(id, SEL))objc_msgSend)(topVC, pubSel);
+else ((void (*)(id, SEL, id))objc_msgSend)(topVC, pubSelWithSender, nil);
+} @catch (NSException *e) {
+ACLog(@"[原生发布] 唤起异常 %@", e.reason);
+}
+if (retryLeft > 0) {
+__weak typeof(self) w = self;
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[w ac_publishViaNativeUI:task retryLeft:retryLeft - 1 completion:completion];
+});
+return;
+}
+[self ac_finishMomentPublish:task ok:YES msg:@"✅ 已唤起原生发布页（下次调度自动注入发布）" completion:completion];
+return;
+}
+
+// C. 静默构建发布控制器（不依赖当前页面）
+if (pubVCCls) {
+@try {
+id vc = [[pubVCCls alloc] init];
+if (vc) {
+@try { (void)((UIViewController *)vc).view; } @catch(NSException *e) {}
+UITextView *tv = nil;
+@try { tv = [vc valueForKey:@"textView"]; } @catch(NSException *e) {}
+if (!tv) { @try { tv = [vc valueForKey:@"contentTextView"]; } @catch(NSException *e) {} }
+if (!tv) tv = ACFindTextViewDeep(((UIViewController *)vc).view);
+if (tv) tv.text = task.contentText;
+if ([vc respondsToSelector:pubSel]) {
+ACLog(@"🎯 [原生发布] 静默构建发布控制器并触发");
+((void (*)(id, SEL))objc_msgSend)(vc, pubSel);
+[self ac_finishMomentPublish:task ok:YES msg:@"✅ 原生动态发布已提交(静默)" completion:completion];
+return;
+}
+}
+} @catch (NSException *e) {
+ACLog(@"[原生发布] 静默构建异常 %@", e.reason);
+}
+}
+
+[self ac_finishMomentPublish:task ok:NO msg:@"💡 未找到原生发布入口，请先进入飞行圈动态界面" completion:completion];
+}
+
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
-ACLog(@"[发布] 入口 task=%@ textLen=%lu token=%lu lts=%lu publishing=%d",
-task ? @"有" : @"无", (unsigned long)task.contentText.length,
-(unsigned long)ACHeaderValue(self.latestHTTPHeaders, @"token").length,
-(unsigned long)ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id").length,
-(int)self.momentPublishing);
+ACLog(@"[发布] 入口 task=%@ textLen=%lu publishing=%d",
+task ? @"有" : @"无", (unsigned long)task.contentText.length, (int)self.momentPublishing);
 if (!task || task.contentText.length == 0) {
 self.lastMomentLog = @"❌ 动态内容为空，发布被跳过";
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 if (completion) completion(NO, self.lastMomentLog);
 return;
 }
-// 自愈：上一次发布如果因进程挂起/会话失效没有回调，不能永久卡住后续发布
+// 自愈：上一次发布若未正常释放锁，60 秒后强制解锁
 if (self.momentPublishing && self.momentPublishingSince > 0 &&
-[[NSDate date] timeIntervalSince1970] - self.momentPublishingSince > 120.0) {
-ACLog(@"[发布] 检测到上一次发布超过120秒未回调，强制解锁");
+[[NSDate date] timeIntervalSince1970] - self.momentPublishingSince > 60.0) {
+ACLog(@"[发布] 上一次发布超过 60 秒未结束，强制解锁");
 self.momentPublishing = NO;
 }
 if (self.momentPublishing) {
@@ -1782,203 +1929,11 @@ self.lastMomentLog = @"⏳ 上一条动态仍在发布中，请稍后再试";
 if (completion) completion(NO, self.lastMomentLog);
 return;
 }
-// ① 直接走业务网关 HTTP 发布：不再尝试原生桥接（原生桥接拿不到签名，反而拖 25 秒并导致后续超时）
 self.momentPublishing = YES;
 self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-// 修复：token 大小写无关，并允许等待 App 后续请求把 token 捕获进来
-NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
-if (token.length == 0) {
-self.momentPublishing = NO; // 等待 token 期间先释放发布锁，否则递归重试会被自己的锁挡住
-self.lastMomentLog = @"⏳ 正在获取登录凭证（最多等待 20 秒，请保持 App 前台）...";
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-__weak typeof(self) weakSelf = self;
-__block NSInteger tries = 0;
-__block void (^waitBlock)(void);
-waitBlock = ^{
-NSString *tk = ACHeaderValue(weakSelf.latestHTTPHeaders, @"token");
-if (tk.length > 0) {
-[weakSelf publishMomentTask:task completion:completion];
-return;
-}
-if (++tries >= 40) {
-weakSelf.lastMomentLog = @"❌ 未捕获到登录凭证：请先在 App 内切换一次页面（任意 API 请求）后重试";
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, weakSelf.lastMomentLog);
-return;
-}
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), waitBlock);
-};
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), waitBlock);
-return;
-}
-@try {
-acInternalRequest = NO;
-self.momentPublishing = YES;
-self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-// 405 修复：业务网关动态解析（嗅探到的存活域名优先，回落 .cn），绝不使用 COS/CDN 域名，避免 POST 被重定向到对象存储
-NSString *acPubHost = [self ac_activeBusinessHost];
-ACLog(@"[发布] 目标主机 %@（嗅探值：%@）", acPubHost, self.lastAirchatHost ?: @"无");
-NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/publish", acPubHost]];
-NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-req.HTTPMethod = @"POST";
-req.timeoutInterval = 15.0;
-[req setValue:acPubHost forHTTPHeaderField:@"Host"];
-// Host 由 URLSession 按 URL 自动生成，这里绝不手动塞入 COS/上传请求的 Host，避免被网关误判为对象存储写入
-// 修复：Accept 必须是 *／*（通配符；注意注释里不要写半角星号+斜杠+星号，否则会被 Logos 当成块注释吞掉后续代码）；UA 必须固定为 App 原生 UA。
-// 旧版从全局 Header 池取值，会被 COS 上传请求污染成 cos-xml-ios-sdk + Accept "/"，
-// 网关直接返回 HTTP 500（空 body），这就是“发布没效果”的主因。
-[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-[req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
-[req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
-[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-[req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
-[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
-[req setValue:token forHTTPHeaderField:@"token"];
-[req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
-NSString *pubVerVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
-if (pubVerVal.length == 0) pubVerVal = @"2.2.0"; // 网关版本淘汰兜底；正常情况优先用嗅探到的实时版本
-[req setValue:pubVerVal forHTTPHeaderField:@"version"];
-[req setValue:pubVerVal forHTTPHeaderField:@"appVersion"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
-// X-Lts-Id 优先取最近一次“原生发布动态”请求的模板；全局池只接受合法长格式
-NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
-if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-NSTimeInterval ltsAge = self.latestLtsAt > 0 ? [[NSDate date] timeIntervalSince1970] - self.latestLtsAt : -1;
-if (ltsId.length > 50) {
-[req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
-} else {
-ACLog(@"[发布] 警告：尚未捕获到有效 X-Lts-Id，先在飞行圈手动操作一次再定时发布");
-}
-// 修复：X-Request-No 与 App 原生一致 = (毫秒时间戳 << 7) | 0~127 序号，15 位数字
-uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
-uint64_t reqNoVal = (nowMs << 7) | (uint64_t)(arc4random() & 0x7F);
-NSString *reqNo = [NSString stringWithFormat:@"%015llu", reqNoVal];
-[req setValue:reqNo forHTTPHeaderField:@"X-Request-No"];
-// 请求体：纯文本 contentType=1；带远端媒体 contentType=2（抓包实证）
-id safeMedia = ACJSONSafeObject(task.capturedMediaList, 0);
-NSArray *mediaArr = [safeMedia isKindOfClass:[NSArray class]] ? (NSArray *)safeMedia : nil;
-BOOL hasRemoteMedia = (mediaArr.count > 0);
-NSMutableDictionary *bodyDict = [NSMutableDictionary dictionary];
-bodyDict[@"commentPermission"] = @(1);
-bodyDict[@"contentText"] = ACSafeStr(task.contentText);
-if (hasRemoteMedia) {
-// 抓包实证：原生带图动态 contentType = 2（不是 3），3 会被业务层判非法
-bodyDict[@"contentType"] = @(2);
-bodyDict[@"mediaList"] = mediaArr;
-} else {
-bodyDict[@"contentType"] = @(1);
-}
-NSData *bodyData = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
-if (!bodyData) {
-self.momentPublishing = NO;
-self.lastMomentLog = @"❌ 请求体序列化失败（文案含非法字符）";
-ACLog(@"[发布] 请求体序列化失败");
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, self.lastMomentLog);
-return;
-}
-req.HTTPBody = bodyData;
-[req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
-ACLog(@"[发布] 实际头发送 Lts=%lu keys=%@",
-(unsigned long)ACHeaderValue([req allHTTPHeaderFields], @"X-Lts-Id").length,
-[[req allHTTPHeaderFields] allKeys]);
-ACLog(@"[发布] 即将发送 tokenLen=%lu ltsLen=%lu reqNo=%@ bodyLen=%lu media=%d",
-(unsigned long)token.length, (unsigned long)ltsId.length, reqNo,
-(unsigned long)bodyData.length, (int)hasRemoteMedia);
-__weak typeof(self) weakSelf = self;
-acInternalRequest = YES;
-NSURLSession *acPubSession = ACDedicatedPluginSession();
-if (!acPubSession) {
-acInternalRequest = NO;
-self.momentPublishing = NO;
-self.lastMomentLog = @"❌ 网络会话初始化失败";
-if (completion) completion(NO, self.lastMomentLog);
-return;
-}
-ACLog(@"[发布] 使用独立 Session ltsAge=%.1fs", self.latestLtsAt > 0 ? [[NSDate date] timeIntervalSince1970] - self.latestLtsAt : -1.0);
-NSURLSessionDataTask *publishTask =
-[acPubSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
 dispatch_async(dispatch_get_main_queue(), ^{
-weakSelf.momentPublishing = NO;
-NSHTTPURLResponse *httpResp = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
-NSInteger httpStatus = httpResp ? (NSInteger)httpResp.statusCode : 0;
-NSString *rawText = data.length > 0 ? ([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"") : @"";
-ACLog(@"[发布] 回调 HTTP %ld err=%@ body=%@", (long)httpStatus,
-error.localizedDescription ?: @"无",
-rawText.length > 200 ? [rawText substringToIndex:200] : rawText);
-if (error) {
-NSString *failMsg = [NSString stringWithFormat:@"❌ 发布异常 HTTP %ld: %@", (long)httpStatus, error.localizedDescription ?: @"网络错误"];
-weakSelf.lastMomentLog = failMsg;
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, failMsg);
-[weakSelf ac_scheduleMomentRetryAfter:60.0];
-return;
-}
-NSDictionary *respDict = ACSafeDict([NSJSONSerialization JSONObjectWithData:(data ?: [NSData data]) options:0 error:nil]);
-if (!respDict) {
-// 没有 JSON：网关/鉴权层直接拒绝（例如 Header 被污染导致 HTTP 500 空 body）
-NSString *snippet = rawText.length > 120 ? [rawText substringToIndex:120] : rawText;
-NSString *failMsg = [NSString stringWithFormat:@"❌ 发布被拒 HTTP %ld：%@", (long)httpStatus, snippet.length ? snippet : @"(空响应)"];
-weakSelf.lastMomentLog = failMsg;
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, failMsg);
-[weakSelf ac_scheduleMomentRetryAfter:60.0];
-return;
-}
-NSInteger code = [ACSafeStr(respDict[@"code"]) integerValue];
-if (code == 200) {
-task.sentCount++;
-NSDateFormatter *df = [[NSDateFormatter alloc] init];
-df.dateFormat = @"HH:mm:ss";
-task.lastSentTimeStr = [df stringFromDate:[NSDate date]];
-[weakSelf saveAllCustomSettings];
-NSString *postIdStr = ACSafeStr(respDict[@"data"]);
-NSString *okMsg = [NSString stringWithFormat:@"✅ 动态发布成功(%@) ID:%@ | 累计%ld次", task.lastSentTimeStr, postIdStr, (long)task.sentCount];
-weakSelf.lastMomentLog = okMsg;
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(YES, okMsg);
-return;
-}
-NSString *serverMsg = ACSafeStr(respDict[@"msg"]);
-if (serverMsg.length == 0) serverMsg = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"接口返回非200";
-// 修复：识别 token 过期与频率限制，分别走“重新抓 token”和“按服务端时间退避”
-if (code == 401 || code == 403 || [serverMsg.lowercaseString containsString:@"token"] ||
-[serverMsg containsString:@"登录"] || [serverMsg containsString:@"未授权"]) {
-[weakSelf.latestHTTPHeaders removeObjectForKey:@"token"];
-[weakSelf.latestHTTPHeaders removeObjectForKey:@"Token"];
-[weakSelf saveAllCustomSettings];
-NSString *errMsg = [NSString stringWithFormat:@"⚠️ 登录凭证失效(%ld): %@（已清除旧 token，60 秒后自动重试）", (long)code, serverMsg];
-weakSelf.lastMomentLog = errMsg;
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, errMsg);
-[weakSelf ac_scheduleMomentRetryAfter:60.0];
-return;
-}
-if ([serverMsg containsString:@"频繁"] || [serverMsg containsString:@"分钟"] || [serverMsg containsString:@"限制"]) {
-NSInteger waitMin = ACParseRetryMinutes(serverMsg);
-NSString *errMsg = [NSString stringWithFormat:@"⏳ 服务端限频(%ld): %@ | 已安排 %ld 分钟后自动重试", (long)code, serverMsg, (long)waitMin];
-weakSelf.lastMomentLog = errMsg;
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, errMsg);
-[weakSelf ac_scheduleMomentRetryAfter:(NSTimeInterval)waitMin * 60.0];
-return;
-}
-NSString *errLog = [NSString stringWithFormat:@"⚠️ 动态返回 HTTP %ld / code %ld: %@", (long)httpStatus, (long)code, serverMsg];
-weakSelf.lastMomentLog = errLog;
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, errLog);
+[self ac_publishViaNativeUI:task retryLeft:2 completion:completion];
 });
-}];
-acInternalRequest = NO;
-[publishTask resume];
-} @catch (NSException *e) {
-acInternalRequest = NO;
-self.momentPublishing = NO;
-ACLog(@"[发布] 异常 %@: %@", e.name, e.reason);
-self.lastMomentLog = [NSString stringWithFormat:@"❌ 发布异常: %@", e.reason ?: e.name];
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, self.lastMomentLog);
-}
 }
 
 #pragma mark - 2.1.3 新人进群迎新处理（严格使用槽位1：ACMediaSlotWelcome）
