@@ -4696,6 +4696,83 @@ if (store && *store) return; // 已安装，避免重复包裹
 IMP oldImp = method_setImplementation(m, newImp);
 if (store) *store = oldImp;
 }
+// —— 精准雷达1：UI 点击探针（抓点赞按钮绑定的真实 Target/Action，Swift 类也会走 target-action） ——
+%hook UIApplication
+- (BOOL)sendAction:(SEL)action to:(id)target from:(id)sender forEvent:(UIEvent *)event {
+@try {
+if (target && action) {
+NSString *clsName = NSStringFromClass([target class]);
+NSString *selName = NSStringFromSelector(action);
+NSString *selLower = selName.lowercaseString;
+BOOL hit = [clsName containsString:@"Moment"] || [clsName containsString:@"Like"] ||
+[selLower containsString:@"like"] || [selLower containsString:@"favor"] ||
+[selLower containsString:@"praise"];
+if (hit) {
+ACLog(@"🎯 [点赞UI探针命中] Target类: %@ | Action: %@ | 控件: %@", clsName, selName, NSStringFromClass([sender class]));
+}
+}
+} @catch (NSException *e) {}
+return %orig;
+}
+%end
+
+// —— 精准雷达2：运行时符号扫描（Dump 动态模块真实业务类与方法，@objc 暴露的 Swift 方法可见） ——
+static void ACDumpMomentClassesAndMethods(void) {
+@try {
+int numClasses = objc_getClassList(NULL, 0);
+if (numClasses <= 0) return;
+Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
+if (!classes) return;
+numClasses = objc_getClassList(classes, numClasses);
+ACLog(@"🔍 开始雷达扫描内存中的动态(Moment)业务符号...");
+for (int i = 0; i < numClasses; i++) {
+Class cls = classes[i];
+if (!cls) continue;
+const char *name = class_getName(cls);
+if (!name) continue;
+NSString *clsName = [NSString stringWithUTF8String:name];
+if (!([clsName containsString:@"Moment"] &&
+([clsName containsString:@"Model"] || [clsName containsString:@"Service"] ||
+[clsName containsString:@"Center"] || [clsName containsString:@"Manager"] ||
+[clsName containsString:@"Controller"] || [clsName containsString:@"Business"]))) continue;
+// 实例方法
+unsigned int methodCount = 0;
+Method *methods = class_copyMethodList(cls, &methodCount);
+if (methods) {
+for (unsigned int j = 0; j < methodCount; j++) {
+SEL sel = method_getName(methods[j]);
+NSString *selName = NSStringFromSelector(sel);
+NSString *sl = selName.lowercaseString;
+if ([sl containsString:@"like"] || [sl containsString:@"publish"] ||
+[sl containsString:@"favor"] || [sl containsString:@"praise"]) {
+ACLog(@"💡 候选方法: [%@ %@] (参数:%d)", clsName, selName, method_getNumberOfArguments(methods[j]) - 2);
+}
+}
+free(methods);
+}
+// 类方法（顺带找单例入口）
+unsigned int cCount = 0;
+Method *cMethods = class_copyMethodList(object_getClass(cls), &cCount);
+if (cMethods) {
+for (unsigned int j = 0; j < cCount; j++) {
+SEL sel = method_getName(cMethods[j]);
+NSString *selName = NSStringFromSelector(sel);
+NSString *sl = selName.lowercaseString;
+if ([sl containsString:@"like"] || [sl containsString:@"publish"] ||
+[sl containsString:@"shared"] || [sl containsString:@"default"]) {
+ACLog(@"💡 候选类方法: [+%@ %@] (参数:%d)", clsName, selName, method_getNumberOfArguments(cMethods[j]) - 2);
+}
+}
+free(cMethods);
+}
+}
+free(classes);
+ACLog(@"🔍 动态业务符号扫描完毕！");
+} @catch (NSException *e) {
+ACLog(@"[雷达] 扫描异常 %@", e.reason);
+}
+}
+
 static void ACInstallTIMHooks(void) {
 Class c = NSClassFromString(@"V2TIMManager");
 if (!c) return;
@@ -4712,4 +4789,8 @@ ACInstallTIMHooks();
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), install);
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), install);
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), install);
+// 延迟 2 秒后雷达扫描，等待 Swift 运行时完全加载
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+ACDumpMomentClassesAndMethods();
+});
 }
