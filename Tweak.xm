@@ -152,6 +152,25 @@ if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8Stri
 NSLog(@"[AirChatTweak] %@", msg);
 }
 }
+// 黄金抓包探针：捕获官方原生点赞/评论/发布请求的完整报文，用于比对修复 code:500
+static void ACGoldenProbeDump(NSURLRequest *request) {
+@try {
+if (!request || !request.URL || acInternalRequest) return;
+NSString *urlStr = request.URL.absoluteString ?: @"";
+if (!([urlStr containsString:@"/like"] || [urlStr containsString:@"/comment/publish"] || [urlStr containsString:@"/post/app/publish"])) return;
+ACLog(@"======== 抓获官方原生请求 ========");
+ACLog(@"[探针] URL: %@", urlStr);
+ACLog(@"[探针] Method: %@", request.HTTPMethod ?: @"GET");
+ACLog(@"[探针] Headers: %@", request.allHTTPHeaderFields);
+if (request.HTTPBody) {
+NSString *bodyStr = [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding];
+ACLog(@"[探针] Body: %@", bodyStr.length > 0 ? bodyStr : @"(非UTF8)");
+} else {
+ACLog(@"[探针] Body: (空，参数在URL Query中)");
+}
+ACLog(@"==================================");
+} @catch (NSException *e) {}
+}
 typedef NS_ENUM(NSInteger, ACMediaSlot) {
 ACMediaSlotBatchSend = 0, // 槽位0：群发专属媒体（好友/群员/群聊）
 ACMediaSlotWelcome   = 1, // 槽位1：🤖迎新专属媒体
@@ -1116,7 +1135,9 @@ ACLog(@"[自动评论] 跳过 %@：token 未捕获", postId);
 return;
 }
 NSString *host = [self ac_activeBusinessHost];
-NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/comment/publish", host]];
+// 【关键修复】Query 带 postId（兼容 @RequestParam），content 留在 Body（中文需转义，不宜放 Query）
+NSString *path = [NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/comment/publish?postId=%@", host, postId];
+NSURL *url = [NSURL URLWithString:path];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
 req.timeoutInterval = 10.0;
@@ -1124,28 +1145,34 @@ req.timeoutInterval = 10.0;
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
 [req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
-[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+[req setValue:@"application/json;charset=UTF-8" forHTTPHeaderField:@"Content-Type"];
 [req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
+// 【关键修复】只带基础鉴权头；绝不塞入发动态专用的 X-Lts-Id（加签绑定路径，跨接口使用会导致服务端 500）
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
 NSString *verVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
-if (verVal.length == 0) verVal = @"2.2.0"; // 网关版本淘汰兜底；正常情况优先用嗅探到的实时版本
+if (verVal.length == 0) verVal = @"2.2.0";
 [req setValue:verVal forHTTPHeaderField:@"version"];
 [req setValue:verVal forHTTPHeaderField:@"appVersion"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
-NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
-if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (ltsId.length > 50) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
 uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
 static uint64_t acReqSeq = 0;
 acReqSeq = (acReqSeq + 1) & 0x7F;
 [req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acReqSeq] forHTTPHeaderField:@"X-Request-No"];
-NSData *body = [NSJSONSerialization dataWithJSONObject:@{@"content": text ?: @"不错", @"postId": postId} options:0 error:nil];
+// 【关键修复】postId 兼容数值型 Long 与字符串两种反序列化
+unsigned long long numPostId = strtoull([postId UTF8String], NULL, 10);
+NSDictionary *cmtBody;
+if (numPostId > 0) {
+cmtBody = @{@"content": text ?: @"不错", @"postId": @(numPostId)};
+} else {
+cmtBody = @{@"content": text ?: @"不错", @"postId": postId ?: @""};
+}
+NSData *body = [NSJSONSerialization dataWithJSONObject:cmtBody options:0 error:nil];
 if (!body) { self.autoCommentSending = NO; return; }
 req.HTTPBody = body;
 [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
-ACLog(@"[自动评论] 发送 postId=%@ text=%@ ltsLen=%lu", postId, text, (unsigned long)ltsId.length);
+ACLog(@"[自动评论] 发送 postId=%@ text=%@ (Query+Body双参, Long=%llu)", postId, text, numPostId);
 acInternalRequest = YES;
 NSURLSession *acSession = ACDedicatedPluginSession();
 if (!acSession) { self.autoCommentSending = NO; acInternalRequest = NO; return; }
@@ -1243,7 +1270,9 @@ ACLog(@"[自动点赞] 跳过 %@：token 未捕获", postId);
 return;
 }
 NSString *host = [self ac_activeBusinessHost];
-NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/like/post", host]];
+// 【关键修复】URL Query 与 Body 双重带参，兼容后端 @RequestParam 与 @RequestBody 两种取参方式
+NSString *path = [NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/like/post?postId=%@&id=%@&likeStatus=1", host, postId, postId];
+NSURL *url = [NSURL URLWithString:path];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
 req.timeoutInterval = 10.0;
@@ -1251,29 +1280,34 @@ req.timeoutInterval = 10.0;
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
 [req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
-[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+[req setValue:@"application/json;charset=UTF-8" forHTTPHeaderField:@"Content-Type"];
 [req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
+// 【关键修复】只带基础鉴权头；绝不塞入发动态专用的 X-Lts-Id（其加签绑定接口路径，跨接口使用会导致服务端解签异常 500）
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
 NSString *verVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
-if (verVal.length == 0) verVal = @"2.2.0"; // 网关版本淘汰兜底；正常情况优先用嗅探到的实时版本
+if (verVal.length == 0) verVal = @"2.2.0";
 [req setValue:verVal forHTTPHeaderField:@"version"];
 [req setValue:verVal forHTTPHeaderField:@"appVersion"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
-NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
-if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (ltsId.length > 50) [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
 uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
 static uint64_t acLikeSeq = 0;
 acLikeSeq = (acLikeSeq + 1) & 0x7F;
 [req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acLikeSeq] forHTTPHeaderField:@"X-Request-No"];
-NSDictionary *bodyDict = @{@"postId": postId ?: @"", @"id": postId ?: @"", @"likeStatus": @(1)};
+// 【关键修复】postId 兼容数值型 Long 与字符串两种反序列化
+unsigned long long numPostId = strtoull([postId UTF8String], NULL, 10);
+NSDictionary *bodyDict;
+if (numPostId > 0) {
+bodyDict = @{@"postId": @(numPostId), @"id": @(numPostId), @"likeStatus": @(1)};
+} else {
+bodyDict = @{@"postId": postId ?: @"", @"id": postId ?: @"", @"likeStatus": @(1)};
+}
 NSData *body = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
 if (!body) { self.isLikeSending = NO; return; }
 req.HTTPBody = body;
 [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
-ACLog(@"[自动点赞] 发送 postId=%@ ltsLen=%lu", postId, (unsigned long)ltsId.length);
+ACLog(@"[自动点赞] 发送 postId=%@ (Query+Body双参, Long=%llu)", postId, numPostId);
 acInternalRequest = YES;
 NSURLSession *acSession = ACDedicatedPluginSession();
 if (!acSession) { self.isLikeSending = NO; acInternalRequest = NO; return; }
@@ -4152,6 +4186,7 @@ nav.modalPresentationStyle = UIModalPresentationPageSheet;
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
 NSString *urlStr = request.URL.absoluteString;
+ACGoldenProbeDump(request);
 // 自动捕获 airchat 业务网关（api/apiv1 域名）请求中的全部真实 Header（用于动态发布鉴权）
 BOOL acIsAirChatHost = ([urlStr containsString:@"airchat.cc"] || [urlStr containsString:@"airchat.cn"] || [urlStr containsString:@"airchat.ltd"]);
 if (!acInternalRequest && acIsAirChatHost && request.allHTTPHeaderFields) {
@@ -4232,6 +4267,7 @@ return %orig;
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
 if (!acInternalRequest && request && request.URL) {
 NSString *urlStr = request.URL.absoluteString ?: @"";
+ACGoldenProbeDump(request);
 if (urlStr.length > 0 && ([urlStr containsString:@"airchat.cc"] || [urlStr containsString:@"airchat.cn"])) {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSDictionary *headers = request.allHTTPHeaderFields;
