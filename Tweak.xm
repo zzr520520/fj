@@ -447,6 +447,8 @@ return item;
 @property (nonatomic, assign) NSTimeInterval autoLikeEnabledAt;
 // —— 批量语音打招呼（TUICallKit/TUICallEngine，默认 1 秒自动挂断）——
 @property (nonatomic, assign) BOOL voiceCallRunning;
+// —— 批量语音条打招呼（私聊发送 AAC 语音条，替代 VoIP 振铃）——
+@property (nonatomic, assign) BOOL voiceMemoRunning;
 @property (nonatomic, assign) BOOL welcomeVoiceCalling;
 @property (nonatomic, assign) float voiceHangupSeconds;
 // —— 自动点赞后台巡检（独立 Session 主动拉取，无需用户浏览信息流）——
@@ -526,6 +528,12 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_triggerAutoLikeForPost:(NSString *)postId;
 // —— 批量语音打招呼 + 自动挂断 ——
 - (void)ac_startBatchVoiceCall:(NSArray<ACContactItem *> *)targets;
+// —— 批量语音条打招呼（私聊 AAC 语音条）——
+- (void)ac_startBatchVoiceMemo:(NSArray<ACContactItem *> *)targets;
+// —— 槽位语音条存储 ——
+- (NSString *)audioPathForSlot:(ACMediaSlot)slot;
+- (void)saveAudioAtURL:(NSURL *)audioURL forSlot:(ACMediaSlot)slot duration:(int)sec;
+- (int)audioDurationForSlot:(ACMediaSlot)slot;
 - (void)ac_stopBatchVoiceCall;
 // —— 自动点赞后台巡检（独立会话） ——
 - (void)ac_startAutoLikePollTimer;
@@ -686,12 +694,43 @@ return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Sl
 NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Thumb.jpg", (long)slot]];
 }
+// 槽位语音条路径（0群发 / 1迎新 / 2自动回复 / 3发动态，彼此独立）
+- (NSString *)audioPathForSlot:(ACMediaSlot)slot {
+NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+return [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Slot_%ld_Audio.m4a", (long)slot]];
+}
+- (void)saveAudioAtURL:(NSURL *)audioURL forSlot:(ACMediaSlot)slot duration:(int)sec {
+if (!audioURL) return;
+@try {
+NSString *dest = [self audioPathForSlot:slot];
+NSFileManager *fm = [NSFileManager defaultManager];
+[fm removeItemAtPath:dest error:nil];
+if (![audioURL.path isEqualToString:dest]) {
+[fm copyItemAtURL:audioURL toURL:[NSURL fileURLWithPath:dest] error:nil];
+}
+int realDur = sec > 0 ? sec : [[ACAudioHelper shared] durationOfAudioAtPath:dest];
+if (realDur <= 0) realDur = 5;
+NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+[ud setInteger:3 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_MediaType", (long)slot]];
+[ud setInteger:realDur forKey:[NSString stringWithFormat:@"AC_Slot_%ld_AudioDur", (long)slot]];
+[ud synchronize];
+ACLog(@"[媒体槽位] 已保存【槽位%ld】语音条 (时长:%d秒)", (long)slot, realDur);
+} @catch (NSException *e) {
+ACLog(@"[媒体槽位] 保存语音失败 %@", e.reason);
+}
+}
+- (int)audioDurationForSlot:(ACMediaSlot)slot {
+NSString *key = [NSString stringWithFormat:@"AC_Slot_%ld_AudioDur", (long)slot];
+int d = (int)[[NSUserDefaults standardUserDefaults] integerForKey:key];
+return d > 0 ? d : 5;
+}
 - (NSInteger)mediaTypeForSlot:(ACMediaSlot)slot {
 NSString *key = [NSString stringWithFormat:@"AC_Slot_%ld_MediaType", (long)slot];
 NSInteger t = [[NSUserDefaults standardUserDefaults] integerForKey:key];
 NSFileManager *fm = [NSFileManager defaultManager];
 if (t == 1 && [fm fileExistsAtPath:[self imagePathForSlot:slot]]) return 1;
 if (t == 2 && [fm fileExistsAtPath:[self videoPathForSlot:slot]]) return 2;
+if (t == 3 && [fm fileExistsAtPath:[self audioPathForSlot:slot]]) return 3; // 语音条
 return 0;
 }
 - (int)videoDurationForSlot:(ACMediaSlot)slot {
@@ -701,6 +740,7 @@ return d > 0 ? d : 5;
 }
 - (UIImage *)previewImageForSlot:(ACMediaSlot)slot {
 NSInteger t = [self mediaTypeForSlot:slot];
+if (t == 3) return [UIImage systemImageNamed:@"waveform"];
 if (t == 1) {
 return [UIImage imageWithContentsOfFile:[self imagePathForSlot:slot]];
 } else if (t == 2) {
@@ -772,9 +812,11 @@ NSFileManager *fm = [NSFileManager defaultManager];
 [fm removeItemAtPath:[self imagePathForSlot:slot] error:nil];
 [fm removeItemAtPath:[self videoPathForSlot:slot] error:nil];
 [fm removeItemAtPath:[self videoThumbPathForSlot:slot] error:nil];
+[fm removeItemAtPath:[self audioPathForSlot:slot] error:nil];
 NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 [ud setInteger:0 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_MediaType", (long)slot]];
 [ud setInteger:0 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_VideoDur", (long)slot]];
+[ud setInteger:0 forKey:[NSString stringWithFormat:@"AC_Slot_%ld_AudioDur", (long)slot]];
 [ud synchronize];
 } @catch (NSException *e) {}
 }
@@ -1862,6 +1904,47 @@ acInternalRequest = NO;
 self.autoLikePolling = NO;
 ACLog(@"[自动点赞] 后台巡检异常 %@", e.reason);
 }
+}
+#pragma mark - 批量语音条打招呼（私聊发送 AAC 语音条，走普通消息信令，替代 VoIP 振铃）
+- (void)ac_startBatchVoiceMemo:(NSArray<ACContactItem *> *)targets {
+if (self.voiceMemoRunning) {
+self.voiceMemoRunning = NO;
+ACLog(@"[语音条打招呼] 已手动停止批量任务");
+return;
+}
+NSInteger mType = [self mediaTypeForSlot:ACMediaSlotBatchSend];
+NSString *audioPath = [self audioPathForSlot:ACMediaSlotBatchSend];
+if (mType != 3 || ![[NSFileManager defaultManager] fileExistsAtPath:audioPath]) {
+ACLog(@"[语音条打招呼] 请先在【💬回复】面板媒体框录制/导入语音条（槽位0 群发专属）");
+return;
+}
+if (targets.count == 0) {
+ACLog(@"[语音条打招呼] 目标为空，请先勾选群成员");
+return;
+}
+self.voiceMemoRunning = YES;
+int dur = [self audioDurationForSlot:ACMediaSlotBatchSend];
+ACLog(@"[语音条打招呼] 启动批量语音条任务，目标 %lu 人（语音 %d 秒，间隔 1.2-2.7 秒随机）", (unsigned long)targets.count, dur);
+__block NSMutableArray *queue = [targets mutableCopy];
+__weak typeof(self) wself = self;
+__block void (^nextSend)(void) = nil;
+nextSend = ^{
+__strong typeof(wself) sself = wself;
+if (!sself || !sself.voiceMemoRunning) return;
+if (queue.count == 0) {
+sself.voiceMemoRunning = NO;
+ACLog(@"[语音条打招呼] ✅ 批量任务全部执行完毕");
+return;
+}
+ACContactItem *t = queue.firstObject;
+[queue removeObjectAtIndex:0];
+[sself sendText:@"" mediaSlot:ACMediaSlotBatchSend attachMedia:YES toItem:t completion:^(BOOL ok, NSString *detail) {
+ACLog(@"[语音条打招呼] %@ [%@] %@", ok ? @"✅" : @"❌", t.name ?: t.targetId, detail ?: @"");
+NSTimeInterval delay = 1.2 + (arc4random_uniform(16) / 10.0);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), nextSend);
+}];
+};
+dispatch_async(dispatch_get_main_queue(), nextSend);
 }
 #pragma mark - 批量语音打招呼（优先进 TUICallEngine/TUICallKit，自动挂断）
 - (void)ac_stopBatchVoiceCall {
@@ -3329,9 +3412,9 @@ attachMedia:(BOOL)attachMedia
 toItem:(ACContactItem *)item
 completion:(void(^)(BOOL ok, NSString *detail))completion {
 NSInteger mType = attachMedia ? [self mediaTypeForSlot:slot] : 0;
-NSString *mPath = (mType == 1) ? [self imagePathForSlot:slot] : ((mType == 2) ? [self videoPathForSlot:slot] : @"");
+NSString *mPath = (mType == 1) ? [self imagePathForSlot:slot] : ((mType == 2) ? [self videoPathForSlot:slot] : ((mType == 3) ? [self audioPathForSlot:slot] : @""));
 NSString *tPath = (mType == 2) ? [self videoThumbPathForSlot:slot] : @"";
-int vDur = (mType == 2) ? [self videoDurationForSlot:slot] : 0;
+int vDur = (mType == 2) ? [self videoDurationForSlot:slot] : ((mType == 3) ? [self audioDurationForSlot:slot] : 0);
 [self sendText:text
 customMediaType:mType
 customMediaPath:mPath
@@ -3386,6 +3469,19 @@ __unsafe_unretained id tempVideoMsg = nil;
 [inv getReturnValue:&tempVideoMsg];
 v2MediaMsg = tempVideoMsg;
 }
+} else if (mType == 3 && mPath.length > 0 && [fm fileExistsAtPath:mPath]) {
+// 语音条消息（AAC 录音文件，走普通富媒体信令，替代 VoIP 振铃）
+SEL createSoundSel = NSSelectorFromString(@"createSoundMessage:duration:");
+int soundDur = vDur > 0 ? vDur : 5;
+if ([manager respondsToSelector:createSoundSel]) {
+v2MediaMsg = ((id (*)(id, SEL, NSString *, int))objc_msgSend)(manager, createSoundSel, mPath, soundDur);
+ACLog(@"[发送引擎] 已构建语音条消息 (文件:%@ 时长:%ds)", mPath.lastPathComponent, soundDur);
+} else {
+Class msgCls = NSClassFromString(@"V2TIMMessage");
+if (msgCls && [msgCls respondsToSelector:createSoundSel]) {
+v2MediaMsg = ((id (*)(id, SEL, NSString *, int))objc_msgSend)(msgCls, createSoundSel, mPath, soundDur);
+}
+}
 }
 NSString *cleanText = [ACSafeStr(text) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 NSString *obfuscatedText = cleanText.length > 0 ? [self obfuscateMessageText:cleanText] : @"";
@@ -3417,11 +3513,11 @@ item.chatMeType = 0;
 if (v2MediaMsg && v2TextMsg) {
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 [self rawSendV2Message:v2TextMsg toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
-if (completion) completion(YES, mType == 2 ? @"视频+文送达" : @"图+文送达");
+if (completion) completion(YES, mType == 2 ? @"视频+文送达" : (mType == 3 ? @"语音+文送达" : @"图+文送达"));
 }];
 });
 } else {
-if (completion) completion(YES, v2MediaMsg ? (mType == 2 ? @"视频送达" : @"图片送达") : @"文本送达");
+if (completion) completion(YES, v2MediaMsg ? (mType == 2 ? @"视频送达" : (mType == 3 ? @"🎙️语音条送达" : @"图片送达")) : @"文本送达");
 }
 return;
 }
@@ -3455,7 +3551,7 @@ if (completion) completion(NO, @"发送异常");
 }
 @end
 #pragma mark - 5. 转发/迎新/自动回复/定时动态 六合一主界面控制器（各面板媒体独立切换）
-@interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource, UINavigationControllerDelegate, UIImagePickerControllerDelegate, UITextViewDelegate>
+@interface ACForwardAssistantVC : UIViewController <UITableViewDelegate, UITableViewDataSource, UINavigationControllerDelegate, UIImagePickerControllerDelegate, UIDocumentPickerDelegate, UITextViewDelegate>
 @property (nonatomic, strong) UIView *headerContainer;
 @property (nonatomic, strong) UITextView *contentTextView;
 @property (nonatomic, strong) UIImageView *previewImageView;
@@ -3819,6 +3915,13 @@ self.previewImageView.image = previewImg;
 self.clearMediaBtn.hidden = NO;
 self.mediaBadgeLabel.hidden = NO;
 self.mediaBadgeLabel.text = [NSString stringWithFormat:@"🎬%@(%ds)", slotTitle, [mgr videoDurationForSlot:slot]];
+} else if (mType == 3 && previewImg) {
+self.previewImageView.image = previewImg; // 系统波形图标
+self.previewImageView.tintColor = [UIColor systemGreenColor];
+[self.pickMediaBtn setTitle:@"" forState:UIControlStateNormal];
+self.clearMediaBtn.hidden = NO;
+self.mediaBadgeLabel.hidden = NO;
+self.mediaBadgeLabel.text = [NSString stringWithFormat:@"🎙️%@(%ds)", slotTitle, [mgr audioDurationForSlot:slot]];
 } else {
 self.previewImageView.image = nil;
 [self.pickMediaBtn setTitle:[NSString stringWithFormat:@"🖼️/🎬\n%@\n点此上传", slotTitle] forState:UIControlStateNormal];
@@ -4141,14 +4244,94 @@ for (ACContactItem *g in mgr.groupList) {
 [self updateUI];
 [self.tableView reloadData];
 }
+// 媒体选择：Action Sheet（相册 / 现场录音 / 导入音频 / 试听语音）
 - (void)chooseMediaFromAlbum {
 [self.view endEditing:YES];
+ACMediaSlot slot = [self currentActiveMediaSlot];
+NSString *slotTitle = [self slotNameForSlot:slot];
+UIAlertController *sheet = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"选择【%@】媒体类型", slotTitle]
+message:@"图片 / 视频 / 录音 / 导入本地音频"
+preferredStyle:UIAlertControllerStyleActionSheet];
+[sheet addAction:[UIAlertAction actionWithTitle:@"🖼️ / 🎬 相册选择图片/视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
 UIImagePickerController *picker = [[UIImagePickerController alloc] init];
 picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
 picker.mediaTypes = @[@"public.image", @"public.movie"];
 picker.videoQuality = UIImagePickerControllerQualityTypeMedium;
 picker.delegate = self;
 [self presentViewController:picker animated:YES completion:nil];
+}]];
+[sheet addAction:[UIAlertAction actionWithTitle:@"🎙️ 现场录制语音条" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+[self showAudioRecordingDialogForSlot:slot];
+}]];
+[sheet addAction:[UIAlertAction actionWithTitle:@"🎵 导入本地音频 (.m4a/.mp3/.wav)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+UIDocumentPickerViewController *docPicker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.audio"] inMode:UIDocumentPickerModeImport];
+docPicker.delegate = self;
+docPicker.allowsMultipleSelection = NO;
+[self presentViewController:docPicker animated:YES completion:nil];
+}]];
+if ([[ACForwardHelperManager shared] mediaTypeForSlot:slot] == 3) {
+[sheet addAction:[UIAlertAction actionWithTitle:@"▶️ 试听当前槽位语音" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+NSString *audioPath = [[ACForwardHelperManager shared] audioPathForSlot:slot];
+self.statusLabel.text = @"🔊 正在试听语音条...";
+__weak typeof(self) wself = self;
+[[ACAudioHelper shared] playAudioAtPath:audioPath completion:^{
+__strong typeof(wself) sself = wself;
+if (sself) sself.statusLabel.text = @"▶️ 语音播放完毕";
+}];
+}]];
+}
+[sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+[self presentViewController:sheet animated:YES completion:nil];
+}
+// 现场录音交互（先申请麦克风权限）
+- (void)showAudioRecordingDialogForSlot:(ACMediaSlot)slot {
+NSString *destPath = [[ACForwardHelperManager shared] audioPathForSlot:slot];
+__weak typeof(self) wself = self;
+[[AVAudioSession sharedInstance] performSelector:@selector(requestRecordPermission:) withObject:^(BOOL granted) {
+dispatch_async(dispatch_get_main_queue(), ^{
+__strong typeof(wself) sself = wself;
+if (!sself) return;
+if (!granted) {
+sself.statusLabel.textColor = [UIColor systemRedColor];
+sself.statusLabel.text = @"❌ 未授权麦克风，请到系统设置开启";
+return;
+}
+UIAlertController *recAlert = [UIAlertController alertControllerWithTitle:@"🎙️ 录制语音条"
+message:@"点击【开始录音】后对着手机讲话，录完点击【停止并保存】"
+preferredStyle:UIAlertControllerStyleAlert];
+[recAlert addAction:[UIAlertAction actionWithTitle:@"🔴 开始录音" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+[[ACAudioHelper shared] startRecordingToPath:destPath];
+sself.statusLabel.text = @"🎙️ 正在录音中... 请对着手机讲话";
+UIAlertController *stopAlert = [UIAlertController alertControllerWithTitle:@"🎙️ 正在录音..."
+message:@"说话结束后点击停止"
+preferredStyle:UIAlertControllerStyleAlert];
+[stopAlert addAction:[UIAlertAction actionWithTitle:@"⏹️ 停止并保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a2) {
+int sec = [[ACAudioHelper shared] stopRecording];
+[[ACForwardHelperManager shared] saveAudioAtURL:[NSURL fileURLWithPath:destPath] forSlot:slot duration:sec];
+[sself refreshMediaPreviewUI];
+sself.statusLabel.textColor = [UIColor systemGreenColor];
+sself.statusLabel.text = [NSString stringWithFormat:@"✅ 录制成功！已保存为 %d 秒语音条", sec];
+}]];
+[stopAlert addAction:[UIAlertAction actionWithTitle:@"取消(不保存)" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a2) {
+[[ACAudioHelper shared] stopRecording];
+sself.statusLabel.text = @"已取消录音";
+}]];
+[sself presentViewController:stopAlert animated:YES completion:nil];
+}]];
+[recAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+[sself presentViewController:recAlert animated:YES completion:nil];
+});
+}];
+}
+// 本地音频导入回调
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+NSURL *url = urls.firstObject;
+if (!url) return;
+ACMediaSlot slot = [self currentActiveMediaSlot];
+[[ACForwardHelperManager shared] saveAudioAtURL:url forSlot:slot duration:0];
+[self refreshMediaPreviewUI];
+self.statusLabel.textColor = [UIColor systemGreenColor];
+self.statusLabel.text = [NSString stringWithFormat:@"✅ 音频导入成功！时长: %d 秒", [[ACForwardHelperManager shared] audioDurationForSlot:slot]];
 }
 // 选图或选视频时，严格保存到当前面板对应的独立槽位中，绝不串用！
 - (void)imagePickerController:(UIImagePickerController * _Nonnull)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> * _Nonnull)info {
@@ -4367,7 +4550,7 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 4) return mgr.autoReplyRules.count;
 if (idx == 5) return mgr.momentTasks.count;
-if (idx == 6) return 6; // 自动点赞 / 语音打招呼 / 后台保活 / 机器人伪装 / 机器人名称 / 挂断秒数
+if (idx == 6) return 7; // 自动点赞 / 语音打招呼 / 后台保活 / 机器人伪装 / 机器人名称 / 挂断秒数
 if (idx == 7) return mgr.accountList.count + 1; // 首行保存 + 账号列表
 return [self currentItems].count;
 }
@@ -4427,9 +4610,20 @@ cell.accessoryView = [self ac_toolSwitch:mgr.robotModeEnabled tag:702];
 cell.textLabel.text = @"✏️ 机器人名称";
 cell.detailTextLabel.text = mgr.robotDisplayName.length > 0 ? mgr.robotDisplayName : @"群管机器人";
 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-} else {
+} else if (indexPath.row == 5) {
 cell.textLabel.text = @"⏱️ 语音自动挂断秒数";
 cell.detailTextLabel.text = [NSString stringWithFormat:@"当前 %.1f 秒（允许 0.3–15 秒，越短越安全）", mgr.voiceHangupSeconds];
+cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+} else { // row 6 批量语音条打招呼
+NSInteger selCount = 0;
+for (ACContactItem *m in mgr.groupMemberList) if (m.isSelected) selCount++;
+NSInteger targetCount = selCount > 0 ? selCount : (NSInteger)mgr.groupMemberList.count;
+BOOL hasAudio = [mgr mediaTypeForSlot:ACMediaSlotBatchSend] == 3;
+cell.textLabel.text = mgr.voiceMemoRunning ? @"🛑 停止批量语音条打招呼" : @"🎙️ 批量语音条打招呼";
+cell.textLabel.textColor = mgr.voiceMemoRunning ? [UIColor systemRedColor] : [UIColor systemPurpleColor];
+cell.detailTextLabel.text = hasAudio
+? [NSString stringWithFormat:@"向 %ld 位群成员私聊发送语音条（%d 秒），走普通消息信令，不触发 VoIP 骚扰风控", (long)targetCount, [mgr audioDurationForSlot:ACMediaSlotBatchSend]]
+: @"⚠️ 请先在【💬回复】面板媒体框录制/导入语音条（槽位0 群发专属）";
 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 }
 return cell;
@@ -4598,6 +4792,23 @@ self.statusLabel.text = mgr.voiceCallRunning
 ? [NSString stringWithFormat:@"📞 批量语音打招呼运行中（%lu 人，%.1f 秒自动挂断）", (unsigned long)targets.count, mgr.voiceHangupSeconds]
 : @"🛑 已停止批量语音打招呼";
 [tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:1 inSection:0]] withRowAnimation:UITableViewRowAnimationNone];
+return;
+}
+if (indexPath.row == 6) {
+NSMutableArray<ACContactItem *> *targets = [NSMutableArray array];
+for (ACContactItem *m in mgr.groupMemberList) if (m.isSelected) [targets addObject:m];
+if (targets.count == 0) targets = [mgr.groupMemberList mutableCopy];
+if (targets.count == 0) {
+self.statusLabel.textColor = [UIColor systemRedColor];
+self.statusLabel.text = @"❌ 群成员列表为空，请先到【群员】面板定向采集";
+return;
+}
+[mgr ac_startBatchVoiceMemo:targets];
+self.statusLabel.textColor = mgr.voiceMemoRunning ? [UIColor systemPurpleColor] : [UIColor secondaryLabelColor];
+self.statusLabel.text = mgr.voiceMemoRunning
+? [NSString stringWithFormat:@"🎙️ 批量语音条打招呼运行中（%lu 人，私聊发送）", (unsigned long)targets.count]
+: @"🛑 已停止批量语音条打招呼";
+[tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:6 inSection:0]] withRowAnimation:UITableViewRowAnimationNone];
 return;
 }
 if (indexPath.row == 5) {
@@ -5104,6 +5315,88 @@ if (quickForwardPill.superview) [quickForwardPill removeFromSuperview];
 ACPresentForwardAssistantFromTopVC();
 }
 %end
+#pragma mark - 语音条录制/播放辅助器（AVFoundation 原生，AAC 格式双端通用）
+@interface ACAudioHelper : NSObject <AVAudioRecorderDelegate, AVAudioPlayerDelegate>
+@property (nonatomic, strong) AVAudioRecorder *recorder;
+@property (nonatomic, strong) AVAudioPlayer *player;
+@property (nonatomic, copy) NSString *currentRecordingPath;
+@property (nonatomic, assign) NSTimeInterval recordStartTime;
++ (instancetype)shared;
+- (void)startRecordingToPath:(NSString *)destPath;
+- (int)stopRecording;
+- (void)playAudioAtPath:(NSString *)path completion:(void(^)(void))completion;
+- (void)stopPlaying;
+- (int)durationOfAudioAtPath:(NSString *)path;
+@end
+@implementation ACAudioHelper {
+void (^_playDoneBlock)(void);
+}
++ (instancetype)shared {
+static ACAudioHelper *inst = nil;
+static dispatch_once_t once;
+dispatch_once(&once, ^{ inst = [[ACAudioHelper alloc] init]; });
+return inst;
+}
+- (void)startRecordingToPath:(NSString *)destPath {
+[self stopPlaying];
+self.currentRecordingPath = destPath;
+@try {
+AVAudioSession *session = [AVAudioSession sharedInstance];
+[session setCategory:AVAudioSessionCategoryPlayAndRecord error:nil];
+[session setActive:YES error:nil];
+NSDictionary *settings = @{
+AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+AVSampleRateKey: @(16000.0),
+AVNumberOfChannelsKey: @(1),
+AVEncoderAudioQualityKey: @(AVAudioQualityMedium)
+};
+NSURL *url = [NSURL fileURLWithPath:destPath];
+[[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
+self.recorder = [[AVAudioRecorder alloc] initWithURL:url settings:settings error:nil];
+self.recorder.delegate = self;
+[self.recorder record];
+self.recordStartTime = [[NSDate date] timeIntervalSince1970];
+ACLog(@"[录音] 开始录制语音条 -> %@", destPath.lastPathComponent);
+} @catch (NSException *e) {
+ACLog(@"[录音] 启动失败 %@", e.reason);
+}
+}
+- (int)stopRecording {
+if (!self.recorder || !self.recorder.isRecording) return 0;
+NSTimeInterval dur = [[NSDate date] timeIntervalSince1970] - self.recordStartTime;
+@try { [self.recorder stop]; } @catch (NSException *e) {}
+self.recorder = nil;
+[AVAudioSession.sharedInstance setCategory:AVAudioSessionCategoryPlayback error:nil];
+int sec = (int)round(dur);
+return sec > 0 ? sec : 1;
+}
+- (void)playAudioAtPath:(NSString *)path completion:(void(^)(void))completion {
+[self stopPlaying];
+if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
+_playDoneBlock = [completion copy];
+@try {
+self.player = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:nil];
+self.player.delegate = self;
+[self.player play];
+} @catch (NSException *e) {}
+}
+- (void)stopPlaying {
+if (self.player && self.player.isPlaying) [self.player stop];
+self.player = nil;
+}
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
+if (_playDoneBlock) { void (^b)(void) = _playDoneBlock; _playDoneBlock = nil; b(); }
+}
+- (int)durationOfAudioAtPath:(NSString *)path {
+if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return 0;
+@try {
+AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+CMTime t = asset.duration;
+if (t.timescale > 0) return (int)round((double)t.value / (double)t.timescale);
+} @catch (NSException *e) {}
+return 0;
+}
+@end
 %hook UIViewController
 // 评论文案防封混淆后缀（破除服务端文本 MD5 查重，风控铁律③）
 static inline NSString *ACAntiBanSuffix(void) {
