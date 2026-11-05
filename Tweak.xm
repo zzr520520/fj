@@ -174,6 +174,10 @@ ACLog(@"[探针] Body: %@", bodyStr.length > 0 ? bodyStr : @"(非UTF8)");
 } else {
 ACLog(@"[探针] Body: (空，参数在URL Query中)");
 }
+// 打印原生调用栈：定位 App 内部是谁在发这个请求（类名/方法名），用于反射桥接
+NSArray *acSyms = [NSThread callStackSymbols];
+NSUInteger acMax = acSyms.count > 30 ? 30 : acSyms.count;
+ACLog(@"[探针核心调用栈]:\n%@", [(NSArray *)[acSyms subarrayWithRange:NSMakeRange(0, acMax)] componentsJoinedByString:@"\n"]);
 ACLog(@"==================================");
 } @catch (NSException *e) {}
 }
@@ -461,6 +465,9 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_pollFeedForAutoLike;
 // —— 动态业务网关解析（升级后 .cc/.cn/.ltd 自适应） ——
 - (NSString *)ac_activeBusinessHost;
+// —— 原生桥接点赞（借 App 内部加签模块生成一次性 X-Lts-Id） ——
+- (void)ac_nativeLikePostId:(NSString *)postId completion:(void(^)(BOOL ok))completion;
+- (void)ac_httpLikePostId:(NSString *)postId;
 // —— 后台静音保活 ——
 - (void)ac_applyKeepAliveState;
 @end
@@ -1257,7 +1264,65 @@ NSString *pid = self.likeQueue.firstObject;
 self.isLikeSending = YES;
 [self ac_triggerAutoLikeForPost:pid];
 }
-- (void)ac_triggerAutoLikeForPost:(NSString *)postId {
+// —— 原生桥接点赞：反射调用 App 内部业务类，让 App 自己生成合法一次性 X-Lts-Id ——
+- (void)ac_nativeLikePostId:(NSString *)postId completion:(void(^)(BOOL ok))completion {
+@try {
+__block BOOL done = NO;
+void (^finish)(BOOL) = ^(BOOL ok2) { if (!done) { done = YES; if (completion) completion(ok2); } };
+// 20s 看门狗：App 内部方法若不回调，防止点赞队列卡死
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ finish(NO); });
+
+Class centerCls = NSClassFromString(@"airchat.AirMomentBusinessCenter");
+if (!centerCls) centerCls = NSClassFromString(@"AirMomentBusinessCenter");
+if (!centerCls) centerCls = NSClassFromString(@"AirMomentBussinessCenter");
+if (!centerCls) centerCls = NSClassFromString(@"AirMomentViewModel");
+if (!centerCls) {
+ACLog(@"[原生点赞] 未找到业务类（等待探针调用栈对齐符号）");
+finish(NO);
+return;
+}
+SEL defaultCenterSel = NSSelectorFromString(@"defaultCenter");
+if (![centerCls respondsToSelector:defaultCenterSel]) defaultCenterSel = NSSelectorFromString(@"shared");
+if (![centerCls respondsToSelector:defaultCenterSel]) defaultCenterSel = NSSelectorFromString(@"sharedInstance");
+id centerObj = nil;
+if ([centerCls respondsToSelector:defaultCenterSel]) {
+centerObj = ((id (*)(id, SEL))objc_msgSend)(centerCls, defaultCenterSel);
+}
+SEL likeSel1 = NSSelectorFromString(@"likePostWithPostId:actionType:completion:");
+SEL likeSel2 = NSSelectorFromString(@"requestLikePost:actionType:completion:");
+SEL likeSel3 = NSSelectorFromString(@"likePost:completion:");
+SEL likeSel4 = NSSelectorFromString(@"likePostWithId:completion:");
+id target = centerObj ?: centerCls;
+if (!target) { finish(NO); return; }
+if ([target respondsToSelector:likeSel1]) {
+ACLog(@"[原生点赞] 命中 likePostWithPostId:actionType:completion:");
+((void (*)(id, SEL, id, id, id))objc_msgSend)(target, likeSel1, postId, @"1", ^(BOOL success, id resp){ finish(success); });
+return;
+}
+if ([target respondsToSelector:likeSel2]) {
+ACLog(@"[原生点赞] 命中 requestLikePost:actionType:completion:");
+((void (*)(id, SEL, id, id, id))objc_msgSend)(target, likeSel2, postId, @"1", ^(BOOL success, id resp){ finish(success); });
+return;
+}
+if ([target respondsToSelector:likeSel3]) {
+ACLog(@"[原生点赞] 命中 likePost:completion:");
+((void (*)(id, SEL, id, id))objc_msgSend)(target, likeSel3, postId, ^(BOOL success, id resp){ finish(success); });
+return;
+}
+if ([target respondsToSelector:likeSel4]) {
+ACLog(@"[原生点赞] 命中 likePostWithId:completion:");
+((void (*)(id, SEL, id, id))objc_msgSend)(target, likeSel4, postId, ^(BOOL success, id resp){ finish(success); });
+return;
+}
+ACLog(@"[原生点赞] 类存在但未匹配到已知选择子（%@），等待探针栈", NSStringFromClass(centerCls));
+finish(NO);
+} @catch (NSException *e) {
+ACLog(@"[原生点赞] 异常: %@", e.reason);
+if (completion) completion(NO);
+}
+}
+// HTTP 直发通道（回退用：原生未接通时以嗅探报文直发）
+- (void)ac_httpLikePostId:(NSString *)postId {
 @try {
 NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
 if (token.length == 0) {
@@ -1329,6 +1394,29 @@ acInternalRequest = NO;
 self.isLikeSending = NO;
 ACLog(@"[自动点赞] 异常 %@: %@", e.name, e.reason);
 }
+}
+// 自动点赞入口：优先原生通道（App 自产一次性 X-Lts-Id，免签名复用 500），未接通回退 HTTP 直发
+- (void)ac_triggerAutoLikeForPost:(NSString *)postId {
+ACLog(@"[自动点赞] 尝试原生通道: %@", postId);
+__weak typeof(self) w = self;
+[self ac_nativeLikePostId:postId completion:^(BOOL ok) {
+dispatch_async(dispatch_get_main_queue(), ^{
+if (ok) {
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.isLikeSending = NO;
+mgr.lastMomentLog = [NSString stringWithFormat:@"👍 原生点赞成功：%@", postId];
+ACLog(@"[自动点赞] ✅ 原生点赞成功 postId=%@", postId);
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+NSTimeInterval delay = 2.0 + (arc4random_uniform(21) / 10.0);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[mgr ac_pumpAutoLikeQueue];
+});
+} else {
+ACLog(@"[自动点赞] 原生通道未接通，回退 HTTP 直发（需探针栈对齐符号）");
+[w ac_httpLikePostId:postId];
+}
+});
+}];
 }
 #pragma mark - 自动点赞/自动评论后台巡检（独立 Session，不依赖用户浏览信息流）
 - (void)ac_startAutoLikePollTimer {
