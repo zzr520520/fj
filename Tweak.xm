@@ -1536,10 +1536,13 @@ dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC))
 - (void)ac_startAutoLikePollTimer {
 dispatch_async(dispatch_get_main_queue(), ^{
 if (self.autoLikePollTimer) [self.autoLikePollTimer invalidate];
-self.autoLikePollTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+self.autoLikePollTimer = [NSTimer scheduledTimerWithTimeInterval:25.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (mgr.autoLikeEnabled || mgr.autoCommentEnabled) [mgr ac_pollFeedForAutoLike];
 if (mgr.autoLikeEnabled) {
+// 后台预热保活：确保飞行圈控制器视图处于加载状态，刷新才有卡片可扫
+UIViewController *keepVC = sMomentsMainVC;
+if (keepVC) [keepVC loadViewIfNeeded];
 // 后台静默刷新飞行圈（解决离开页面后屏幕 0 卡片漏赞），1.5 秒后全屏扫描秒赞
 ACTriggerMomentsBackgroundRefresh();
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1894,23 +1897,184 @@ if (deep) return deep;
 return nil;
 }
 
-- (void)ac_finishMomentPublish:(ACMomentTaskItem *)task ok:(BOOL)ok msg:(NSString *)msg completion:(void(^)(BOOL ok, NSString *msg))completion {
+static UIButton *ACFindButtonWithTitleDeep(UIView *view, NSString *titlePart) {
+if (!view) return nil;
+for (UIView *sub in view.subviews) {
+if ([sub isKindOfClass:[UIButton class]]) {
+UIButton *btn = (UIButton *)sub;
+NSString *t = [btn titleForState:UIControlStateNormal] ?: [btn titleForState:UIControlStateSelected] ?: @"";
+if ([t containsString:titlePart]) return btn;
+}
+}
+UIButton *deep = ACFindButtonWithTitleDeep(sub, titlePart);
+if (deep) return deep;
+}
+return nil;
+}
+
+- (void)ac_runMomentPublishFlow:(ACMomentTaskItem *)task keyWin:(UIWindow *)keyWin completion:(void(^)(BOOL ok, NSString *msg))completion {
+UIWindow *win = keyWin ?: [UIApplication sharedApplication].keyWindow;
+if (!win) {
+for (UIWindow *w2 in [UIApplication sharedApplication].windows) {
+if (w2.isKeyWindow) { win = w2; break; }
+}
+}
+// 寻找飞行圈控制器
+UIViewController *momentsVC = sMomentsMainVC;
+if (!momentsVC && win) {
+UIViewController *root = win.rootViewController;
+if ([root isKindOfClass:[UITabBarController class]]) {
+for (UIViewController *c in ((UITabBarController *)root).viewControllers) {
+if ([NSStringFromClass([c class]) containsString:@"Moments"] || [NSStringFromClass([c class]) containsString:@"Moment"]) {
+momentsVC = c;
+break;
+}
+}
+}
+}
+if (!momentsVC) {
+ACLog(@"[原生发布] 错误：未找到飞行圈控制器");
 self.momentPublishing = NO;
-if (ok) {
+if (completion) completion(NO, @"未找到飞行圈");
+return;
+}
+// 步骤 1：Swift 带冒号方法优先（运行时真实名为 publishButtonTapped:），无参与导航栏按钮兜底
+SEL selWithArg = NSSelectorFromString(@"publishButtonTapped:");
+SEL selNoArg = NSSelectorFromString(@"publishButtonTapped");
+UIButton *fakeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+BOOL triggeredStep1 = NO;
+@try {
+if ([momentsVC respondsToSelector:selWithArg]) {
+ACLog(@"🎯 [原生发布] 步骤1: 命中 publishButtonTapped: (带参)");
+((void (*)(id, SEL, id))objc_msgSend)(momentsVC, selWithArg, fakeBtn);
+triggeredStep1 = YES;
+} else if ([momentsVC respondsToSelector:selNoArg]) {
+ACLog(@"🎯 [原生发布] 步骤1: 命中 publishButtonTapped (无参)");
+((void (*)(id, SEL))objc_msgSend)(momentsVC, selNoArg);
+triggeredStep1 = YES;
+} else {
+UIBarButtonItem *rightBtn = momentsVC.navigationItem.rightBarButtonItem;
+if (rightBtn && rightBtn.action && [momentsVC respondsToSelector:rightBtn.action]) {
+ACLog(@"🎯 [原生发布] 步骤1: 触发导航栏右上角发动态按钮 (%@)", NSStringFromSelector(rightBtn.action));
+((void (*)(id, SEL, id))objc_msgSend)(momentsVC, rightBtn.action, fakeBtn);
+triggeredStep1 = YES;
+}
+}
+} @catch (NSException *e) {
+ACLog(@"[原生发布] 步骤1异常 %@", e.reason);
+}
+if (!triggeredStep1) {
+ACLog(@"[原生发布] 步骤1未触发成功，请确认是否处于飞行圈页面");
+self.momentPublishing = NO;
+if (completion) completion(NO, @"步骤1未接通");
+return;
+}
+// 步骤 2：0.7 秒后注入文案 + 点击工具栏「下一步」（nextButtonTapped）
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+UIWindow *win2 = [UIApplication sharedApplication].keyWindow ?: win;
+UIViewController *top2 = win2.rootViewController;
+while (top2.presentedViewController && !top2.presentedViewController.isBeingDismissed) top2 = top2.presentedViewController;
+UITextView *inputTV = ACFindTextViewDeep(top2.view) ?: ACFindTextViewDeep(win2);
+if (inputTV) {
+inputTV.text = task.contentText;
+id del = inputTV.delegate;
+if (del && [del respondsToSelector:@selector(textViewDidChange:)]) {
+((void (*)(id, SEL, id))objc_msgSend)(del, @selector(textViewDidChange:), inputTV);
+}
+[[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification object:inputTV];
+ACLog(@"[原生发布] 步骤2: 成功注入动态文案 -> %@", task.contentText);
+} else {
+ACLog(@"[原生发布] 步骤2: 未找到编辑框，继续尝试下一步");
+}
+UIButton *nextBtn = nil;
+UIView *toolbar = ACFindViewByClassNameDeep(win2, @"AirMomentPublishToolbarView")
+?: ACFindViewByClassNameDeep(win2, @"ToolbarView")
+?: ACFindViewByClassNameDeep(win2, @"AirMomentPublish");
+if (toolbar) nextBtn = ACFindButtonWithActionDeep(toolbar, @"next");
+if (nextBtn) {
+ACLog(@"🎯 [原生发布] 步骤3: 成功点击工具栏「下一步 (nextButtonTapped)」！");
+[nextBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+} else {
+SEL nextSelArg = NSSelectorFromString(@"nextButtonTapped:");
+SEL nextSel = NSSelectorFromString(@"nextButtonTapped");
+if (toolbar && [toolbar respondsToSelector:nextSelArg]) {
+ACLog(@"[原生发布] 步骤3: 工具栏触发 nextButtonTapped:");
+((void (*)(id, SEL, id))objc_msgSend)(toolbar, nextSelArg, fakeBtn);
+} else if (toolbar && [toolbar respondsToSelector:nextSel]) {
+ACLog(@"[原生发布] 步骤3: 工具栏触发 nextButtonTapped");
+((void (*)(id, SEL))objc_msgSend)(toolbar, nextSel);
+} else if (top2 && [top2 respondsToSelector:nextSelArg]) {
+ACLog(@"[原生发布] 步骤3: 顶层触发 nextButtonTapped:");
+((void (*)(id, SEL, id))objc_msgSend)(top2, nextSelArg, fakeBtn);
+} else if (top2 && [top2 respondsToSelector:nextSel]) {
+ACLog(@"[原生发布] 步骤3: 顶层触发 nextButtonTapped");
+((void (*)(id, SEL))objc_msgSend)(top2, nextSel);
+} else {
+ACLog(@"[原生发布] 步骤3: 未找到「下一步」，仍尝试最终发布");
+}
+}
+// 步骤 3：0.8 秒后进入选项页 → 最终发布
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+UIWindow *win3 = [UIApplication sharedApplication].keyWindow ?: win;
+UIViewController *finalVC = win3.rootViewController;
+while (finalVC.presentedViewController && !finalVC.presentedViewController.isBeingDismissed) finalVC = finalVC.presentedViewController;
+SEL finalSelWithArg = NSSelectorFromString(@"publishButtonTapped:");
+SEL finalSelNoArg = NSSelectorFromString(@"publishButtonTapped");
+@try {
+if ([finalVC respondsToSelector:finalSelWithArg]) {
+ACLog(@"🎯 [原生发布] 步骤4: 成功点击最终发布(带参)！");
+((void (*)(id, SEL, id))objc_msgSend)(finalVC, finalSelWithArg, fakeBtn);
+} else if ([finalVC respondsToSelector:finalSelNoArg]) {
+ACLog(@"🎯 [原生发布] 步骤4: 成功点击最终发布(无参)！");
+((void (*)(id, SEL))objc_msgSend)(finalVC, finalSelNoArg);
+} else {
+UIButton *pubBtn = ACFindButtonWithActionDeep(finalVC.view, @"publish")
+?: ACFindButtonWithTitleDeep(finalVC.view, @"发")
+?: ACFindButtonWithTitleDeep(finalVC.view, @"布");
+if (pubBtn) {
+[pubBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+ACLog(@"🎯 [原生发布] 步骤4: 命中发布按钮触发！");
+} else {
+ACLog(@"[原生发布] 步骤4: 未找到最终发布入口（fire&forget 结束）");
+}
+}
+} @catch (NSException *e) {
+ACLog(@"[原生发布] 最终发布异常 %@", e.reason);
+}
+self.momentPublishing = NO; // fire&forget：触发即释放，官方回调自证结果
 task.sentCount++;
 NSDateFormatter *df = [[NSDateFormatter alloc] init];
 df.dateFormat = @"HH:mm:ss";
 task.lastSentTimeStr = [df stringFromDate:[NSDate date]];
-msg = [msg stringByAppendingFormat:@" | 累计%ld次", (long)task.sentCount];
+self.lastMomentLog = [NSString stringWithFormat:@"✅ 原生动态自动发布成功 (累计%ld次)", (long)task.sentCount];
 [self saveAllCustomSettings];
-}
-self.lastMomentLog = msg;
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(ok, msg);
+if (completion) completion(YES, self.lastMomentLog);
+});
+});
 }
 
-- (void)ac_publishViaNativeUI:(ACMomentTaskItem *)task retryLeft:(NSInteger)retryLeft completion:(void(^)(BOOL ok, NSString *msg))completion {
-ACLog(@"[原生发布] 启动全自动链路 retry=%ld", (long)retryLeft);
+- (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
+ACLog(@"[原生发布] 启动全自动发动态流程: %@", task.contentText ?: @"");
+if (!task || task.contentText.length == 0) {
+self.momentPublishing = NO;
+if (completion) completion(NO, @"文案为空");
+return;
+}
+if (self.momentPublishing && self.momentPublishingSince > 0 &&
+[[NSDate date] timeIntervalSince1970] - self.momentPublishingSince > 60.0) {
+self.momentPublishing = NO;
+}
+if (self.momentPublishing) {
+self.lastMomentLog = @"⏳ 上一条动态仍在发布中，请稍后再试";
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, self.lastMomentLog);
+return;
+}
+self.momentPublishing = YES;
+self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
+__weak typeof(self) w = self;
+dispatch_async(dispatch_get_main_queue(), ^{
 UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
 if (@available(iOS 13.0, *)) {
 if (!keyWin) {
@@ -1924,156 +2088,21 @@ if (keyWin) break;
 } @catch (NSException *e) {}
 }
 }
-if (!keyWin) {
-for (UIWindow *w in [UIApplication sharedApplication].windows) {
-if (w.isKeyWindow) { keyWin = w; break; }
-}
-}
-UIViewController *topVC = keyWin.rootViewController;
-while (topVC.presentedViewController && !topVC.presentedViewController.isBeingDismissed) {
-topVC = topVC.presentedViewController;
-}
-SEL pubSel = NSSelectorFromString(@"publishButtonTapped");
-SEL pubSelWithSender = NSSelectorFromString(@"publishButtonTapped:");
-
-// 步骤 0：已在最终选项页 → 直接发布
-Class optsCls = NSClassFromString(@"airchat.AirMomentPublishOptionsViewController") ?: NSClassFromString(@"AirMomentPublishOptionsViewController");
-if (optsCls && [topVC isKindOfClass:optsCls] && ([topVC respondsToSelector:pubSel] || [topVC respondsToSelector:pubSelWithSender])) {
-ACLog(@"🎯 [原生发布] 已在选项页，直接最终发布");
-@try {
-if ([topVC respondsToSelector:pubSel]) ((void (*)(id, SEL))objc_msgSend)(topVC, pubSel);
-else ((void (*)(id, SEL, id))objc_msgSend)(topVC, pubSelWithSender, nil);
-} @catch (NSException *e) {}
-[self ac_finishMomentPublish:task ok:YES msg:@"✅ 动态自动发布成功" completion:completion];
+// 遮挡处理：顶层是插件助手面板时先收起，避免模态冲突导致 App 无法继续 present
+UIViewController *top = keyWin.rootViewController;
+while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
+if (top && [NSStringFromClass([top class]) containsString:@"ACForwardAssistantVC"]) {
+ACLog(@"[原生发布] 检测到助手面板遮挡，先收起面板再发布");
+[top dismissViewControllerAnimated:NO completion:^{
+[w ac_runMomentPublishFlow:task keyWin:keyWin completion:completion];
+}];
 return;
 }
-
-// 步骤 1：唤起编辑页（常驻飞行圈控制器优先，其次当前 Moment 页面）
-id momentVC = sMomentsMainVC;
-if (!momentVC && topVC && [NSStringFromClass([topVC class]) containsString:@"Moment"]) momentVC = topVC;
-if (!momentVC) {
-[self ac_finishMomentPublish:task ok:NO msg:@"💡 请先进一次飞行圈（锁定发布入口后即可全自动）" completion:completion];
-return;
-}
-@try {
-if ([momentVC respondsToSelector:pubSel]) {
-ACLog(@"[原生发布] 步骤1: publishButtonTapped 打开编辑页");
-((void (*)(id, SEL))objc_msgSend)(momentVC, pubSel);
-} else if ([momentVC respondsToSelector:pubSelWithSender]) {
-ACLog(@"[原生发布] 步骤1: publishButtonTapped: 打开编辑页");
-((void (*)(id, SEL, id))objc_msgSend)(momentVC, pubSelWithSender, nil);
-} else {
-[self ac_finishMomentPublish:task ok:NO msg:@"❌ 飞行圈控制器无 publishButtonTapped" completion:completion];
-return;
-}
-} @catch (NSException *e) {
-[self ac_finishMomentPublish:task ok:NO msg:[NSString stringWithFormat:@"❌ 唤起编辑页异常: %@", e.reason] completion:completion];
-return;
-}
-
-// 步骤 2：0.8 秒后注入文案 + 点击工具栏「下一步」（雷达实证 AirMomentPublishToolbarView/nextButtonTapped）
-__weak typeof(self) w = self;
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-UIWindow *win2 = [UIApplication sharedApplication].keyWindow ?: keyWin;
-UIViewController *top2 = win2.rootViewController;
-while (top2.presentedViewController && !top2.presentedViewController.isBeingDismissed) top2 = top2.presentedViewController;
-
-UITextView *inputView = ACFindTextViewDeep(top2.view) ?: ACFindTextViewDeep(win2);
-if (!inputView && retryLeft > 0) {
-ACLog(@"[原生发布] 编辑页未就绪，1.0 秒后重试");
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[w ac_publishViaNativeUI:task retryLeft:retryLeft - 1 completion:completion];
-});
-return;
-}
-if (inputView) {
-inputView.text = task.contentText;
-id del = inputView.delegate;
-if (del && [del respondsToSelector:@selector(textViewDidChange:)]) {
-((void (*)(id, SEL, id))objc_msgSend)(del, @selector(textViewDidChange:), inputView);
-}
-ACLog(@"[原生发布] 步骤2: 注入文案完成");
-}
-
-UIView *toolbar = ACFindViewByClassNameDeep(win2, @"AirMomentPublishToolbarView");
-BOOL nextClicked = NO;
-if (toolbar) {
-UIButton *nextBtn = ACFindButtonWithActionDeep(toolbar, @"next") ?: ACFirstButtonDeep(toolbar);
-if (nextBtn) {
-[nextBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
-nextClicked = YES;
-ACLog(@"🎯 [原生发布] 步骤3: 点击工具栏「下一步」按钮");
-}
-}
-if (!nextClicked) {
-SEL nextSel = NSSelectorFromString(@"nextButtonTapped");
-if (toolbar && [toolbar respondsToSelector:nextSel]) {
-((void (*)(id, SEL))objc_msgSend)(toolbar, nextSel);
-nextClicked = YES;
-ACLog(@"🎯 [原生发布] 步骤3: 调用工具栏 nextButtonTapped");
-}
-}
-if (!nextClicked && retryLeft > 0) {
-ACLog(@"[原生发布] 未找到「下一步」入口，1.0 秒后重试");
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[w ac_publishViaNativeUI:task retryLeft:retryLeft - 1 completion:completion];
-});
-return;
-}
-
-// 步骤 4：0.8 秒后进入选项页 → 最终发布（官方自产一次性 X-Lts-Id）
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-UIWindow *win3 = [UIApplication sharedApplication].keyWindow ?: keyWin;
-UIViewController *top3 = win3.rootViewController;
-while (top3.presentedViewController && !top3.presentedViewController.isBeingDismissed) top3 = top3.presentedViewController;
-if ([top3 respondsToSelector:pubSel] || [top3 respondsToSelector:pubSelWithSender]) {
-ACLog(@"🎯 [原生发布] 步骤4: 最终发布 publishButtonTapped");
-@try {
-if ([top3 respondsToSelector:pubSel]) ((void (*)(id, SEL))objc_msgSend)(top3, pubSel);
-else ((void (*)(id, SEL, id))objc_msgSend)(top3, pubSelWithSender, nil);
-} @catch (NSException *e) {
-ACLog(@"[原生发布] 最终发布异常 %@", e.reason);
-}
-[w ac_finishMomentPublish:task ok:YES msg:@"✅ 动态自动发布成功" completion:completion];
-} else if (retryLeft > 0) {
-ACLog(@"[原生发布] 选项页未就绪，1.0 秒后重试");
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[w ac_publishViaNativeUI:task retryLeft:retryLeft - 1 completion:completion];
-});
-} else {
-[w ac_finishMomentPublish:task ok:NO msg:@"⚠️ 发布未闭环（点击下一步后未进入选项页）" completion:completion];
-}
-});
+[w ac_runMomentPublishFlow:task keyWin:keyWin completion:completion];
 });
 }
 
-- (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
-ACLog(@"[发布] 入口 task=%@ textLen=%lu publishing=%d",
-task ? @"有" : @"无", (unsigned long)task.contentText.length, (int)self.momentPublishing);
-if (!task || task.contentText.length == 0) {
-self.lastMomentLog = @"❌ 动态内容为空，发布被跳过";
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, self.lastMomentLog);
-return;
-}
-// 自愈：上一次发布若未正常释放锁，60 秒后强制解锁
-if (self.momentPublishing && self.momentPublishingSince > 0 &&
-[[NSDate date] timeIntervalSince1970] - self.momentPublishingSince > 60.0) {
-ACLog(@"[发布] 上一次发布超过 60 秒未结束，强制解锁");
-self.momentPublishing = NO;
-}
-if (self.momentPublishing) {
-self.lastMomentLog = @"⏳ 上一条动态仍在发布中，请稍后再试";
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, self.lastMomentLog);
-return;
-}
-self.momentPublishing = YES;
-self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-dispatch_async(dispatch_get_main_queue(), ^{
-[self ac_publishViaNativeUI:task retryLeft:2 completion:completion];
-});
-}
+// （旧版 HTTP 直发入口已删除，由上方原生全自动引擎接管）
 
 #pragma mark - 2.1.3 新人进群迎新处理（严格使用槽位1：ACMediaSlotWelcome）
 - (void)handleNewMembersJoinedGroup:(NSString *)groupID memberList:(NSArray *)memberList {
