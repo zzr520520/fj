@@ -346,12 +346,45 @@ static __weak UIView *__lastLongPressedView = nil;
 static NSString *__pendingForwardText = nil;
 static NSString *__currentChatPeerId = nil;
 #pragma mark - 2. 核心管理器（四槽位媒体完全隔离 + 原生动态发布引擎）
+#pragma mark - 多账号数据模型
+@interface ACAccountItem : NSObject
+@property (nonatomic, copy) NSString *userId;
+@property (nonatomic, copy) NSString *token;
+@property (nonatomic, copy) NSString *remark;
+@property (nonatomic, copy) NSString *channel;
+@property (nonatomic, copy) NSString *saveTime;
+- (NSDictionary *)toDict;
++ (instancetype)fromDict:(NSDictionary *)dict;
+@end
+@implementation ACAccountItem
+- (NSDictionary *)toDict {
+return @{
+@"userId": self.userId ?: @"",
+@"token": self.token ?: @"",
+@"remark": self.remark ?: @"",
+@"channel": self.channel ?: @"",
+@"saveTime": self.saveTime ?: @""
+};
+}
++ (instancetype)fromDict:(NSDictionary *)d {
+if (!d || ![d isKindOfClass:[NSDictionary class]]) return nil;
+ACAccountItem *item = [[ACAccountItem alloc] init];
+item.userId = ACSafeStr(d[@"userId"]);
+item.token = ACSafeStr(d[@"token"]);
+item.remark = ACSafeStr(d[@"remark"]);
+item.channel = ACSafeStr(d[@"channel"]);
+item.saveTime = ACSafeStr(d[@"saveTime"]);
+return item;
+}
+@end
+
 @interface ACForwardHelperManager : NSObject
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *friendList;
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *groupMemberList;
 @property (nonatomic, strong) NSMutableArray<ACContactItem *> *groupList;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *friendMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMemberMap;
+@property (nonatomic, strong) NSMutableArray<ACAccountItem *> *accountList; // 多账号列表
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupBanStatusMap;
 @property (nonatomic, copy) NSString *selfUserId;
@@ -497,12 +530,70 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_applyKeepAliveState;
 @end
 @implementation ACForwardHelperManager
+
+#pragma mark - 多账号管理（保存/快速切换）
+- (NSString *)accountsCachePath {
+NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+return [doc stringByAppendingPathComponent:@"AC_SavedAccounts.plist"];
+}
+- (void)saveAllAccounts {
+@synchronized (self) {
+NSMutableArray *arr = [NSMutableArray array];
+for (ACAccountItem *acc in self.accountList) {
+if ([acc isKindOfClass:[ACAccountItem class]]) [arr addObject:[acc toDict]];
+}
+[arr writeToFile:[self accountsCachePath] atomically:YES];
+}
+}
+- (void)loadAllAccounts {
+@synchronized (self) {
+self.accountList = [NSMutableArray array];
+NSArray *arr = [NSArray arrayWithContentsOfFile:[self accountsCachePath]];
+if ([arr isKindOfClass:[NSArray class]]) {
+for (NSDictionary *d in arr) {
+ACAccountItem *acc = [ACAccountItem fromDict:d];
+if (acc && acc.token.length > 5) [self.accountList addObject:acc];
+}
+}
+}
+}
+- (void)switchToAccount:(ACAccountItem *)targetAccount completion:(void(^)(BOOL ok, NSString *msg))completion {
+if (!targetAccount || targetAccount.token.length == 0) {
+if (completion) completion(NO, @"账号凭证无效");
+return;
+}
+ACLog(@"[账号切换] 开始切换到 -> %@ (%@)", targetAccount.remark, targetAccount.userId);
+// 1. 全量替换内存中的核心鉴权凭证
+self.selfUserId = targetAccount.userId;
+self.latestHTTPHeaders[@"token"] = targetAccount.token;
+self.latestHTTPHeaders[@"Token"] = targetAccount.token;
+self.latestHTTPHeaders[@"x-userid"] = targetAccount.userId;
+if (targetAccount.channel.length > 0) {
+self.latestHTTPHeaders[@"channel"] = targetAccount.channel;
+}
+// 2. 清空旧账号的缓存数据，防止串号
+[self.friendList removeAllObjects];
+[self.friendMap removeAllObjects];
+[self.groupMemberList removeAllObjects];
+[self.groupMemberMap removeAllObjects];
+[self.groupList removeAllObjects];
+[self.groupMap removeAllObjects];
+// 3. 持久化 + 重挂 IM 监听 + 后台拉取新账号数据
+[self saveAllCustomSettings];
+[self setupIMGroupWelcomeListener];
+[self reloadAllDataWithProgress:nil completion:nil];
+NSString *tip = [NSString stringWithFormat:@"✅ 已切换到账号：【%@】", targetAccount.remark];
+ACLog(@"%@", tip);
+if (completion) completion(YES, tip);
+}
 + (instancetype)shared {
 static ACForwardHelperManager *instance = nil;
 static dispatch_once_t onceToken;
 dispatch_once(&onceToken, ^{
 instance = [[ACForwardHelperManager alloc] init];
 instance.friendList = [NSMutableArray array];
+instance.accountList = [NSMutableArray array];
+[instance loadAllAccounts];
 instance.groupMemberList = [NSMutableArray array];
 instance.groupList = [NSMutableArray array];
 instance.friendMap = [NSMutableDictionary dictionary];
@@ -1316,7 +1407,7 @@ self.isLikeSending = YES;
 [self ac_triggerAutoLikeForPost:pid];
 }
 // —— 常驻飞行圈句柄：后台刷新 + 全自动发布依赖（viewDidAppear 捕获） ——
-static __weak UIViewController *sMomentsMainVC = nil;
+static UIViewController *sMomentsMainVC = nil; // 强引用永久保活，杜绝弱引用被系统置 nil
 static __weak UIScrollView *sMomentsScrollView = nil;
 
 static UIScrollView *ACFirstScrollViewDeep(UIView *view) {
@@ -3322,7 +3413,7 @@ self.tabControl.frame = CGRectMake(12, 110, width - 24, 32);
 self.tabControl.selectedSegmentIndex = 1;
 [self.tabControl addTarget:self action:@selector(topTabChanged) forControlEvents:UIControlEventValueChanged];
 [self.headerContainer addSubview:self.tabControl];
-self.tabControlBottom = [[UISegmentedControl alloc] initWithItems:@[@"💬回复", @"📝动态", @"⚙️工具"]];
+self.tabControlBottom = [[UISegmentedControl alloc] initWithItems:@[@"💬回复", @"📝动态", @"⚙️工具", @"👥账号"]];
 self.tabControlBottom.frame = CGRectMake(12, 145, width - 24, 32);
 self.tabControlBottom.selectedSegmentIndex = UISegmentedControlNoSegment;
 [self.tabControlBottom addTarget:self action:@selector(bottomTabChanged) forControlEvents:UIControlEventValueChanged];
@@ -4042,6 +4133,10 @@ self.statusLabel.text = @"💡 输入动态文案点➕添加任务，点任务�
 self.contentTextView.text = @"⚙️ 自动点赞 / 批量语音打招呼 / 后台保活 / 群机器人伪装";
 self.statusLabel.textColor = [UIColor secondaryLabelColor];
 self.statusLabel.text = @"💡 自动点赞每 45 秒独立巡检一次；语音打招呼挂断秒数可点按调整";
+} else if (idx == 7) {
+self.contentTextView.text = @"👥 多账号管理：先「保存当前账号」，再一键秒切";
+self.statusLabel.textColor = [UIColor secondaryLabelColor];
+self.statusLabel.text = @"💡 点击列表账号即刻切换登录态（Token/UserID 全量替换）；左滑删除";
 } else {
 self.statusLabel.textColor = [UIColor secondaryLabelColor];
 self.statusLabel.text = @"💡 当前右上角为【群发专属图/视频】，仅用于勾选好友/群员群发";
@@ -4058,6 +4153,7 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 [self.tabControlBottom setTitle:[NSString stringWithFormat:@"💬回复(%@)", mgr.autoReplyEnabled ? @"开" : @"关"] forSegmentAtIndex:0];
 [self.tabControlBottom setTitle:[NSString stringWithFormat:@"📝动态(%@)", mgr.autoMomentEnabled ? @"开" : @"关"] forSegmentAtIndex:1];
 [self.tabControlBottom setTitle:[NSString stringWithFormat:@"⚙️工具(%@)", (mgr.autoLikeEnabled || mgr.keepAliveEnabled || mgr.robotModeEnabled) ? @"开" : @"关"] forSegmentAtIndex:2];
+[self.tabControlBottom setTitle:@"👥账号" forSegmentAtIndex:3];
 NSInteger selCount = 0;
 for (ACContactItem *i in mgr.friendList) if (i.isSelected) selCount++;
 for (ACContactItem *i in mgr.groupMemberList) if (i.isSelected) selCount++;
@@ -4071,6 +4167,7 @@ NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 4) return mgr.autoReplyRules.count;
 if (idx == 5) return mgr.momentTasks.count;
 if (idx == 6) return 6; // 自动点赞 / 语音打招呼 / 后台保活 / 机器人伪装 / 机器人名称 / 挂断秒数
+if (idx == 7) return mgr.accountList.count + 1; // 首行保存 + 账号列表
 return [self currentItems].count;
 }
 - (UITableViewCell * _Nonnull)tableView:(UITableView * _Nonnull)tableView cellForRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
@@ -4087,6 +4184,21 @@ cell.accessoryType = UITableViewCellAccessoryNone;
 cell.textLabel.textColor = [UIColor labelColor];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.ac_selectedTabIndex;
+if (idx == 7) {
+if (indexPath.row == 0) {
+cell.textLabel.text = @"💾 保存当前登录账号";
+cell.textLabel.textColor = [UIColor systemBlueColor];
+cell.detailTextLabel.text = [NSString stringWithFormat:@"当前UID: %@ | 点击保存并设置备注", mgr.selfUserId ?: @"未知"];
+cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+return cell;
+}
+ACAccountItem *acc = (indexPath.row - 1 < (NSInteger)mgr.accountList.count) ? mgr.accountList[indexPath.row - 1] : nil;
+if (!acc) return cell;
+BOOL isCurrent = [acc.userId isEqualToString:mgr.selfUserId];
+cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", isCurrent ? @"🟢 [当前]" : @"⚪", acc.remark ?: @"未命名账号"];
+cell.detailTextLabel.text = [NSString stringWithFormat:@"UID: %@ | 保存于: %@ | 左滑删除", acc.userId ?: @"?", acc.saveTime ?: @"未知"];
+return cell;
+}
 if (idx == 6) {
 if (indexPath.row == 0) {
 cell.textLabel.text = @"👍 自动点赞新动态";
@@ -4196,6 +4308,60 @@ preferredStyle:UIAlertControllerStyleAlert];
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.ac_selectedTabIndex;
+if (idx == 7) {
+if (indexPath.row == 0) {
+UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"💾 保存当前登录账号"
+message:@"请输入该账号的备注名称（如：大号-客服01）"
+preferredStyle:UIAlertControllerStyleAlert];
+NSString *defRemark = @"我的账号";
+NSString *uid = mgr.selfUserId ?: @"";
+if (uid.length > 4) defRemark = [NSString stringWithFormat:@"账号_%@", [uid substringFromIndex:uid.length - 4]];
+[alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+tf.placeholder = @"账号备注名";
+tf.text = defRemark;
+}];
+[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+[alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+NSString *remark = alert.textFields.firstObject.text;
+ACAccountItem *newItem = [[ACAccountItem alloc] init];
+newItem.userId = mgr.selfUserId;
+newItem.token = ACHeaderValue(mgr.latestHTTPHeaders, @"token");
+newItem.channel = ACHeaderValue(mgr.latestHTTPHeaders, @"channel");
+newItem.remark = remark.length > 0 ? remark : @"我的账号";
+NSDateFormatter *df = [[NSDateFormatter alloc] init];
+df.dateFormat = @"MM-dd HH:mm";
+newItem.saveTime = [df stringFromDate:[NSDate date]];
+// 同 UID 已存在则更新，避免重复堆积
+BOOL replaced = NO;
+for (NSUInteger i2 = 0; i2 < mgr.accountList.count; i2++) {
+ACAccountItem *old = mgr.accountList[i2];
+if ([old.userId isEqualToString:newItem.userId]) {
+[mgr.accountList replaceObjectAtIndex:i2 withObject:newItem];
+replaced = YES;
+break;
+}
+}
+if (!replaced) [mgr.accountList insertObject:newItem atIndex:0];
+[mgr saveAllAccounts];
+[self.tableView reloadData];
+self.statusLabel.textColor = [UIColor systemGreenColor];
+self.statusLabel.text = [NSString stringWithFormat:@"✅ 账号【%@】已保存！", newItem.remark];
+}]];
+[self presentViewController:alert animated:YES completion:nil];
+return;
+}
+NSUInteger arow = (NSUInteger)indexPath.row - 1;
+if (arow < mgr.accountList.count) {
+ACAccountItem *targetAcc = mgr.accountList[arow];
+[mgr switchToAccount:targetAcc completion:^(BOOL ok, NSString *msg) {
+self.statusLabel.textColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+self.statusLabel.text = msg;
+[self updateUI];
+[self.tableView reloadData];
+}];
+}
+return;
+}
 if (idx == 6) {
 if (indexPath.row == 1) {
 NSMutableArray<ACContactItem *> *targets = [NSMutableArray array];
@@ -4293,6 +4459,7 @@ item.isSelected = !item.isSelected;
 }
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
 NSInteger idx = self.ac_selectedTabIndex;
+if (idx == 7) return indexPath.row > 0; // 账号面板：首行不可删
 return (idx == 4 || idx == 5);
 }
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -4312,6 +4479,10 @@ if (rule.customThumbPath.length > 0) {
 } else if (self.ac_selectedTabIndex == 5 && indexPath.row < mgr.momentTasks.count) {
 [mgr.momentTasks removeObjectAtIndex:indexPath.row];
 [mgr saveAllCustomSettings];
+[tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
+} else if (self.ac_selectedTabIndex == 7 && indexPath.row >= 1 && (indexPath.row - 1) < (NSInteger)mgr.accountList.count) {
+[mgr.accountList removeObjectAtIndex:indexPath.row - 1];
+[mgr saveAllAccounts];
 [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
 }
 }
