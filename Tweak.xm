@@ -209,6 +209,88 @@ ACLog(@"  -> 属性: %@ = (KVC不可读)", name);
 if (props) free(props);
 } @catch (NSException *e) {}
 }
+#pragma mark - 语音条录制/播放辅助器（AVFoundation 原生，AAC 格式双端通用）
+@interface ACAudioHelper : NSObject <AVAudioRecorderDelegate, AVAudioPlayerDelegate>
+@property (nonatomic, strong) AVAudioRecorder *recorder;
+@property (nonatomic, strong) AVAudioPlayer *player;
+@property (nonatomic, copy) NSString *currentRecordingPath;
+@property (nonatomic, assign) NSTimeInterval recordStartTime;
++ (instancetype)shared;
+- (void)startRecordingToPath:(NSString *)destPath;
+- (int)stopRecording;
+- (void)playAudioAtPath:(NSString *)path completion:(void(^)(void))completion;
+- (void)stopPlaying;
+- (int)durationOfAudioAtPath:(NSString *)path;
+@end
+@implementation ACAudioHelper {
+void (^_playDoneBlock)(void);
+}
++ (instancetype)shared {
+static ACAudioHelper *inst = nil;
+static dispatch_once_t once;
+dispatch_once(&once, ^{ inst = [[ACAudioHelper alloc] init]; });
+return inst;
+}
+- (void)startRecordingToPath:(NSString *)destPath {
+[self stopPlaying];
+self.currentRecordingPath = destPath;
+@try {
+AVAudioSession *session = [AVAudioSession sharedInstance];
+[session setCategory:AVAudioSessionCategoryPlayAndRecord error:nil];
+[session setActive:YES error:nil];
+NSDictionary *settings = @{
+AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+AVSampleRateKey: @(16000.0),
+AVNumberOfChannelsKey: @(1),
+AVEncoderAudioQualityKey: @(AVAudioQualityMedium)
+};
+NSURL *url = [NSURL fileURLWithPath:destPath];
+[[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
+self.recorder = [[AVAudioRecorder alloc] initWithURL:url settings:settings error:nil];
+self.recorder.delegate = self;
+[self.recorder record];
+self.recordStartTime = [[NSDate date] timeIntervalSince1970];
+ACLog(@"[录音] 开始录制语音条 -> %@", destPath.lastPathComponent);
+} @catch (NSException *e) {
+ACLog(@"[录音] 启动失败 %@", e.reason);
+}
+}
+- (int)stopRecording {
+if (!self.recorder || !self.recorder.isRecording) return 0;
+NSTimeInterval dur = [[NSDate date] timeIntervalSince1970] - self.recordStartTime;
+@try { [self.recorder stop]; } @catch (NSException *e) {}
+self.recorder = nil;
+[AVAudioSession.sharedInstance setCategory:AVAudioSessionCategoryPlayback error:nil];
+int sec = (int)round(dur);
+return sec > 0 ? sec : 1;
+}
+- (void)playAudioAtPath:(NSString *)path completion:(void(^)(void))completion {
+[self stopPlaying];
+if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
+_playDoneBlock = [completion copy];
+@try {
+self.player = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:nil];
+self.player.delegate = self;
+[self.player play];
+} @catch (NSException *e) {}
+}
+- (void)stopPlaying {
+if (self.player && self.player.isPlaying) [self.player stop];
+self.player = nil;
+}
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
+if (_playDoneBlock) { void (^b)(void) = _playDoneBlock; _playDoneBlock = nil; b(); }
+}
+- (int)durationOfAudioAtPath:(NSString *)path {
+if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return 0;
+@try {
+AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+CMTime t = asset.duration;
+if (t.timescale > 0) return (int)round((double)t.value / (double)t.timescale);
+} @catch (NSException *e) {}
+return 0;
+}
+@end
 typedef NS_ENUM(NSInteger, ACMediaSlot) {
 ACMediaSlotBatchSend = 0, // 槽位0：群发专属媒体（好友/群员/群聊）
 ACMediaSlotWelcome   = 1, // 槽位1：🤖迎新专属媒体
@@ -5315,88 +5397,6 @@ if (quickForwardPill.superview) [quickForwardPill removeFromSuperview];
 ACPresentForwardAssistantFromTopVC();
 }
 %end
-#pragma mark - 语音条录制/播放辅助器（AVFoundation 原生，AAC 格式双端通用）
-@interface ACAudioHelper : NSObject <AVAudioRecorderDelegate, AVAudioPlayerDelegate>
-@property (nonatomic, strong) AVAudioRecorder *recorder;
-@property (nonatomic, strong) AVAudioPlayer *player;
-@property (nonatomic, copy) NSString *currentRecordingPath;
-@property (nonatomic, assign) NSTimeInterval recordStartTime;
-+ (instancetype)shared;
-- (void)startRecordingToPath:(NSString *)destPath;
-- (int)stopRecording;
-- (void)playAudioAtPath:(NSString *)path completion:(void(^)(void))completion;
-- (void)stopPlaying;
-- (int)durationOfAudioAtPath:(NSString *)path;
-@end
-@implementation ACAudioHelper {
-void (^_playDoneBlock)(void);
-}
-+ (instancetype)shared {
-static ACAudioHelper *inst = nil;
-static dispatch_once_t once;
-dispatch_once(&once, ^{ inst = [[ACAudioHelper alloc] init]; });
-return inst;
-}
-- (void)startRecordingToPath:(NSString *)destPath {
-[self stopPlaying];
-self.currentRecordingPath = destPath;
-@try {
-AVAudioSession *session = [AVAudioSession sharedInstance];
-[session setCategory:AVAudioSessionCategoryPlayAndRecord error:nil];
-[session setActive:YES error:nil];
-NSDictionary *settings = @{
-AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-AVSampleRateKey: @(16000.0),
-AVNumberOfChannelsKey: @(1),
-AVEncoderAudioQualityKey: @(AVAudioQualityMedium)
-};
-NSURL *url = [NSURL fileURLWithPath:destPath];
-[[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
-self.recorder = [[AVAudioRecorder alloc] initWithURL:url settings:settings error:nil];
-self.recorder.delegate = self;
-[self.recorder record];
-self.recordStartTime = [[NSDate date] timeIntervalSince1970];
-ACLog(@"[录音] 开始录制语音条 -> %@", destPath.lastPathComponent);
-} @catch (NSException *e) {
-ACLog(@"[录音] 启动失败 %@", e.reason);
-}
-}
-- (int)stopRecording {
-if (!self.recorder || !self.recorder.isRecording) return 0;
-NSTimeInterval dur = [[NSDate date] timeIntervalSince1970] - self.recordStartTime;
-@try { [self.recorder stop]; } @catch (NSException *e) {}
-self.recorder = nil;
-[AVAudioSession.sharedInstance setCategory:AVAudioSessionCategoryPlayback error:nil];
-int sec = (int)round(dur);
-return sec > 0 ? sec : 1;
-}
-- (void)playAudioAtPath:(NSString *)path completion:(void(^)(void))completion {
-[self stopPlaying];
-if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
-_playDoneBlock = [completion copy];
-@try {
-self.player = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:nil];
-self.player.delegate = self;
-[self.player play];
-} @catch (NSException *e) {}
-}
-- (void)stopPlaying {
-if (self.player && self.player.isPlaying) [self.player stop];
-self.player = nil;
-}
-- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
-if (_playDoneBlock) { void (^b)(void) = _playDoneBlock; _playDoneBlock = nil; b(); }
-}
-- (int)durationOfAudioAtPath:(NSString *)path {
-if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return 0;
-@try {
-AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-CMTime t = asset.duration;
-if (t.timescale > 0) return (int)round((double)t.value / (double)t.timescale);
-} @catch (NSException *e) {}
-return 0;
-}
-@end
 %hook UIViewController
 // 评论文案防封混淆后缀（破除服务端文本 MD5 查重，风控铁律③）
 static inline NSString *ACAntiBanSuffix(void) {
