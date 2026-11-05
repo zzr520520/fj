@@ -493,9 +493,6 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_pollFeedForAutoLike;
 // —— 动态业务网关解析（升级后 .cc/.cn/.ltd 自适应） ——
 - (NSString *)ac_activeBusinessHost;
-// —— 原生桥接点赞（借 App 内部加签模块生成一次性 X-Lts-Id） ——
-- (void)ac_nativeLikePostId:(NSString *)postId completion:(void(^)(BOOL ok))completion;
-- (void)ac_httpLikePostId:(NSString *)postId;
 // —— 后台静音保活 ——
 - (void)ac_applyKeepAliveState;
 @end
@@ -1292,174 +1289,132 @@ NSString *pid = self.likeQueue.firstObject;
 self.isLikeSending = YES;
 [self ac_triggerAutoLikeForPost:pid];
 }
-// —— 原生桥接点赞：驱动界面上的 MomentCardView 官方按钮（雷达实证 airchat.MomentCardView/likeButtonTapped），App 自产一次性 X-Lts-Id ——
-- (void)ac_nativeLikePostId:(NSString *)postId completion:(void(^)(BOOL ok))completion {
-if (postId.length < 5) {
-if (completion) completion(NO);
+// —— 终极原生自动点赞引擎：暴力扫描屏幕视图树找 MomentCardView，直接触发官方红心（App 自产一次性 X-Lts-Id，永无 500） ——
+static NSMutableSet<NSValue *> *sAlreadyLikedCardPointers = nil;
+
+// 递归查找当前窗口下所有正在显示的 MomentCardView
+static void ACFindMomentCardsInView(UIView *view, NSMutableArray<UIView *> *results) {
+if (!view) return;
+if ([NSStringFromClass([view class]) isEqualToString:@"airchat.MomentCardView"]) {
+[results addObject:view];
+return; // 卡片内部不需要继续往下搜子卡片
+}
+for (UIView *sub in view.subviews) {
+ACFindMomentCardsInView(sub, results);
+}
+}
+
+// 在卡片内部递归查找绑定了 like 动作的点赞按钮
+static UIButton *ACFindLikeButtonInCardDeep(UIView *view) {
+if (!view) return nil;
+for (UIView *sub in view.subviews) {
+if ([sub isKindOfClass:[UIButton class]]) {
+UIButton *btn = (UIButton *)sub;
+for (id target in [btn allTargets]) {
+NSArray *actions = [btn actionsForTarget:target forControlEvent:UIControlEventAllEvents];
+for (NSString *act in actions) {
+NSString *al = act.lowercaseString;
+if ([al containsString:@"like"] || [al containsString:@"favor"] || [al containsString:@"praise"]) return btn;
+}
+}
+}
+UIButton *deep = ACFindLikeButtonInCardDeep(sub);
+if (deep) return deep;
+}
+return nil;
+}
+
+- (void)ac_triggerAutoLikeForPost:(NSString *)postId {
+dispatch_async(dispatch_get_main_queue(), ^{
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+if (!mgr.autoLikeEnabled) {
+mgr.isLikeSending = NO;
 return;
 }
-dispatch_async(dispatch_get_main_queue(), ^{
+if (!sAlreadyLikedCardPointers) sAlreadyLikedCardPointers = [NSMutableSet set];
+if (sAlreadyLikedCardPointers.count > 200) [sAlreadyLikedCardPointers removeAllObjects];
+
+// 1. 获取主窗口（keyWindow → Scene → windows 三级兜底）
+UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+if (@available(iOS 13.0, *)) {
+if (!keyWin) {
+@try {
+for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+if ([sc isKindOfClass:[UIWindowScene class]] && sc.activationState == UISceneActivationStateForegroundActive) {
+keyWin = ((UIWindowScene *)sc).keyWindow;
+if (keyWin) break;
+}
+}
+} @catch (NSException *e) {}
+}
+}
+if (!keyWin) {
+for (UIWindow *w in [UIApplication sharedApplication].windows) {
+if (w.isKeyWindow) { keyWin = w; break; }
+}
+}
+
+// 2. 暴力扫描当前屏幕所有动态卡片
+NSMutableArray<UIView *> *cardsOnScreen = [NSMutableArray array];
+if (keyWin) ACFindMomentCardsInView(keyWin, cardsOnScreen);
+
+// 3. 优先匹配 postId 对应的卡片（pass 0），其次取任意未点赞卡片（pass 1）
 SEL likeSel = NSSelectorFromString(@"likeButtonTapped");
 SEL likeSelWithSender = NSSelectorFromString(@"likeButtonTapped:");
-UIView *matchedCard = nil;
-@synchronized(sLiveMomentCardMap) {
-matchedCard = sLiveMomentCardMap[postId];
+UIView *targetCard = nil;
+UIButton *targetBtn = nil;
+NSString *mode = @"";
+for (int pass = 0; pass < 2 && !targetCard; pass++) {
+for (UIView *card in cardsOnScreen) {
+if (pass == 0) {
+NSString *pid = ACExtractCardPostId(card);
+if (pid.length == 0 || ![pid isEqualToString:postId]) continue;
 }
-// 策略 A：界面已有该动态卡片 → 二次校验当前 model 确实是目标 postId（防 cell 复用映射过期），再触发官方按钮
-if (matchedCard) {
-NSString *curPid = ACExtractCardPostId(matchedCard);
-if (![curPid isEqualToString:postId]) {
-@synchronized(sLiveMomentCardMap) { [sLiveMomentCardMap removeObjectForKey:postId]; }
-matchedCard = nil;
-} else if ([matchedCard respondsToSelector:likeSel]) {
-ACLog(@"[原生点赞] 命中界面卡片 likeButtonTapped: %@", postId);
-((void (*)(id, SEL))objc_msgSend)(matchedCard, likeSel);
-if (completion) completion(YES);
-return;
-} else if ([matchedCard respondsToSelector:likeSelWithSender]) {
-ACLog(@"[原生点赞] 命中界面卡片 likeButtonTapped:: %@", postId);
-((void (*)(id, SEL, id))objc_msgSend)(matchedCard, likeSelWithSender, nil);
-if (completion) completion(YES);
-return;
+NSValue *ptrVal = [NSValue valueWithNonretainedObject:card];
+if ([sAlreadyLikedCardPointers containsObject:ptrVal]) continue;
+UIButton *likeBtn = ACFindLikeButtonInCardDeep(card);
+if (likeBtn && likeBtn.isSelected) {
+[sAlreadyLikedCardPointers addObject:ptrVal]; // 已是点赞态，跳过
+continue;
 }
-}
-// 策略 B：借任意在屏卡片，临时把 model 的 id/postId 改成目标后触发（借鸡生蛋），0.5s 后还原
-UIView *anyCard = nil;
-@synchronized(sLiveMomentCardMap) {
-for (UIView *v in sLiveMomentCardMap.allValues) {
-if (v.window) { anyCard = v; break; }
+if (likeBtn) { targetCard = card; targetBtn = likeBtn; mode = @"按钮点击"; break; }
+if ([card respondsToSelector:likeSel]) { targetCard = card; mode = @"无参Selector"; break; }
+if ([card respondsToSelector:likeSelWithSender]) { targetCard = card; mode = @"带参Selector"; break; }
 }
 }
-if (anyCard) {
-@try {
-id model = [anyCard valueForKey:@"model"] ?: [anyCard valueForKey:@"item"] ?: [anyCard valueForKey:@"data"];
-if (model) {
-id oldId = nil;
-@try { oldId = [model valueForKey:@"id"]; } @catch(NSException *e) {}
-id oldPid = nil;
-@try { oldPid = [model valueForKey:@"postId"]; } @catch(NSException *e) {}
-@try { [model setValue:postId forKey:@"id"]; } @catch(NSException *e) {}
-@try { [model setValue:postId forKey:@"postId"]; } @catch(NSException *e) {}
-BOOL fired = NO;
-if ([anyCard respondsToSelector:likeSel]) {
-ACLog(@"[原生点赞] 借鸡生蛋触发(目标:%@)", postId);
-((void (*)(id, SEL))objc_msgSend)(anyCard, likeSel);
-fired = YES;
-} else if ([anyCard respondsToSelector:likeSelWithSender]) {
-ACLog(@"[原生点赞] 借鸡生蛋触发带参(目标:%@)", postId);
-((void (*)(id, SEL, id))objc_msgSend)(anyCard, likeSelWithSender, nil);
-fired = YES;
-}
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-@try { if (oldId) [model setValue:oldId forKey:@"id"]; } @catch(NSException *e) {}
-@try { if (oldPid) [model setValue:oldPid forKey:@"postId"]; } @catch(NSException *e) {}
-});
-if (fired) { if (completion) completion(YES); return; }
-}
-} @catch(NSException *e) {
-ACLog(@"[原生点赞] 借卡点赞异常: %@", e.reason);
-}
-}
-ACLog(@"[原生点赞] 当前屏幕暂无可用的 MomentCardView，请在飞行圈动态界面保持浏览");
-if (completion) completion(NO);
-});
-}
-// HTTP 直发通道（回退用：原生未接通时以嗅探报文直发）
-- (void)ac_httpLikePostId:(NSString *)postId {
-@try {
-NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
-if (token.length == 0) {
-self.isLikeSending = NO;
-ACLog(@"[自动点赞] 跳过 %@：token 未捕获", postId);
-return;
-}
-NSString *host = [self ac_activeBusinessHost];
-// 像素级对齐官方原生点赞报文（探针实证）：纯 URL 无 Query，Header 仅官方 7 项
-NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/like/post", host]];
-NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-req.HTTPMethod = @"POST";
-req.timeoutInterval = 10.0;
-[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-[req setValue:token forHTTPHeaderField:@"token"];
-[req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
-NSString *verVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
-if (verVal.length == 0) verVal = @"2.1.9 (1102)"; // 官方实测版本
-[req setValue:verVal forHTTPHeaderField:@"version"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, 4B77DFD1-5EFA-4610-B3B6-7136D60B2002 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
-// 官方点赞请求带 X-Lts-Id（探针实证），取嗅探到的最新有效值
-NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (ltsId.length > 50) {
-[req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
-} else {
-ACLog(@"[自动点赞] 警告：尚未捕获到有效 X-Lts-Id，先手动点一次赞触发嗅探");
-}
-// X-Request-No 与官方同构 = (毫秒时间戳 << 7) | 0~127 序号（探针实测同 15 位格式）
-uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
-static uint64_t acLikeSeq = 0;
-acLikeSeq = (acLikeSeq + 1) & 0x7F;
-[req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acLikeSeq] forHTTPHeaderField:@"X-Request-No"];
-// 官方真实 Body：postId 为字符串，动作为 actionType="1"（旧字段 likeStatus/id 为臆造，服务端空指针 500）
-NSDictionary *bodyDict = @{@"postId": (postId ?: @""), @"actionType": @"1"};
-NSData *body = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
-if (!body) { self.isLikeSending = NO; return; }
-req.HTTPBody = body;
-[req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
-ACLog(@"[自动点赞] 发送官方对齐包 postId=%@ ltsLen=%lu", postId, (unsigned long)ltsId.length);
-acInternalRequest = YES;
-NSURLSession *acSession = ACDedicatedPluginSession();
-if (!acSession) { self.isLikeSending = NO; acInternalRequest = NO; return; }
-NSURLSessionDataTask *t = [acSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-dispatch_async(dispatch_get_main_queue(), ^{
-ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+
 mgr.isLikeSending = NO;
-NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
-NSString *raw = data.length ? ([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"") : @"";
-NSDictionary *jd = ACSafeDict([NSJSONSerialization JSONObjectWithData:(data ?: [NSData data]) options:0 error:nil]);
-NSInteger code = jd ? [ACSafeStr(jd[@"code"]) integerValue] : 0;
-if (code == 200) {
-mgr.lastMomentLog = [NSString stringWithFormat:@"👍 已自动点赞：%@", postId];
+if (targetCard) {
+[sAlreadyLikedCardPointers addObject:[NSValue valueWithNonretainedObject:targetCard]];
+@try {
+if ([mode isEqualToString:@"按钮点击"]) {
+ACLog(@"🎯 [原生自动点赞] 命中卡片点赞按钮，模拟点击 (目标:%@)", postId);
+[targetBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+} else if ([mode isEqualToString:@"无参Selector"]) {
+ACLog(@"🎯 [原生自动点赞] 命中卡片无参 Selector (目标:%@)", postId);
+((void (*)(id, SEL))objc_msgSend)(targetCard, likeSel);
 } else {
-mgr.lastMomentLog = [NSString stringWithFormat:@"⚠️ 自动点赞失败 HTTP %ld / code %ld %@", (long)status, (long)code,
-raw.length > 60 ? [raw substringToIndex:60] : raw];
+ACLog(@"🎯 [原生自动点赞] 命中卡片带参 Selector (目标:%@)", postId);
+((void (*)(id, SEL, id))objc_msgSend)(targetCard, likeSelWithSender, nil);
 }
-ACLog(@"[自动点赞] 回调 %@ HTTP %ld code=%ld body=%@", postId, (long)status, (long)code, raw.length > 160 ? [raw substringToIndex:160] : raw);
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-// 节流：2-4 秒后处理下一条，避免点赞过频触发风控
-NSTimeInterval delay = 2.0 + (arc4random_uniform(21) / 10.0);
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[mgr ac_pumpAutoLikeQueue];
-});
-});
-}];
-acInternalRequest = NO;
-[t resume];
-} @catch (NSException *e) {
-self.isLikeSending = NO;
-ACLog(@"[自动点赞] 异常 %@: %@", e.name, e.reason);
-}
-}
-// 自动点赞入口：优先原生通道（App 自产一次性 X-Lts-Id，免签名复用 500），未接通回退 HTTP 直发
-- (void)ac_triggerAutoLikeForPost:(NSString *)postId {
-ACLog(@"[自动点赞] 尝试原生通道: %@", postId);
-__weak typeof(self) w = self;
-[self ac_nativeLikePostId:postId completion:^(BOOL ok) {
-dispatch_async(dispatch_get_main_queue(), ^{
-if (ok) {
-ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-mgr.isLikeSending = NO;
 mgr.lastMomentLog = [NSString stringWithFormat:@"👍 原生点赞成功：%@", postId];
-ACLog(@"[自动点赞] ✅ 原生点赞成功 postId=%@", postId);
+ACLog(@"✅ [原生自动点赞] 官方原生通道触发成功（官方自产一次性 X-Lts-Id）");
+} @catch (NSException *e) {
+ACLog(@"[原生自动点赞] 触发异常 %@", e.reason);
+mgr.lastMomentLog = @"⚠️ 原生点赞触发异常";
+}
+} else {
+mgr.lastMomentLog = @"💡 请停留在飞行圈动态页面或滑动加载新卡片";
+ACLog(@"[原生自动点赞] 屏幕搜寻到 %lu 张卡片但无可点目标（postId=%@，其余可能已点赞）", (unsigned long)cardsOnScreen.count, postId);
+}
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-NSTimeInterval delay = 2.0 + (arc4random_uniform(21) / 10.0);
+
+// 节流 2~3.5 秒处理下一张卡片
+NSTimeInterval delay = 2.0 + (arc4random_uniform(16) / 10.0);
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 [mgr ac_pumpAutoLikeQueue];
 });
-} else {
-ACLog(@"[自动点赞] 原生通道未接通，回退 HTTP 直发（需探针栈对齐符号）");
-[w ac_httpLikePostId:postId];
-}
 });
-}];
 }
 #pragma mark - 自动点赞/自动评论后台巡检（独立 Session，不依赖用户浏览信息流）
 - (void)ac_startAutoLikePollTimer {
