@@ -53,15 +53,21 @@ return ([k isEqualToString:@"全部"] || [k isEqualToString:@"任意"] || [k isE
 [k isEqualToString:@"*"] || [k isEqualToString:@"＊"] ||
 [lower isEqualToString:@"any"] || [lower isEqualToString:@"all"]);
 }
-// 只有 airchat 业务网关才允许用于发布/群列表请求；COS、CDN 等域名一律拒绝，
-// 否则 POST 会被重定向到对象存储并返回 HTTP 405 MethodNotAllowed
+// 严格限定只有 apiv1/api 业务网关才允许用于发布/点赞/评论请求；
+// static/file/res 等静态资源、CDN、COS 存储桶域名一律拒绝，否则 POST 会打进对象存储返回 405 XML
 static inline BOOL ACIsBusinessHost(NSString *host) {
     NSString *h = ACSafeStr(host).lowercaseString;
     if (h.length == 0) return NO;
-    if ([h containsString:@"myqcloud.com"] || [h containsString:@"cos."] ||
-        [h hasPrefix:@"cos"] || [h containsString:@"tencentcloud"] ||
-        [h containsString:@"cloudfront"] || [h containsString:@"aliyuncs"]) return NO;
-    return [h containsString:@"airchat"];
+    // 1. 过滤所有常见对象存储、CDN、静态资源域名
+    if ([h containsString:@"myqcloud"] || [h containsString:@"cos."] || [h hasPrefix:@"cos"] ||
+        [h containsString:@"tencentcloud"] || [h containsString:@"cloudfront"] || [h containsString:@"aliyuncs"] ||
+        [h containsString:@"static"] || [h containsString:@"image"] || [h containsString:@"file"] ||
+        [h containsString:@"media"] || [h containsString:@"res"] || [h containsString:@"download"]) return NO;
+    // 2. 必须包含 airchat，且必须是 api/apiv1 主机，排除 cdn.airchat.cc 之类纯静态域名
+    if ([h containsString:@"airchat"]) {
+        return ([h containsString:@"apiv1"] || [h hasPrefix:@"api"]);
+    }
+    return NO;
 }
 // 兼容新老信息流接口的响应结构：data.records / records / data.list / data.rows
 static inline NSArray *ACFeedRecordsFromJSON(NSDictionary *json) {
@@ -1109,9 +1115,12 @@ self.autoCommentSending = NO;
 ACLog(@"[自动评论] 跳过 %@：token 未捕获", postId);
 return;
 }
-NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/comment/publish", [self ac_activeBusinessHost]]];
+NSString *host = [self ac_activeBusinessHost];
+NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/comment/publish", host]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
+req.timeoutInterval = 10.0;
+[req setValue:host forHTTPHeaderField:@"Host"];
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
 [req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
@@ -1233,9 +1242,12 @@ self.isLikeSending = NO;
 ACLog(@"[自动点赞] 跳过 %@：token 未捕获", postId);
 return;
 }
-NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/like/post", [self ac_activeBusinessHost]]];
+NSString *host = [self ac_activeBusinessHost];
+NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/like/post", host]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
+req.timeoutInterval = 10.0;
+[req setValue:host forHTTPHeaderField:@"Host"];
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
 [req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
@@ -1314,9 +1326,11 @@ NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
 if (token.length == 0) return;
 self.autoLikePolling = YES;
 // 旧接口 /airchat/c/post/pageIds 升级后已废弃，切换为存活的动态分页接口（响应结构与 data.records 兼容）
+NSString *host = [self ac_activeBusinessHost];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
-[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/page?current=1&size=20", [self ac_activeBusinessHost]]]];
+[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/page?current=1&size=20", host]]];
 req.HTTPMethod = @"GET";
+[req setValue:host forHTTPHeaderField:@"Host"];
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
 [self ac_applyCapturedHeadersToRequest:req];
@@ -1699,6 +1713,7 @@ NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
 req.timeoutInterval = 15.0;
+[req setValue:acPubHost forHTTPHeaderField:@"Host"];
 // Host 由 URLSession 按 URL 自动生成，这里绝不手动塞入 COS/上传请求的 Host，避免被网关误判为对象存储写入
 // 修复：Accept 必须是 *／*（通配符；注意注释里不要写半角星号+斜杠+星号，否则会被 Logos 当成块注释吞掉后续代码）；UA 必须固定为 App 原生 UA。
 // 旧版从全局 Header 池取值，会被 COS 上传请求污染成 cos-xml-ios-sdk + Accept "/"，
@@ -2574,10 +2589,15 @@ if ([lk isEqualToString:@"content-length"] || [lk isEqualToString:@"host"] ||
 [lk isEqualToString:@"user-agent"]) return;
 [req setValue:v forHTTPHeaderField:k];
 }];
+// 强制使用当前 URL 的 host 作为 Host 头，杜绝被污染的 Host 头把 POST 分流到对象存储返回 405
+if (req.URL.host) [req setValue:req.URL.host forHTTPHeaderField:@"Host"];
 }
-// 动态解析当前可用的业务网关：优先用嗅探到的存活域名；升级后 .cc 可能被废弃，回落 .cn 主力网关
+// 动态解析当前可用的业务网关：嗅探域名需通过严格白名单；.cc 部分节点已被切给静态存储，强制走 .cn
 - (NSString *)ac_activeBusinessHost {
-if (ACIsBusinessHost(self.lastAirchatHost)) return self.lastAirchatHost;
+if (ACIsBusinessHost(self.lastAirchatHost)) {
+if ([self.lastAirchatHost containsString:@"airchat.cc"]) return @"apiv1.airchat.cn";
+return self.lastAirchatHost;
+}
 return @"apiv1.airchat.cn";
 }
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
@@ -4132,7 +4152,7 @@ nav.modalPresentationStyle = UIModalPresentationPageSheet;
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
 NSString *urlStr = request.URL.absoluteString;
-// 自动捕获 apiv1.airchat.cc 请求中的全部真实 Header（用于动态发布鉴权）
+// 自动捕获 airchat 业务网关（api/apiv1 域名）请求中的全部真实 Header（用于动态发布鉴权）
 BOOL acIsAirChatHost = ([urlStr containsString:@"airchat.cc"] || [urlStr containsString:@"airchat.cn"] || [urlStr containsString:@"airchat.ltd"]);
 if (!acInternalRequest && acIsAirChatHost && request.allHTTPHeaderFields) {
 NSDictionary *headers = request.allHTTPHeaderFields;
