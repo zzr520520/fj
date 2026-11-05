@@ -1289,6 +1289,120 @@ NSString *pid = self.likeQueue.firstObject;
 self.isLikeSending = YES;
 [self ac_triggerAutoLikeForPost:pid];
 }
+// —— 常驻飞行圈句柄：后台刷新 + 全自动发布依赖（viewDidAppear 捕获） ——
+static __weak UIViewController *sMomentsMainVC = nil;
+static __weak UIScrollView *sMomentsScrollView = nil;
+
+static UIScrollView *ACFirstScrollViewDeep(UIView *view) {
+if (!view) return nil;
+for (UIView *sub in view.subviews) {
+if ([sub isKindOfClass:[UIScrollView class]]) return (UIScrollView *)sub;
+UIScrollView *deep = ACFirstScrollViewDeep(sub);
+if (deep) return deep;
+}
+return nil;
+}
+
+static UIView *ACFindViewByClassNameDeep(UIView *view, NSString *namePart) {
+if (!view) return nil;
+for (UIView *sub in view.subviews) {
+if ([NSStringFromClass([sub class]) containsString:namePart]) return sub;
+UIView *deep = ACFindViewByClassNameDeep(sub, namePart);
+if (deep) return deep;
+}
+return nil;
+}
+
+static UIButton *ACFirstButtonDeep(UIView *view) {
+if (!view) return nil;
+for (UIView *sub in view.subviews) {
+if ([sub isKindOfClass:[UIButton class]]) return (UIButton *)sub;
+UIButton *deep = ACFirstButtonDeep(sub);
+if (deep) return deep;
+}
+return nil;
+}
+
+static UIButton *ACFindButtonWithActionDeep(UIView *view, NSString *actionPart) {
+if (!view) return nil;
+for (UIView *sub in view.subviews) {
+if ([sub isKindOfClass:[UIButton class]]) {
+UIButton *btn = (UIButton *)sub;
+for (id target in [btn allTargets]) {
+NSArray *actions = [btn actionsForTarget:target forControlEvent:UIControlEventAllEvents];
+for (NSString *act in actions) {
+if ([act.lowercaseString containsString:actionPart.lowercaseString]) return btn;
+}
+}
+}
+UIButton *deep = ACFindButtonWithActionDeep(sub, actionPart);
+if (deep) return deep;
+}
+return nil;
+}
+
+// 后台静默下拉刷新飞行圈（UIRefreshControl / MJRefresh / 控制器刷新方法 三级降级）
+static void ACTriggerMomentsBackgroundRefresh(void) {
+dispatch_async(dispatch_get_main_queue(), ^{
+if (!sMomentsMainVC) {
+UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+if (@available(iOS 13.0, *)) {
+if (!keyWin) {
+@try {
+for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+if ([sc isKindOfClass:[UIWindowScene class]] && sc.activationState == UISceneActivationStateForegroundActive) {
+keyWin = ((UIWindowScene *)sc).keyWindow;
+if (keyWin) break;
+}
+}
+} @catch (NSException *e) {}
+}
+}
+UIViewController *root = keyWin.rootViewController;
+if ([root isKindOfClass:[UITabBarController class]]) {
+UITabBarController *tab = (UITabBarController *)root;
+for (UIViewController *child in tab.viewControllers) {
+if ([NSStringFromClass([child class]) containsString:@"Moment"]) {
+sMomentsMainVC = child;
+break;
+}
+}
+}
+}
+UIViewController *mVC = sMomentsMainVC;
+if (!mVC) return;
+@try { [mVC loadViewIfNeeded]; } @catch (NSException *e) { return; }
+if (!sMomentsScrollView) sMomentsScrollView = ACFirstScrollViewDeep(mVC.viewIfLoaded);
+ACLog(@"🔄 [后台刷新] 自动静默刷新飞行圈列表...");
+if (sMomentsScrollView) {
+if (sMomentsScrollView.refreshControl) {
+[sMomentsScrollView.refreshControl beginRefreshing];
+[sMomentsScrollView.refreshControl sendActionsForControlEvents:UIControlEventValueChanged];
+return;
+}
+SEL mjSel = NSSelectorFromString(@"mj_header");
+if ([sMomentsScrollView respondsToSelector:mjSel]) {
+@try {
+id header = ((id (*)(id, SEL))objc_msgSend)(sMomentsScrollView, mjSel);
+SEL beginSel = NSSelectorFromString(@"beginRefreshing");
+if (header && [header respondsToSelector:beginSel]) {
+((void (*)(id, SEL))objc_msgSend)(header, beginSel);
+return;
+}
+} @catch (NSException *e) {}
+}
+}
+NSArray *refreshSelNames = @[@"headerRefresh", @"refreshData", @"loadData", @"pullDownRefresh"];
+for (NSString *selName in refreshSelNames) {
+SEL sel = NSSelectorFromString(selName);
+if ([mVC respondsToSelector:sel]) {
+((void (*)(id, SEL))objc_msgSend)(mVC, sel);
+break;
+}
+}
+});
+}
+
 // —— 终极原生自动点赞引擎：暴力扫描屏幕视图树找 MomentCardView，直接触发官方红心（App 自产一次性 X-Lts-Id，永无 500） ——
 static NSMutableSet<NSValue *> *sAlreadyLikedCardPointers = nil;
 
@@ -1354,9 +1468,11 @@ if (w.isKeyWindow) { keyWin = w; break; }
 }
 }
 
-// 2. 暴力扫描当前屏幕所有动态卡片
+// 2. 暴力扫描当前屏幕所有动态卡片（离开飞行圈时，常驻控制器的视图树里也有卡片）
 NSMutableArray<UIView *> *cardsOnScreen = [NSMutableArray array];
 if (keyWin) ACFindMomentCardsInView(keyWin, cardsOnScreen);
+UIViewController *mVC = sMomentsMainVC;
+if (mVC && mVC.viewIfLoaded) ACFindMomentCardsInView(mVC.viewIfLoaded, cardsOnScreen);
 
 // 3. 优先匹配 postId 对应的卡片（pass 0），其次取任意未点赞卡片（pass 1）
 SEL likeSel = NSSelectorFromString(@"likeButtonTapped");
@@ -1420,9 +1536,17 @@ dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC))
 - (void)ac_startAutoLikePollTimer {
 dispatch_async(dispatch_get_main_queue(), ^{
 if (self.autoLikePollTimer) [self.autoLikePollTimer invalidate];
-self.autoLikePollTimer = [NSTimer scheduledTimerWithTimeInterval:45.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+self.autoLikePollTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (mgr.autoLikeEnabled || mgr.autoCommentEnabled) [mgr ac_pollFeedForAutoLike];
+if (mgr.autoLikeEnabled) {
+// 后台静默刷新飞行圈（解决离开页面后屏幕 0 卡片漏赞），1.5 秒后全屏扫描秒赞
+ACTriggerMomentsBackgroundRefresh();
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+ACForwardHelperManager *m2 = [ACForwardHelperManager shared];
+if (m2.autoLikeEnabled && !m2.isLikeSending) [m2 ac_triggerAutoLikeForPost:@"auto_scan"];
+});
+}
 }];
 [[NSRunLoop mainRunLoop] addTimer:self.autoLikePollTimer forMode:NSRunLoopCommonModes];
 });
@@ -1786,8 +1910,7 @@ if (completion) completion(ok, msg);
 }
 
 - (void)ac_publishViaNativeUI:(ACMomentTaskItem *)task retryLeft:(NSInteger)retryLeft completion:(void(^)(BOOL ok, NSString *msg))completion {
-ACLog(@"[原生发布] 尝试原生通道 retry=%ld", (long)retryLeft);
-// 1. 顶层 VC（keyWindow → Scene → windows 三级兜底）
+ACLog(@"[原生发布] 启动全自动链路 retry=%ld", (long)retryLeft);
 UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
 if (@available(iOS 13.0, *)) {
 if (!keyWin) {
@@ -1810,102 +1933,118 @@ UIViewController *topVC = keyWin.rootViewController;
 while (topVC.presentedViewController && !topVC.presentedViewController.isBeingDismissed) {
 topVC = topVC.presentedViewController;
 }
-
-Class pubOptsCls = NSClassFromString(@"airchat.AirMomentPublishOptionsViewController") ?: NSClassFromString(@"AirMomentPublishOptionsViewController");
-Class pubVCCls = NSClassFromString(@"airchat.AirMomentPublishViewController") ?: pubOptsCls;
-Class momentsCls = NSClassFromString(@"airchat.AirMomentsViewController") ?: NSClassFromString(@"AirMomentsViewController");
 SEL pubSel = NSSelectorFromString(@"publishButtonTapped");
 SEL pubSelWithSender = NSSelectorFromString(@"publishButtonTapped:");
 
-// A. 当前已在原生发布页：注入文案 → 触发发布
-id pubVC = nil;
-if (pubOptsCls && [topVC isKindOfClass:pubOptsCls]) pubVC = topVC;
-if (!pubVC && pubVCCls && pubVCCls != pubOptsCls && [topVC isKindOfClass:pubVCCls]) pubVC = topVC;
-if (pubVC) {
-@try {
-UITextView *tv = nil;
-@try { tv = [pubVC valueForKey:@"textView"]; } @catch(NSException *e) {}
-if (!tv) { @try { tv = [pubVC valueForKey:@"contentTextView"]; } @catch(NSException *e) {} }
-if (!tv) { @try { tv = [pubVC valueForKey:@"editorTextView"]; } @catch(NSException *e) {} }
-if (!tv) tv = ACFindTextViewDeep(((UIViewController *)pubVC).view) ?: ACFindTextViewDeep(keyWin);
-if (!tv && retryLeft > 0) {
-ACLog(@"[原生发布] 发布页已打开但编辑框未就绪，1.2 秒后重试");
-__weak typeof(self) w = self;
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[w ac_publishViaNativeUI:task retryLeft:retryLeft - 1 completion:completion];
-});
-return;
-}
-if (tv) {
-tv.text = task.contentText;
-// 触发 delegate 同步（Swift VM 可能监听 textViewDidChange）
-id del = tv.delegate;
-if (del && [del respondsToSelector:@selector(textViewDidChange:)]) {
-((void (*)(id, SEL, id))objc_msgSend)(del, @selector(textViewDidChange:), tv);
-}
-ACLog(@"[原生发布] 文案已注入原生编辑框");
-}
-if ([pubVC respondsToSelector:pubSel]) {
-ACLog(@"🎯 [原生发布] 触发发布页 publishButtonTapped");
-((void (*)(id, SEL))objc_msgSend)(pubVC, pubSel);
-[self ac_finishMomentPublish:task ok:YES msg:@"✅ 原生动态发布已提交" completion:completion];
-return;
-} else if ([pubVC respondsToSelector:pubSelWithSender]) {
-ACLog(@"🎯 [原生发布] 触发发布页 publishButtonTapped:");
-((void (*)(id, SEL, id))objc_msgSend)(pubVC, pubSelWithSender, nil);
-[self ac_finishMomentPublish:task ok:YES msg:@"✅ 原生动态发布已提交" completion:completion];
-return;
-}
-} @catch (NSException *e) {
-ACLog(@"[原生发布] 发布页注入异常 %@", e.reason);
-}
-}
-
-// B. 在飞行圈主页：触发主界面发动态按钮唤起发布页，稍后回来注入发布
-BOOL onMoments = (momentsCls && [topVC isKindOfClass:momentsCls]) || [NSStringFromClass([topVC class]) containsString:@"Moment"];
-if (onMoments && ([topVC respondsToSelector:pubSel] || [topVC respondsToSelector:pubSelWithSender])) {
-ACLog(@"🎯 [原生发布] 触发主界面发动态按钮，唤起原生发布页");
+// 步骤 0：已在最终选项页 → 直接发布
+Class optsCls = NSClassFromString(@"airchat.AirMomentPublishOptionsViewController") ?: NSClassFromString(@"AirMomentPublishOptionsViewController");
+if (optsCls && [topVC isKindOfClass:optsCls] && ([topVC respondsToSelector:pubSel] || [topVC respondsToSelector:pubSelWithSender])) {
+ACLog(@"🎯 [原生发布] 已在选项页，直接最终发布");
 @try {
 if ([topVC respondsToSelector:pubSel]) ((void (*)(id, SEL))objc_msgSend)(topVC, pubSel);
 else ((void (*)(id, SEL, id))objc_msgSend)(topVC, pubSelWithSender, nil);
-} @catch (NSException *e) {
-ACLog(@"[原生发布] 唤起异常 %@", e.reason);
+} @catch (NSException *e) {}
+[self ac_finishMomentPublish:task ok:YES msg:@"✅ 动态自动发布成功" completion:completion];
+return;
 }
-if (retryLeft > 0) {
+
+// 步骤 1：唤起编辑页（常驻飞行圈控制器优先，其次当前 Moment 页面）
+id momentVC = sMomentsMainVC;
+if (!momentVC && topVC && [NSStringFromClass([topVC class]) containsString:@"Moment"]) momentVC = topVC;
+if (!momentVC) {
+[self ac_finishMomentPublish:task ok:NO msg:@"💡 请先进一次飞行圈（锁定发布入口后即可全自动）" completion:completion];
+return;
+}
+@try {
+if ([momentVC respondsToSelector:pubSel]) {
+ACLog(@"[原生发布] 步骤1: publishButtonTapped 打开编辑页");
+((void (*)(id, SEL))objc_msgSend)(momentVC, pubSel);
+} else if ([momentVC respondsToSelector:pubSelWithSender]) {
+ACLog(@"[原生发布] 步骤1: publishButtonTapped: 打开编辑页");
+((void (*)(id, SEL, id))objc_msgSend)(momentVC, pubSelWithSender, nil);
+} else {
+[self ac_finishMomentPublish:task ok:NO msg:@"❌ 飞行圈控制器无 publishButtonTapped" completion:completion];
+return;
+}
+} @catch (NSException *e) {
+[self ac_finishMomentPublish:task ok:NO msg:[NSString stringWithFormat:@"❌ 唤起编辑页异常: %@", e.reason] completion:completion];
+return;
+}
+
+// 步骤 2：0.8 秒后注入文案 + 点击工具栏「下一步」（雷达实证 AirMomentPublishToolbarView/nextButtonTapped）
 __weak typeof(self) w = self;
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+UIWindow *win2 = [UIApplication sharedApplication].keyWindow ?: keyWin;
+UIViewController *top2 = win2.rootViewController;
+while (top2.presentedViewController && !top2.presentedViewController.isBeingDismissed) top2 = top2.presentedViewController;
+
+UITextView *inputView = ACFindTextViewDeep(top2.view) ?: ACFindTextViewDeep(win2);
+if (!inputView && retryLeft > 0) {
+ACLog(@"[原生发布] 编辑页未就绪，1.0 秒后重试");
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 [w ac_publishViaNativeUI:task retryLeft:retryLeft - 1 completion:completion];
 });
 return;
 }
-[self ac_finishMomentPublish:task ok:YES msg:@"✅ 已唤起原生发布页（下次调度自动注入发布）" completion:completion];
+if (inputView) {
+inputView.text = task.contentText;
+id del = inputView.delegate;
+if (del && [del respondsToSelector:@selector(textViewDidChange:)]) {
+((void (*)(id, SEL, id))objc_msgSend)(del, @selector(textViewDidChange:), inputView);
+}
+ACLog(@"[原生发布] 步骤2: 注入文案完成");
+}
+
+UIView *toolbar = ACFindViewByClassNameDeep(win2, @"AirMomentPublishToolbarView");
+BOOL nextClicked = NO;
+if (toolbar) {
+UIButton *nextBtn = ACFindButtonWithActionDeep(toolbar, @"next") ?: ACFirstButtonDeep(toolbar);
+if (nextBtn) {
+[nextBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+nextClicked = YES;
+ACLog(@"🎯 [原生发布] 步骤3: 点击工具栏「下一步」按钮");
+}
+}
+if (!nextClicked) {
+SEL nextSel = NSSelectorFromString(@"nextButtonTapped");
+if (toolbar && [toolbar respondsToSelector:nextSel]) {
+((void (*)(id, SEL))objc_msgSend)(toolbar, nextSel);
+nextClicked = YES;
+ACLog(@"🎯 [原生发布] 步骤3: 调用工具栏 nextButtonTapped");
+}
+}
+if (!nextClicked && retryLeft > 0) {
+ACLog(@"[原生发布] 未找到「下一步」入口，1.0 秒后重试");
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[w ac_publishViaNativeUI:task retryLeft:retryLeft - 1 completion:completion];
+});
 return;
 }
 
-// C. 静默构建发布控制器（不依赖当前页面）
-if (pubVCCls) {
+// 步骤 4：0.8 秒后进入选项页 → 最终发布（官方自产一次性 X-Lts-Id）
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+UIWindow *win3 = [UIApplication sharedApplication].keyWindow ?: keyWin;
+UIViewController *top3 = win3.rootViewController;
+while (top3.presentedViewController && !top3.presentedViewController.isBeingDismissed) top3 = top3.presentedViewController;
+if ([top3 respondsToSelector:pubSel] || [top3 respondsToSelector:pubSelWithSender]) {
+ACLog(@"🎯 [原生发布] 步骤4: 最终发布 publishButtonTapped");
 @try {
-id vc = [[pubVCCls alloc] init];
-if (vc) {
-@try { (void)((UIViewController *)vc).view; } @catch(NSException *e) {}
-UITextView *tv = nil;
-@try { tv = [vc valueForKey:@"textView"]; } @catch(NSException *e) {}
-if (!tv) { @try { tv = [vc valueForKey:@"contentTextView"]; } @catch(NSException *e) {} }
-if (!tv) tv = ACFindTextViewDeep(((UIViewController *)vc).view);
-if (tv) tv.text = task.contentText;
-if ([vc respondsToSelector:pubSel]) {
-ACLog(@"🎯 [原生发布] 静默构建发布控制器并触发");
-((void (*)(id, SEL))objc_msgSend)(vc, pubSel);
-[self ac_finishMomentPublish:task ok:YES msg:@"✅ 原生动态发布已提交(静默)" completion:completion];
-return;
-}
-}
+if ([top3 respondsToSelector:pubSel]) ((void (*)(id, SEL))objc_msgSend)(top3, pubSel);
+else ((void (*)(id, SEL, id))objc_msgSend)(top3, pubSelWithSender, nil);
 } @catch (NSException *e) {
-ACLog(@"[原生发布] 静默构建异常 %@", e.reason);
+ACLog(@"[原生发布] 最终发布异常 %@", e.reason);
 }
+[w ac_finishMomentPublish:task ok:YES msg:@"✅ 动态自动发布成功" completion:completion];
+} else if (retryLeft > 0) {
+ACLog(@"[原生发布] 选项页未就绪，1.0 秒后重试");
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[w ac_publishViaNativeUI:task retryLeft:retryLeft - 1 completion:completion];
+});
+} else {
+[w ac_finishMomentPublish:task ok:NO msg:@"⚠️ 发布未闭环（点击下一步后未进入选项页）" completion:completion];
 }
-
-[self ac_finishMomentPublish:task ok:NO msg:@"💡 未找到原生发布入口，请先进入飞行圈动态界面" completion:completion];
+});
+});
 }
 
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
@@ -4665,6 +4804,26 @@ if (pid.length >= 6) {
 @synchronized(sLiveMomentCardMap) {
 if (sLiveMomentCardMap.count > 80) [sLiveMomentCardMap removeAllObjects]; // 防膨胀
 sLiveMomentCardMap[pid] = self;
+}
+}
+} @catch (NSException *e) {}
+}
+%end
+
+// —— 常驻飞行圈句柄捕获（后台静默刷新 / 全自动发动态依赖） ——
+%hook UIViewController
+- (void)viewDidAppear:(BOOL)animated {
+%orig;
+@try {
+NSString *clsName = NSStringFromClass([self class]);
+if ([clsName containsString:@"AirMomentsViewController"] || [clsName containsString:@"MomentsContentViewController"]) {
+BOOL already = (sMomentsMainVC == self);
+sMomentsMainVC = self;
+sMomentsScrollView = nil;
+if (!already) {
+ACLog(@"🎯 [后台引擎] 捕获并锁定飞行圈主控制器: %@", clsName);
+UIScrollView *sv = ACFirstScrollViewDeep(self.view);
+if (sv) sMomentsScrollView = sv;
 }
 }
 } @catch (NSException *e) {}
