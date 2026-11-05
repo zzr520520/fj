@@ -1905,7 +1905,6 @@ UIButton *btn = (UIButton *)sub;
 NSString *t = [btn titleForState:UIControlStateNormal] ?: [btn titleForState:UIControlStateSelected] ?: @"";
 if ([t containsString:titlePart]) return btn;
 }
-}
 UIButton *deep = ACFindButtonWithTitleDeep(sub, titlePart);
 if (deep) return deep;
 }
