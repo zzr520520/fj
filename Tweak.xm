@@ -181,6 +181,34 @@ ACLog(@"[探针核心调用栈]:\n%@", [(NSArray *)[acSyms subarrayWithRange:NSM
 ACLog(@"==================================");
 } @catch (NSException *e) {}
 }
+// —— 原生点赞弹药库：postId → 屏上 MomentCardView 映射 ——
+static NSMutableDictionary<NSString *, UIView *> *sLiveMomentCardMap = nil;
+static inline NSString *ACExtractCardPostId(UIView *card) {
+@try {
+id model = [card valueForKey:@"model"] ?: [card valueForKey:@"item"] ?: [card valueForKey:@"data"];
+if (!model) return @"";
+NSString *pid = ACSafeStr([model valueForKey:@"id"]);
+if (pid.length == 0) pid = ACSafeStr([model valueForKey:@"postId"]);
+return pid ?: @"";
+} @catch (NSException *e) { return @""; }
+}
+static void ACDumpCardProperties(id card) {
+@try {
+unsigned int count = 0;
+objc_property_t *props = class_copyPropertyList([card class], &count);
+for (unsigned int i = 0; i < count; i++) {
+const char *pName = property_getName(props[i]);
+NSString *name = [NSString stringWithUTF8String:pName];
+@try {
+id val = [card valueForKey:name];
+ACLog(@"  -> 属性: %@ = %@", name, val);
+} @catch (NSException *e) {
+ACLog(@"  -> 属性: %@ = (KVC不可读)", name);
+}
+}
+if (props) free(props);
+} @catch (NSException *e) {}
+}
 typedef NS_ENUM(NSInteger, ACMediaSlot) {
 ACMediaSlotBatchSend = 0, // 槽位0：群发专属媒体（好友/群员/群聊）
 ACMediaSlotWelcome   = 1, // 槽位1：🤖迎新专属媒体
@@ -1264,62 +1292,77 @@ NSString *pid = self.likeQueue.firstObject;
 self.isLikeSending = YES;
 [self ac_triggerAutoLikeForPost:pid];
 }
-// —— 原生桥接点赞：反射调用 App 内部业务类，让 App 自己生成合法一次性 X-Lts-Id ——
+// —— 原生桥接点赞：驱动界面上的 MomentCardView 官方按钮（雷达实证 airchat.MomentCardView/likeButtonTapped），App 自产一次性 X-Lts-Id ——
 - (void)ac_nativeLikePostId:(NSString *)postId completion:(void(^)(BOOL ok))completion {
-@try {
-__block BOOL done = NO;
-void (^finish)(BOOL) = ^(BOOL ok2) { if (!done) { done = YES; if (completion) completion(ok2); } };
-// 20s 看门狗：App 内部方法若不回调，防止点赞队列卡死
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ finish(NO); });
-
-Class centerCls = NSClassFromString(@"airchat.AirMomentBusinessCenter");
-if (!centerCls) centerCls = NSClassFromString(@"AirMomentBusinessCenter");
-if (!centerCls) centerCls = NSClassFromString(@"AirMomentBussinessCenter");
-if (!centerCls) centerCls = NSClassFromString(@"AirMomentViewModel");
-if (!centerCls) {
-ACLog(@"[原生点赞] 未找到业务类（等待探针调用栈对齐符号）");
-finish(NO);
-return;
-}
-SEL defaultCenterSel = NSSelectorFromString(@"defaultCenter");
-if (![centerCls respondsToSelector:defaultCenterSel]) defaultCenterSel = NSSelectorFromString(@"shared");
-if (![centerCls respondsToSelector:defaultCenterSel]) defaultCenterSel = NSSelectorFromString(@"sharedInstance");
-id centerObj = nil;
-if ([centerCls respondsToSelector:defaultCenterSel]) {
-centerObj = ((id (*)(id, SEL))objc_msgSend)(centerCls, defaultCenterSel);
-}
-SEL likeSel1 = NSSelectorFromString(@"likePostWithPostId:actionType:completion:");
-SEL likeSel2 = NSSelectorFromString(@"requestLikePost:actionType:completion:");
-SEL likeSel3 = NSSelectorFromString(@"likePost:completion:");
-SEL likeSel4 = NSSelectorFromString(@"likePostWithId:completion:");
-id target = centerObj ?: centerCls;
-if (!target) { finish(NO); return; }
-if ([target respondsToSelector:likeSel1]) {
-ACLog(@"[原生点赞] 命中 likePostWithPostId:actionType:completion:");
-((void (*)(id, SEL, id, id, id))objc_msgSend)(target, likeSel1, postId, @"1", ^(BOOL success, id resp){ finish(success); });
-return;
-}
-if ([target respondsToSelector:likeSel2]) {
-ACLog(@"[原生点赞] 命中 requestLikePost:actionType:completion:");
-((void (*)(id, SEL, id, id, id))objc_msgSend)(target, likeSel2, postId, @"1", ^(BOOL success, id resp){ finish(success); });
-return;
-}
-if ([target respondsToSelector:likeSel3]) {
-ACLog(@"[原生点赞] 命中 likePost:completion:");
-((void (*)(id, SEL, id, id))objc_msgSend)(target, likeSel3, postId, ^(BOOL success, id resp){ finish(success); });
-return;
-}
-if ([target respondsToSelector:likeSel4]) {
-ACLog(@"[原生点赞] 命中 likePostWithId:completion:");
-((void (*)(id, SEL, id, id))objc_msgSend)(target, likeSel4, postId, ^(BOOL success, id resp){ finish(success); });
-return;
-}
-ACLog(@"[原生点赞] 类存在但未匹配到已知选择子（%@），等待探针栈", NSStringFromClass(centerCls));
-finish(NO);
-} @catch (NSException *e) {
-ACLog(@"[原生点赞] 异常: %@", e.reason);
+if (postId.length < 5) {
 if (completion) completion(NO);
+return;
 }
+dispatch_async(dispatch_get_main_queue(), ^{
+SEL likeSel = NSSelectorFromString(@"likeButtonTapped");
+SEL likeSelWithSender = NSSelectorFromString(@"likeButtonTapped:");
+UIView *matchedCard = nil;
+@synchronized(sLiveMomentCardMap) {
+matchedCard = sLiveMomentCardMap[postId];
+}
+// 策略 A：界面已有该动态卡片 → 二次校验当前 model 确实是目标 postId（防 cell 复用映射过期），再触发官方按钮
+if (matchedCard) {
+NSString *curPid = ACExtractCardPostId(matchedCard);
+if (![curPid isEqualToString:postId]) {
+@synchronized(sLiveMomentCardMap) { [sLiveMomentCardMap removeObjectForKey:postId]; }
+matchedCard = nil;
+} else if ([matchedCard respondsToSelector:likeSel]) {
+ACLog(@"[原生点赞] 命中界面卡片 likeButtonTapped: %@", postId);
+((void (*)(id, SEL))objc_msgSend)(matchedCard, likeSel);
+if (completion) completion(YES);
+return;
+} else if ([matchedCard respondsToSelector:likeSelWithSender]) {
+ACLog(@"[原生点赞] 命中界面卡片 likeButtonTapped:: %@", postId);
+((void (*)(id, SEL, id))objc_msgSend)(matchedCard, likeSelWithSender, nil);
+if (completion) completion(YES);
+return;
+}
+}
+// 策略 B：借任意在屏卡片，临时把 model 的 id/postId 改成目标后触发（借鸡生蛋），0.5s 后还原
+UIView *anyCard = nil;
+@synchronized(sLiveMomentCardMap) {
+for (UIView *v in sLiveMomentCardMap.allValues) {
+if (v.window) { anyCard = v; break; }
+}
+}
+if (anyCard) {
+@try {
+id model = [anyCard valueForKey:@"model"] ?: [anyCard valueForKey:@"item"] ?: [anyCard valueForKey:@"data"];
+if (model) {
+id oldId = nil;
+@try { oldId = [model valueForKey:@"id"]; } @catch(NSException *e) {}
+id oldPid = nil;
+@try { oldPid = [model valueForKey:@"postId"]; } @catch(NSException *e) {}
+@try { [model setValue:postId forKey:@"id"]; } @catch(NSException *e) {}
+@try { [model setValue:postId forKey:@"postId"]; } @catch(NSException *e) {}
+BOOL fired = NO;
+if ([anyCard respondsToSelector:likeSel]) {
+ACLog(@"[原生点赞] 借鸡生蛋触发(目标:%@)", postId);
+((void (*)(id, SEL))objc_msgSend)(anyCard, likeSel);
+fired = YES;
+} else if ([anyCard respondsToSelector:likeSelWithSender]) {
+ACLog(@"[原生点赞] 借鸡生蛋触发带参(目标:%@)", postId);
+((void (*)(id, SEL, id))objc_msgSend)(anyCard, likeSelWithSender, nil);
+fired = YES;
+}
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+@try { if (oldId) [model setValue:oldId forKey:@"id"]; } @catch(NSException *e) {}
+@try { if (oldPid) [model setValue:oldPid forKey:@"postId"]; } @catch(NSException *e) {}
+});
+if (fired) { if (completion) completion(YES); return; }
+}
+} @catch(NSException *e) {
+ACLog(@"[原生点赞] 借卡点赞异常: %@", e.reason);
+}
+}
+ACLog(@"[原生点赞] 当前屏幕暂无可用的 MomentCardView，请在飞行圈动态界面保持浏览");
+if (completion) completion(NO);
+});
 }
 // HTTP 直发通道（回退用：原生未接通时以嗅探报文直发）
 - (void)ac_httpLikePostId:(NSString *)postId {
@@ -4696,6 +4739,28 @@ if (store && *store) return; // 已安装，避免重复包裹
 IMP oldImp = method_setImplementation(m, newImp);
 if (store) *store = oldImp;
 }
+// —— 弹药库搜集：MomentCardView 上屏时建立 postId → 卡片映射（原生点赞的燃料） ——
+%hook UIView
+- (void)didMoveToSuperview {
+%orig;
+@try {
+NSString *clsName = NSStringFromClass([self class]);
+if (![clsName isEqualToString:@"airchat.MomentCardView"]) return;
+static dispatch_once_t onceToken;
+dispatch_once(&onceToken, ^{
+sLiveMomentCardMap = [NSMutableDictionary dictionary];
+});
+NSString *pid = ACExtractCardPostId(self);
+if (pid.length >= 6) {
+@synchronized(sLiveMomentCardMap) {
+if (sLiveMomentCardMap.count > 80) [sLiveMomentCardMap removeAllObjects]; // 防膨胀
+sLiveMomentCardMap[pid] = self;
+}
+}
+} @catch (NSException *e) {}
+}
+%end
+
 // —— 精准雷达1：UI 点击探针（抓点赞按钮绑定的真实 Target/Action，Swift 类也会走 target-action） ——
 %hook UIApplication
 - (BOOL)sendAction:(SEL)action to:(id)target from:(id)sender forEvent:(UIEvent *)event {
@@ -4773,6 +4838,45 @@ ACLog(@"[雷达] 扫描异常 %@", e.reason);
 }
 }
 
+// —— MomentCardView 点赞核心窥探：触发时 Dump 卡片全部属性，找内部真正发请求的模型/字段 ——
+static void ACHookMomentCardLike(void) {
+@try {
+static dispatch_once_t acCardHookOnce;
+dispatch_once(&acCardHookOnce, ^{
+Class cardCls = NSClassFromString(@"airchat.MomentCardView");
+if (!cardCls) { ACLog(@"[Hook] MomentCardView 类未加载"); return; }
+SEL sel = NSSelectorFromString(@"likeButtonTapped");
+Method m = class_getInstanceMethod(cardCls, sel);
+unsigned int nargs = 2;
+if (!m) {
+sel = NSSelectorFromString(@"likeButtonTapped:");
+m = class_getInstanceMethod(cardCls, sel);
+nargs = 3;
+}
+if (!m) { ACLog(@"[Hook] 未找到 MomentCardView likeButtonTapped"); return; }
+IMP origImp = method_getImplementation(m);
+if (nargs == 2) {
+IMP newImp = imp_implementationWithBlock(^id(id self2, SEL cmd) {
+ACLog(@"🔥 [MomentCardView likeButtonTapped 被调用]");
+ACDumpCardProperties(self2);
+return ((id (*)(id, SEL))origImp)(self2, cmd);
+});
+method_setImplementation(m, newImp);
+} else {
+IMP newImp = imp_implementationWithBlock(^id(id self2, SEL cmd, id sender) {
+ACLog(@"🔥 [MomentCardView likeButtonTapped: 被调用]");
+ACDumpCardProperties(self2);
+return ((id (*)(id, SEL, id))origImp)(self2, cmd, sender);
+});
+method_setImplementation(m, newImp);
+}
+ACLog(@"[Hook] 成功挂载 MomentCardView 点赞探针！");
+});
+} @catch (NSException *e) {
+ACLog(@"[Hook] 挂载异常 %@", e.reason);
+}
+}
+
 static void ACInstallTIMHooks(void) {
 Class c = NSClassFromString(@"V2TIMManager");
 if (!c) return;
@@ -4792,5 +4896,12 @@ dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
 // 延迟 2 秒后雷达扫描，等待 Swift 运行时完全加载
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 ACDumpMomentClassesAndMethods();
+});
+// 延迟挂载 MomentCardView 点赞窥探探针（1.5s 首次，5s 兜底重试）
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+ACHookMomentCardLike();
+});
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+ACHookMomentCardLike();
 });
 }
