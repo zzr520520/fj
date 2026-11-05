@@ -346,11 +346,13 @@ static __weak UIView *__lastLongPressedView = nil;
 static NSString *__pendingForwardText = nil;
 static NSString *__currentChatPeerId = nil;
 #pragma mark - 2. 核心管理器（四槽位媒体完全隔离 + 原生动态发布引擎）
-#pragma mark - 多账号数据模型
+#pragma mark - 多账号数据模型（账号+密码+备注，支持缓存凭证秒切）
 @interface ACAccountItem : NSObject
+@property (nonatomic, copy) NSString *account;   // 账号/手机号
+@property (nonatomic, copy) NSString *password;  // 密码
+@property (nonatomic, copy) NSString *remark;    // 备注名
 @property (nonatomic, copy) NSString *userId;
 @property (nonatomic, copy) NSString *token;
-@property (nonatomic, copy) NSString *remark;
 @property (nonatomic, copy) NSString *channel;
 @property (nonatomic, copy) NSString *saveTime;
 - (NSDictionary *)toDict;
@@ -359,9 +361,11 @@ static NSString *__currentChatPeerId = nil;
 @implementation ACAccountItem
 - (NSDictionary *)toDict {
 return @{
+@"account": self.account ?: @"",
+@"password": self.password ?: @"",
+@"remark": self.remark ?: @"",
 @"userId": self.userId ?: @"",
 @"token": self.token ?: @"",
-@"remark": self.remark ?: @"",
 @"channel": self.channel ?: @"",
 @"saveTime": self.saveTime ?: @""
 };
@@ -369,9 +373,11 @@ return @{
 + (instancetype)fromDict:(NSDictionary *)d {
 if (!d || ![d isKindOfClass:[NSDictionary class]]) return nil;
 ACAccountItem *item = [[ACAccountItem alloc] init];
+item.account = ACSafeStr(d[@"account"]);
+item.password = ACSafeStr(d[@"password"]);
+item.remark = ACSafeStr(d[@"remark"]);
 item.userId = ACSafeStr(d[@"userId"]);
 item.token = ACSafeStr(d[@"token"]);
-item.remark = ACSafeStr(d[@"remark"]);
 item.channel = ACSafeStr(d[@"channel"]);
 item.saveTime = ACSafeStr(d[@"saveTime"]);
 return item;
@@ -585,6 +591,75 @@ self.latestHTTPHeaders[@"channel"] = targetAccount.channel;
 NSString *tip = [NSString stringWithFormat:@"✅ 已切换到账号：【%@】", targetAccount.remark];
 ACLog(@"%@", tip);
 if (completion) completion(YES, tip);
+}
+// 账号密码登录切换（有缓存凭证优先热切秒进，否则走官方登录接口免验证码直登）
+- (void)loginWithAccount:(ACAccountItem *)item completion:(void(^)(BOOL ok, NSString *msg))completion {
+if (!item || item.account.length == 0 || item.password.length == 0) {
+if (completion) completion(NO, @"账号或密码为空");
+return;
+}
+ACLog(@"[账号切换] 使用账号密码登录: %@ (备注:%@)", item.account, item.remark);
+void (^applyAndFinish)(NSString *msg) = ^(NSString *msg) {
+// 全量替换内存鉴权凭证 + 清空旧账号缓存 + 重挂监听 + 拉取新数据
+self.selfUserId = item.userId;
+self.latestHTTPHeaders[@"token"] = item.token;
+self.latestHTTPHeaders[@"Token"] = item.token;
+self.latestHTTPHeaders[@"x-userid"] = item.userId;
+if (item.channel.length > 0) self.latestHTTPHeaders[@"channel"] = item.channel;
+[self.friendList removeAllObjects];
+[self.friendMap removeAllObjects];
+[self.groupMemberList removeAllObjects];
+[self.groupMemberMap removeAllObjects];
+[self.groupList removeAllObjects];
+[self.groupMap removeAllObjects];
+[self saveAllCustomSettings];
+[self setupIMGroupWelcomeListener];
+[self reloadAllDataWithProgress:nil completion:nil];
+ACLog(@"%@", msg);
+if (completion) completion(YES, msg);
+};
+// 1. 已缓存有效凭证 → 热切换秒进
+if (item.token.length > 10 && item.userId.length > 3) {
+applyAndFinish([NSString stringWithFormat:@"✅ 已切换至:【%@】", item.remark]);
+return;
+}
+// 2. 官方账号密码登录接口直登
+NSString *loginUrl = @"https://apiv1.airchat.cn/client/biz/user/login";
+NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:loginUrl]];
+req.HTTPMethod = @"POST";
+req.timeoutInterval = 12.0;
+[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
+NSDictionary *body = @{@"account": item.account, @"password": item.password, @"clientType": @"iOS"};
+req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+acInternalRequest = YES;
+NSURLSession *session = ACDedicatedPluginSession();
+if (!session) { acInternalRequest = NO; if (completion) completion(NO, @"会话创建失败"); return; }
+NSURLSessionDataTask *t = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+dispatch_async(dispatch_get_main_queue(), ^{
+acInternalRequest = NO;
+if (error || data.length == 0) {
+if (completion) completion(NO, @"网络错误，登录失败");
+return;
+}
+NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
+if (code == 200) {
+NSDictionary *d = ACSafeDict(json[@"data"]) ?: json;
+item.token = ACSafeStr(d[@"token"]);
+item.userId = ACSafeStr(d[@"userId"]);
+if (item.userId.length == 0) item.userId = ACSafeStr(d[@"id"]);
+if (item.userId.length == 0) item.userId = ACSafeStr(d[@"uid"]);
+[self saveAllAccounts];
+applyAndFinish([NSString stringWithFormat:@"✅ 账号【%@】登录切换成功！", item.remark]);
+} else {
+NSString *msg = ACSafeStr(json[@"msg"]);
+if (msg.length == 0) msg = @"账号或密码错误";
+if (completion) completion(NO, [NSString stringWithFormat:@"登录失败: %@", msg]);
+}
+});
+}];
+[t resume];
 }
 + (instancetype)shared {
 static ACForwardHelperManager *instance = nil;
@@ -1258,6 +1333,7 @@ NSString *text = self.autoCommentText.length > 0 ? self.autoCommentText : @"不�
 // 前置声明：评论引擎位于点赞引擎之前，深搜助手定义在后
 static void ACFindMomentCardsInView(UIView *view, NSMutableArray<UIView *> *results);
 static UIButton *ACFindButtonWithActionDeep(UIView *view, NSString *actionPart);
+static UIButton *ACFindButtonWithTargetClassDeep(UIView *view, NSString *classPart);
 static UITextView *ACFindTextViewDeep(UIView *view);
 static UIButton *ACFindButtonWithTitleDeep(UIView *view, NSString *titlePart);
 
@@ -2068,6 +2144,21 @@ if (deep) return deep;
 }
 return nil;
 }
+// 按 target 类名深搜按钮（如选项页 AirMomentPublishOptionsViewController 的发布按钮）
+static UIButton *ACFindButtonWithTargetClassDeep(UIView *view, NSString *classPart) {
+if (!view) return nil;
+for (UIView *sub in view.subviews) {
+if ([sub isKindOfClass:[UIButton class]]) {
+UIButton *btn = (UIButton *)sub;
+for (id target in [btn allTargets]) {
+if ([NSStringFromClass([target class]) containsString:classPart]) return btn;
+}
+}
+UIButton *deep = ACFindButtonWithTargetClassDeep(sub, classPart);
+if (deep) return deep;
+}
+return nil;
+}
 
 - (void)ac_runMomentPublishFlow:(ACMomentTaskItem *)task keyWin:(UIWindow *)keyWin completion:(void(^)(BOOL ok, NSString *msg))completion {
 UIWindow *win = keyWin ?: [UIApplication sharedApplication].keyWindow;
@@ -2122,6 +2213,13 @@ UIWindow *win2 = [UIApplication sharedApplication].keyWindow ?: win;
 UIViewController *top2 = win2.rootViewController;
 while (top2.presentedViewController && !top2.presentedViewController.isBeingDismissed) top2 = top2.presentedViewController;
 UITextView *inputTV = ACFindTextViewDeep(top2.view) ?: ACFindTextViewDeep(win2);
+// 键盘/输入副工具栏在独立 Window（UITextEffectsWindow）里，编辑框与按钮必须全 Window 扫描
+if (!inputTV) {
+for (UIWindow *w3 in [UIApplication sharedApplication].windows) {
+inputTV = ACFindTextViewDeep(w3);
+if (inputTV) break;
+}
+}
 if (inputTV) {
 inputTV.text = task.contentText;
 id del = inputTV.delegate;
@@ -2138,8 +2236,26 @@ UIView *toolbar = ACFindViewByClassNameDeep(win2, @"AirMomentPublishToolbarView"
 ?: ACFindViewByClassNameDeep(win2, @"ToolbarView")
 ?: ACFindViewByClassNameDeep(win2, @"AirMomentPublish");
 if (toolbar) nextBtn = ACFindButtonWithActionDeep(toolbar, @"next");
+// 关键修复：下一步按钮挂在键盘 inputAccessoryView 上，必须穿透所有 Window（含键盘 Window）搜寻
+if (!nextBtn) {
+for (UIWindow *w3 in [UIApplication sharedApplication].windows) {
+UIView *tb3 = ACFindViewByClassNameDeep(w3, @"AirMomentPublishToolbarView")
+?: ACFindViewByClassNameDeep(w3, @"ToolbarView")
+?: ACFindViewByClassNameDeep(w3, @"AirMomentPublish");
+if (tb3) {
+nextBtn = ACFindButtonWithActionDeep(tb3, @"next");
+if (nextBtn) { toolbar = tb3; break; }
+}
+}
+}
+if (!nextBtn) {
+for (UIWindow *w3 in [UIApplication sharedApplication].windows) {
+nextBtn = ACFindButtonWithActionDeep(w3, @"next");
+if (nextBtn) break;
+}
+}
 if (nextBtn) {
-ACLog(@"🎯 [原生发布] 步骤3: 成功点击工具栏「下一步 (nextButtonTapped)」！");
+ACLog(@"🎯 [原生发布] 步骤3: 成功点击「下一步 (nextButtonTapped)」（含键盘层搜索）！");
 [nextBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
 } else {
 SEL nextSelArg = NSSelectorFromString(@"nextButtonTapped:");
@@ -2175,12 +2291,21 @@ ACLog(@"🎯 [原生发布] 步骤4: 成功点击最终发布(带参)！");
 ACLog(@"🎯 [原生发布] 步骤4: 成功点击最终发布(无参)！");
 ((void (*)(id, SEL))objc_msgSend)(finalVC, finalSelNoArg);
 } else {
-UIButton *pubBtn = ACFindButtonWithActionDeep(finalVC.view, @"publish")
-?: ACFindButtonWithTitleDeep(finalVC.view, @"发")
+UIButton *pubBtn = ACFindButtonWithActionDeep(finalVC.view, @"publish");
+if (!pubBtn) {
+// 全 Window 搜终发按钮：优先选项页控制器绑定的按钮，其次任意 publish 动作
+for (UIWindow *w4 in [UIApplication sharedApplication].windows) {
+pubBtn = ACFindButtonWithTargetClassDeep(w4, @"OptionsViewController");
+if (pubBtn) break;
+pubBtn = ACFindButtonWithActionDeep(w4, @"publish");
+if (pubBtn) break;
+}
+}
+if (!pubBtn) pubBtn = ACFindButtonWithTitleDeep(finalVC.view, @"发")
 ?: ACFindButtonWithTitleDeep(finalVC.view, @"布");
 if (pubBtn) {
 [pubBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
-ACLog(@"🎯 [原生发布] 步骤4: 命中发布按钮触发！");
+ACLog(@"🎯 [原生发布] 步骤4: 命中发布按钮触发（含键盘层全窗搜索）！");
 } else {
 ACLog(@"[原生发布] 步骤4: 未找到最终发布入口（fire&forget 结束）");
 }
@@ -4186,9 +4311,9 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 7) {
 if (indexPath.row == 0) {
-cell.textLabel.text = @"💾 保存当前登录账号";
+cell.textLabel.text = @"➕ 添加切换账号（账号+密码）";
 cell.textLabel.textColor = [UIColor systemBlueColor];
-cell.detailTextLabel.text = [NSString stringWithFormat:@"当前UID: %@ | 点击保存并设置备注", mgr.selfUserId ?: @"未知"];
+cell.detailTextLabel.text = @"输入账号/手机号 + 密码 + 备注，保存后一键免验证码切换";
 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 return cell;
 }
@@ -4196,7 +4321,8 @@ ACAccountItem *acc = (indexPath.row - 1 < (NSInteger)mgr.accountList.count) ? mg
 if (!acc) return cell;
 BOOL isCurrent = [acc.userId isEqualToString:mgr.selfUserId];
 cell.textLabel.text = [NSString stringWithFormat:@"%@ %@", isCurrent ? @"🟢 [当前]" : @"⚪", acc.remark ?: @"未命名账号"];
-cell.detailTextLabel.text = [NSString stringWithFormat:@"UID: %@ | 保存于: %@ | 左滑删除", acc.userId ?: @"?", acc.saveTime ?: @"未知"];
+cell.detailTextLabel.text = [NSString stringWithFormat:@"账号: %@ | %@ | 左滑删除",
+acc.account ?: @"?", acc.token.length > 0 ? @"已缓存凭证(点击秒切)" : @"需密码登录"];
 return cell;
 }
 if (idx == 6) {
@@ -4310,32 +4436,42 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 7) {
 if (indexPath.row == 0) {
-UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"💾 保存当前登录账号"
-message:@"请输入该账号的备注名称（如：大号-客服01）"
+UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"➕ 添加切换账号"
+message:@"输入账号密码保存，后续点击即可免验证码快速切换"
 preferredStyle:UIAlertControllerStyleAlert];
-NSString *defRemark = @"我的账号";
-NSString *uid = mgr.selfUserId ?: @"";
-if (uid.length > 4) defRemark = [NSString stringWithFormat:@"账号_%@", [uid substringFromIndex:uid.length - 4]];
 [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-tf.placeholder = @"账号备注名";
-tf.text = defRemark;
+tf.placeholder = @"备注名称（如：大号-客服01）";
+}];
+[alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+tf.placeholder = @"账号 / 手机号";
+tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+}];
+[alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+tf.placeholder = @"登录密码";
+tf.secureTextEntry = YES;
 }];
 [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-[alert addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-NSString *remark = alert.textFields.firstObject.text;
+[alert addAction:[UIAlertAction actionWithTitle:@"保存并登录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+NSString *remark = alert.textFields[0].text;
+NSString *account = [alert.textFields[1].text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+NSString *pwd = alert.textFields[2].text;
+if (account.length == 0 || pwd.length == 0) {
+self.statusLabel.textColor = [UIColor systemRedColor];
+self.statusLabel.text = @"❌ 账号或密码为空";
+return;
+}
 ACAccountItem *newItem = [[ACAccountItem alloc] init];
-newItem.userId = mgr.selfUserId;
-newItem.token = ACHeaderValue(mgr.latestHTTPHeaders, @"token");
-newItem.channel = ACHeaderValue(mgr.latestHTTPHeaders, @"channel");
-newItem.remark = remark.length > 0 ? remark : @"我的账号";
+newItem.remark = remark.length > 0 ? remark : account;
+newItem.account = account;
+newItem.password = pwd;
 NSDateFormatter *df = [[NSDateFormatter alloc] init];
 df.dateFormat = @"MM-dd HH:mm";
 newItem.saveTime = [df stringFromDate:[NSDate date]];
-// 同 UID 已存在则更新，避免重复堆积
+// 同账号已存在则更新，避免重复堆积
 BOOL replaced = NO;
 for (NSUInteger i2 = 0; i2 < mgr.accountList.count; i2++) {
 ACAccountItem *old = mgr.accountList[i2];
-if ([old.userId isEqualToString:newItem.userId]) {
+if ([old.account isEqualToString:newItem.account]) {
 [mgr.accountList replaceObjectAtIndex:i2 withObject:newItem];
 replaced = YES;
 break;
@@ -4344,8 +4480,14 @@ break;
 if (!replaced) [mgr.accountList insertObject:newItem atIndex:0];
 [mgr saveAllAccounts];
 [self.tableView reloadData];
-self.statusLabel.textColor = [UIColor systemGreenColor];
-self.statusLabel.text = [NSString stringWithFormat:@"✅ 账号【%@】已保存！", newItem.remark];
+// 保存后立即尝试登录切换
+self.statusLabel.textColor = [UIColor systemBlueColor];
+self.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在登录【%@】...", newItem.remark];
+[mgr loginWithAccount:newItem completion:^(BOOL ok, NSString *msg) {
+self.statusLabel.textColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+self.statusLabel.text = msg;
+[self.tableView reloadData];
+}];
 }]];
 [self presentViewController:alert animated:YES completion:nil];
 return;
@@ -4353,7 +4495,9 @@ return;
 NSUInteger arow = (NSUInteger)indexPath.row - 1;
 if (arow < mgr.accountList.count) {
 ACAccountItem *targetAcc = mgr.accountList[arow];
-[mgr switchToAccount:targetAcc completion:^(BOOL ok, NSString *msg) {
+self.statusLabel.textColor = [UIColor systemBlueColor];
+self.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在切换至【%@】...", targetAcc.remark];
+[mgr loginWithAccount:targetAcc completion:^(BOOL ok, NSString *msg) {
 self.statusLabel.textColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
 self.statusLabel.text = msg;
 [self updateUI];
