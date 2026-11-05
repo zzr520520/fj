@@ -623,43 +623,92 @@ if (item.token.length > 10 && item.userId.length > 3) {
 applyAndFinish([NSString stringWithFormat:@"✅ 已切换至:【%@】", item.remark]);
 return;
 }
-// 2. 官方账号密码登录接口直登
-NSString *loginUrl = @"https://apiv1.airchat.cn/client/biz/user/login";
-NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:loginUrl]];
-req.HTTPMethod = @"POST";
-req.timeoutInterval = 12.0;
-[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
-NSDictionary *body = @{@"account": item.account, @"password": item.password, @"clientType": @"iOS"};
-req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-acInternalRequest = YES;
-NSURLSession *session = ACDedicatedPluginSession();
-if (!session) { acInternalRequest = NO; if (completion) completion(NO, @"会话创建失败"); return; }
-NSURLSessionDataTask *t = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-dispatch_async(dispatch_get_main_queue(), ^{
-acInternalRequest = NO;
-if (error || data.length == 0) {
-if (completion) completion(NO, @"网络错误，登录失败");
+// 2. 无缓存凭证 → 注销 IM 回登录页，自动填账号密码模拟点击登录（不再用未经抓包验证的 HTTP 登录接口）
+[self switchToAccountAndAutoLogin:item completion:completion];
+}
+// 切号终极方案：注销 IM → 等待跳转登录页 → 自动填入账号密码 → 模拟点击登录按钮（模拟真人操作，规避 Token 缓存死锁）
+- (void)switchToAccountAndAutoLogin:(ACAccountItem *)item completion:(void(^)(BOOL ok, NSString *msg))completion {
+if (!item || item.account.length == 0 || item.password.length == 0) {
+if (completion) completion(NO, @"账号或密码为空");
 return;
 }
-NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
-NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
-if (code == 200) {
-NSDictionary *d = ACSafeDict(json[@"data"]) ?: json;
-item.token = ACSafeStr(d[@"token"]);
-item.userId = ACSafeStr(d[@"userId"]);
-if (item.userId.length == 0) item.userId = ACSafeStr(d[@"id"]);
-if (item.userId.length == 0) item.userId = ACSafeStr(d[@"uid"]);
-[self saveAllAccounts];
-applyAndFinish([NSString stringWithFormat:@"✅ 账号【%@】登录切换成功！", item.remark]);
+ACLog(@"[账号切换] 启动全自动切号流程 -> 账号:%@ (备注:%@)", item.account, item.remark);
+dispatch_async(dispatch_get_main_queue(), ^{
+UIWindow *win = [UIApplication sharedApplication].keyWindow;
+// 收起助手面板，避免遮挡
+UIViewController *top = win.rootViewController;
+while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
+if (top && [NSStringFromClass([top class]) containsString:@"ACForwardAssistantVC"]) {
+[top dismissViewControllerAnimated:NO completion:nil];
+}
+// 触发官方 IM 注销（App 收到登出后自行退回登录页）
+@try {
+Class imCls = NSClassFromString(@"V2TIMManager");
+if (imCls && [imCls respondsToSelector:@selector(sharedInstance)]) {
+id imMgr = ((id (*)(id, SEL))objc_msgSend)(imCls, @selector(sharedInstance));
+SEL logoutSel = NSSelectorFromString(@"logout:fail:");
+if ([imMgr respondsToSelector:logoutSel]) {
+((void (*)(id, SEL, id, id))objc_msgSend)(imMgr, logoutSel, nil, nil);
+ACLog(@"[账号切换] 已触发 IM 注销，等待跳转登录页...");
+}
+}
+} @catch (NSException *e) {
+ACLog(@"[账号切换] 注销异常 %@", e.reason);
+}
+// 等登录页出现后，全窗口搜账号/密码输入框与登录按钮
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+UIWindow *win2 = [UIApplication sharedApplication].keyWindow ?: win;
+UITextField *accountField = nil;
+UITextField *pwdField = nil;
+UIButton *loginBtn = nil;
+for (UIWindow *w2 in [UIApplication sharedApplication].windows) {
+if (accountField && pwdField && loginBtn) break;
+NSMutableArray *q = [NSMutableArray arrayWithObject:w2];
+while (q.count > 0) {
+UIView *v = q.firstObject;
+[q removeObjectAtIndex:0];
+if ([v isKindOfClass:[UITextField class]]) {
+UITextField *tf = (UITextField *)v;
+NSString *ph = ACSafeStr(tf.placeholder);
+if (tf.secureTextEntry || [ph containsString:@"密"]) {
+if (!pwdField) pwdField = tf;
+} else if ([ph containsString:@"手机"] || [ph containsString:@"账号"] || [ph containsString:@"号码"]) {
+if (!accountField) accountField = tf;
+}
+}
+if ([v isKindOfClass:[UIButton class]]) {
+UIButton *b = (UIButton *)v;
+NSString *t1 = [b titleForState:UIControlStateNormal] ?: @"";
+if (t1.length > 0 && [t1 containsString:@"登"]) loginBtn = loginBtn ?: b;
+}
+[q addObjectsFromArray:v.subviews];
+}
+}
+if (!accountField && !pwdField) {
+ACLog(@"[账号切换] 未检测到登录页（注销未生效或登录页结构不同）");
+if (completion) completion(NO, @"未检测到登录页，请手动退出登录后再点切换");
+return;
+}
+if (accountField) {
+accountField.text = item.account;
+[accountField sendActionsForControlEvents:UIControlEventEditingChanged];
+}
+if (pwdField) {
+pwdField.text = item.password;
+[pwdField sendActionsForControlEvents:UIControlEventEditingChanged];
+}
+ACLog(@"[账号切换] 已自动填入账号: %@ / 密码 ***", item.account);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+if (loginBtn) {
+ACLog(@"🎯 [账号切换] 自动点击登录按钮！");
+[loginBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+if (completion) completion(YES, [NSString stringWithFormat:@"✅ 已自动填入并登录:【%@】", item.remark]);
 } else {
-NSString *msg = ACSafeStr(json[@"msg"]);
-if (msg.length == 0) msg = @"账号或密码错误";
-if (completion) completion(NO, [NSString stringWithFormat:@"登录失败: %@", msg]);
+if (completion) completion(NO, @"已填入凭证，未找到登录按钮，请手动点击登录");
 }
 });
-}];
-[t resume];
+});
+});
 }
 + (instancetype)shared {
 static ACForwardHelperManager *instance = nil;
@@ -1338,7 +1387,7 @@ static UITextView *ACFindTextViewDeep(UIView *view);
 static UIButton *ACFindButtonWithTitleDeep(UIView *view, NSString *titlePart);
 
 - (void)ac_commentPostId:(NSString *)postId text:(NSString *)text {
-// 原生评论：与点赞同路——点卡片评论气泡 → 注入文字 → 点发送，由 App 自产合法加签，告别自拼 HTTP 500
+// 原生评论 v2（实证）：卡片评论入口是手势/selector 而非绑定按钮；输入框为 AirCommentInputView（可能在键盘 Window）
 dispatch_async(dispatch_get_main_queue(), ^{
 UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
 if (@available(iOS 13.0, *)) {
@@ -1372,21 +1421,69 @@ dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), 
 });
 return;
 }
+// ① 触发评论入口：selector 三连 → 按钮 → 手势（三级降级）
+BOOL triggered = NO;
+@try {
+SEL cSel1 = NSSelectorFromString(@"commentButtonTapped");
+SEL cSel2 = NSSelectorFromString(@"commentButtonTapped:");
+SEL cSel3 = NSSelectorFromString(@"onCommentAction");
+if ([targetCard respondsToSelector:cSel1]) {
+ACLog(@"🎯 [原生评论] 命中 commentButtonTapped");
+((void (*)(id, SEL))objc_msgSend)(targetCard, cSel1);
+triggered = YES;
+} else if ([targetCard respondsToSelector:cSel2]) {
+ACLog(@"🎯 [原生评论] 命中 commentButtonTapped:");
+((void (*)(id, SEL, id))objc_msgSend)(targetCard, cSel2, nil);
+triggered = YES;
+} else if ([targetCard respondsToSelector:cSel3]) {
+ACLog(@"🎯 [原生评论] 命中 onCommentAction");
+((void (*)(id, SEL))objc_msgSend)(targetCard, cSel3);
+triggered = YES;
+}
+if (!triggered) {
 UIButton *commentBtn = ACFindButtonWithActionDeep(targetCard, @"comment");
-if (!commentBtn) {
-ACLog(@"[原生评论] 卡片上未找到评论按钮（跳过 %@）", postId);
+if (commentBtn) {
+ACLog(@"🎯 [原生评论] 触发卡片评论按钮点击！");
+[commentBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+triggered = YES;
+}
+}
+if (!triggered) {
+for (UIGestureRecognizer *g in targetCard.gestureRecognizers) {
+if ([g isKindOfClass:[UITapGestureRecognizer class]] && g.isEnabled) {
+id gTarget = g.target;
+SEL gAct = g.action;
+if (gTarget && gAct) {
+ACLog(@"🎯 [原生评论] 触发卡片点击手势唤起评论");
+((void (*)(id, SEL, id))objc_msgSend)(gTarget, gAct, g);
+triggered = YES;
+break;
+}
+}
+}
+}
+} @catch (NSException *e) {
+ACLog(@"[原生评论] 触发异常 %@", e.reason);
+}
+if (!triggered) {
+ACLog(@"[原生评论] 卡片无可触发的评论入口（跳过 %@）", postId);
 self.autoCommentSending = NO;
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 [[ACForwardHelperManager shared] ac_pumpAutoCommentQueue];
 });
 return;
 }
-ACLog(@"🎯 [原生评论] 触发卡片评论按钮点击！");
-[commentBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+// ② 0.7s 后全窗口找评论输入框（firstResponder 优先）→ 注入 → 发送
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 UIViewController *top = keyWin.rootViewController;
 while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
-UITextView *cInput = ACFindTextViewDeep(top.view) ?: ACFindTextViewDeep(keyWin);
+UITextView *cInput = nil;
+// 优先取正在输入的 firstResponder 输入框（评论弹窗弹出后即获得焦点）
+for (UIWindow *w2 in [UIApplication sharedApplication].windows) {
+UITextView *tv2 = ACFindTextViewDeep(w2);
+if (tv2 && tv2.isFirstResponder) { cInput = tv2; break; }
+}
+if (!cInput) cInput = ACFindTextViewDeep(top.view) ?: ACFindTextViewDeep(keyWin);
 BOOL injected = NO;
 if (cInput) {
 cInput.text = text ?: @"不错";
@@ -1397,12 +1494,21 @@ if (del && [del respondsToSelector:@selector(textViewDidChange:)]) {
 [[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification object:cInput];
 injected = YES;
 ACLog(@"[原生评论] 注入评论文字: %@", cInput.text);
+} else {
+ACLog(@"[原生评论] 未找到评论输入框（AirCommentInputView 未弹出？）");
 }
-UIButton *sendBtn = ACFindButtonWithActionDeep(top.view, @"send")
-?: ACFindButtonWithTitleDeep(top.view, @"发")
-?: ACFindButtonWithTitleDeep(top.view, @"送");
+// 发送按钮：全窗口搜 send 动作 / 「发」「送」标题
+UIButton *sendBtn = ACFindButtonWithActionDeep(top.view, @"send");
+if (!sendBtn) {
+for (UIWindow *w2 in [UIApplication sharedApplication].windows) {
+sendBtn = ACFindButtonWithActionDeep(w2, @"send")
+?: ACFindButtonWithTitleDeep(w2, @"发")
+?: ACFindButtonWithTitleDeep(w2, @"送");
+if (sendBtn) break;
+}
+}
 BOOL sent = NO;
-if (sendBtn && sendBtn != commentBtn) {
+if (sendBtn) {
 [sendBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
 sent = YES;
 ACLog(@"✅ [原生评论] 已点击发送按钮！");
@@ -2232,10 +2338,19 @@ ACLog(@"[原生发布] 步骤2: 成功注入动态文案 -> %@", task.contentTex
 ACLog(@"[原生发布] 步骤2: 未找到编辑框，继续尝试下一步");
 }
 UIButton *nextBtn = nil;
-UIView *toolbar = ACFindViewByClassNameDeep(win2, @"AirMomentPublishToolbarView")
+UIView *toolbar = nil;
+// 优先级0（UI 探针实证）：工具栏 AirMomentPublishToolbarView 挂在编辑框的 inputAccessoryView（键盘上方）
+if (inputTV && inputTV.inputAccessoryView) {
+toolbar = inputTV.inputAccessoryView;
+nextBtn = ACFindButtonWithActionDeep(toolbar, @"next");
+if (nextBtn) ACLog(@"[原生发布] 步骤3: 从 inputAccessoryView 直接锁定「下一步」按钮");
+}
+if (!nextBtn) {
+toolbar = ACFindViewByClassNameDeep(win2, @"AirMomentPublishToolbarView")
 ?: ACFindViewByClassNameDeep(win2, @"ToolbarView")
 ?: ACFindViewByClassNameDeep(win2, @"AirMomentPublish");
 if (toolbar) nextBtn = ACFindButtonWithActionDeep(toolbar, @"next");
+}
 // 关键修复：下一步按钮挂在键盘 inputAccessoryView 上，必须穿透所有 Window（含键盘 Window）搜寻
 if (!nextBtn) {
 for (UIWindow *w3 in [UIApplication sharedApplication].windows) {
