@@ -1450,15 +1450,34 @@ triggered = YES;
 }
 if (!triggered) {
 for (UIGestureRecognizer *g in targetCard.gestureRecognizers) {
-if ([g isKindOfClass:[UITapGestureRecognizer class]] && g.isEnabled) {
-id gTarget = g.target;
-SEL gAct = g.action;
-if (gTarget && gAct) {
+if (![g isKindOfClass:[UITapGestureRecognizer class]] || !g.isEnabled) continue;
+// target/action 非公开属性：KVC 取私有 ivar，respondsToSelector 兜底
+id gTarget = nil;
+SEL gAct = NULL;
+@try { gTarget = [g valueForKey:@"target"]; } @catch (NSException *e) { gTarget = nil; }
+if (!gTarget) {
+@try {
+id tlist = [g valueForKey:@"_targets"];
+if ([tlist isKindOfClass:[NSArray class]] && tlist.count > 0) {
+id entry = ((NSArray *)tlist)[0];
+if ([entry isKindOfClass:[NSObject class]]) {
+@try { gTarget = [entry valueForKey:@"target"]; } @catch (NSException *e) { gTarget = entry; }
+id act = nil;
+@try { act = [entry valueForKey:@"action"]; } @catch (NSException *e) { act = nil; }
+if ([act isKindOfClass:[NSString class]]) gAct = NSSelectorFromString(act);
+}
+}
+} @catch (NSException *e) { gTarget = gTarget; }
+}
+if (gAct == NULL) {
+SEL aSel = NSSelectorFromString(@"action");
+if ([g respondsToSelector:aSel]) gAct = ((SEL (*)(id, SEL))objc_msgSend)(g, aSel);
+}
+if (gTarget && gAct != NULL) {
 ACLog(@"🎯 [原生评论] 触发卡片点击手势唤起评论");
-((void (*)(id, SEL, id))objc_msgSend)(gTarget, gAct, g);
+[gTarget performSelector:gAct withObject:g];
 triggered = YES;
 break;
-}
 }
 }
 }
