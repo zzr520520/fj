@@ -623,92 +623,8 @@ if (item.token.length > 10 && item.userId.length > 3) {
 applyAndFinish([NSString stringWithFormat:@"✅ 已切换至:【%@】", item.remark]);
 return;
 }
-// 2. 无缓存凭证 → 注销 IM 回登录页，自动填账号密码模拟点击登录（不再用未经抓包验证的 HTTP 登录接口）
-[self switchToAccountAndAutoLogin:item completion:completion];
-}
-// 切号终极方案：注销 IM → 等待跳转登录页 → 自动填入账号密码 → 模拟点击登录按钮（模拟真人操作，规避 Token 缓存死锁）
-- (void)switchToAccountAndAutoLogin:(ACAccountItem *)item completion:(void(^)(BOOL ok, NSString *msg))completion {
-if (!item || item.account.length == 0 || item.password.length == 0) {
-if (completion) completion(NO, @"账号或密码为空");
-return;
-}
-ACLog(@"[账号切换] 启动全自动切号流程 -> 账号:%@ (备注:%@)", item.account, item.remark);
-dispatch_async(dispatch_get_main_queue(), ^{
-UIWindow *win = [UIApplication sharedApplication].keyWindow;
-// 收起助手面板，避免遮挡
-UIViewController *top = win.rootViewController;
-while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
-if (top && [NSStringFromClass([top class]) containsString:@"ACForwardAssistantVC"]) {
-[top dismissViewControllerAnimated:NO completion:nil];
-}
-// 触发官方 IM 注销（App 收到登出后自行退回登录页）
-@try {
-Class imCls = NSClassFromString(@"V2TIMManager");
-if (imCls && [imCls respondsToSelector:@selector(sharedInstance)]) {
-id imMgr = ((id (*)(id, SEL))objc_msgSend)(imCls, @selector(sharedInstance));
-SEL logoutSel = NSSelectorFromString(@"logout:fail:");
-if ([imMgr respondsToSelector:logoutSel]) {
-((void (*)(id, SEL, id, id))objc_msgSend)(imMgr, logoutSel, nil, nil);
-ACLog(@"[账号切换] 已触发 IM 注销，等待跳转登录页...");
-}
-}
-} @catch (NSException *e) {
-ACLog(@"[账号切换] 注销异常 %@", e.reason);
-}
-// 等登录页出现后，全窗口搜账号/密码输入框与登录按钮
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-UIWindow *win2 = [UIApplication sharedApplication].keyWindow ?: win;
-UITextField *accountField = nil;
-UITextField *pwdField = nil;
-UIButton *loginBtn = nil;
-for (UIWindow *w2 in [UIApplication sharedApplication].windows) {
-if (accountField && pwdField && loginBtn) break;
-NSMutableArray *q = [NSMutableArray arrayWithObject:w2];
-while (q.count > 0) {
-UIView *v = q.firstObject;
-[q removeObjectAtIndex:0];
-if ([v isKindOfClass:[UITextField class]]) {
-UITextField *tf = (UITextField *)v;
-NSString *ph = ACSafeStr(tf.placeholder);
-if (tf.secureTextEntry || [ph containsString:@"密"]) {
-if (!pwdField) pwdField = tf;
-} else if ([ph containsString:@"手机"] || [ph containsString:@"账号"] || [ph containsString:@"号码"]) {
-if (!accountField) accountField = tf;
-}
-}
-if ([v isKindOfClass:[UIButton class]]) {
-UIButton *b = (UIButton *)v;
-NSString *t1 = [b titleForState:UIControlStateNormal] ?: @"";
-if (t1.length > 0 && [t1 containsString:@"登"]) loginBtn = loginBtn ?: b;
-}
-[q addObjectsFromArray:v.subviews];
-}
-}
-if (!accountField && !pwdField) {
-ACLog(@"[账号切换] 未检测到登录页（注销未生效或登录页结构不同）");
-if (completion) completion(NO, @"未检测到登录页，请手动退出登录后再点切换");
-return;
-}
-if (accountField) {
-accountField.text = item.account;
-[accountField sendActionsForControlEvents:UIControlEventEditingChanged];
-}
-if (pwdField) {
-pwdField.text = item.password;
-[pwdField sendActionsForControlEvents:UIControlEventEditingChanged];
-}
-ACLog(@"[账号切换] 已自动填入账号: %@ / 密码 ***", item.account);
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-if (loginBtn) {
-ACLog(@"🎯 [账号切换] 自动点击登录按钮！");
-[loginBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
-if (completion) completion(YES, [NSString stringWithFormat:@"✅ 已自动填入并登录:【%@】", item.remark]);
-} else {
-if (completion) completion(NO, @"已填入凭证，未找到登录按钮，请手动点击登录");
-}
-});
-});
-});
+// 2. 无缓存凭证 → 提示先登录一次再保存（App 密码经自有加密校验，明文直登会被拒；注销回登录页也会破坏插件运行环境）
+if (completion) completion(NO, @"该账号暂无缓存凭证：请先用此账号登录 App，再进面板「➕ 添加切换账号」重新保存");
 }
 + (instancetype)shared {
 static ACForwardHelperManager *instance = nil;
@@ -5192,6 +5108,13 @@ ACPresentForwardAssistantFromTopVC();
 }
 %end
 %hook UIViewController
+// 评论文案防封混淆后缀（破除服务端文本 MD5 查重，风控铁律③）
+static inline NSString *ACAntiBanSuffix(void) {
+NSArray *pool = @[@" ~", @" ✨", @" 👍", @" 😊", @" ❤️", @" 🎈", @" 🌟", @" ！", @" ｜", @" ～"];
+return pool[arc4random_uniform((u_int32_t)pool.count)];
+}
+// 详情页秒评去重（同一条动态只评一次）
+static NSString *sLastCommentedDetailPid = nil;
 // 迎新/批量语音打招呼期间，压制 TUICall 前台呼叫弹窗，避免打断用户操作
 - (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)animated completion:(void (^)(void))completion {
 @try {
@@ -5221,6 +5144,70 @@ if (!already) {
 ACLog(@"🎯 [后台引擎] 捕获并锁定飞行圈主控制器: %@", mCls);
 UIScrollView *sv = ACFirstScrollViewDeep(self.view);
 if (sv) sMomentsScrollView = sv;
+}
+}
+// 极速精准秒评：点进任意动态详情页（类名含 MomentDetail），0.35 秒后自动填词发送，点一个评一个
+NSString *dCls = NSStringFromClass([self class]);
+if ([dCls containsString:@"MomentDetail"]) {
+ACForwardHelperManager *mgr2 = [ACForwardHelperManager shared];
+if (mgr2.autoCommentEnabled) {
+NSString *currentPid = nil;
+@try {
+id momentObj = [self valueForKey:@"moment"] ?: [self valueForKey:@"model"] ?: [self valueForKey:@"item"];
+if (momentObj) {
+currentPid = ACSafeStr([momentObj valueForKey:@"id"]);
+if (currentPid.length == 0) currentPid = ACSafeStr([momentObj valueForKey:@"postId"]);
+}
+} @catch (NSException *e) {}
+if (currentPid.length > 5 && [currentPid isEqualToString:sLastCommentedDetailPid]) return;
+ACLog(@"🎯 [点进动态] 识别动态详情页 (PID: %@)，0.35 秒后自动跟评...", currentPid ?: @"未知");
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+UITextView *inputTV = nil;
+UITextField *inputTF = nil;
+UIButton *sendBtn = nil;
+// 全窗口穿透搜评论输入框与发送按钮
+NSMutableArray *views = [NSMutableArray arrayWithObject:self.view];
+for (UIWindow *w in [UIApplication sharedApplication].windows) [views addObject:w];
+while (views.count > 0) {
+UIView *v = views.firstObject;
+[views removeObjectAtIndex:0];
+if ([v isKindOfClass:[UITextView class]] && v.isUserInteractionEnabled) inputTV = (UITextView *)v;
+else if ([v isKindOfClass:[UITextField class]] && v.isUserInteractionEnabled) inputTF = (UITextField *)v;
+if ([v isKindOfClass:[UIButton class]]) {
+UIButton *b = (UIButton *)v;
+NSString *title = b.currentTitle ?: @"";
+if (title.length > 0 && ([title containsString:@"发"] || [title containsString:@"送"] || [title containsString:@"评"])) sendBtn = b;
+}
+[views addObjectsFromArray:v.subviews];
+}
+NSString *commentText = mgr2.autoCommentText.length > 0 ? mgr2.autoCommentText : @"不错";
+commentText = [commentText stringByAppendingString:ACAntiBanSuffix()];
+if (inputTV) {
+inputTV.text = commentText;
+id del = inputTV.delegate;
+if (del && [del respondsToSelector:@selector(textViewDidChange:)]) ((void (*)(id, SEL, id))objc_msgSend)(del, @selector(textViewDidChange:), inputTV);
+[[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification object:inputTV];
+}
+if (inputTF) {
+inputTF.text = commentText;
+[inputTF sendActionsForControlEvents:UIControlEventEditingChanged];
+}
+BOOL done = NO;
+if (sendBtn) {
+[sendBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+done = YES;
+ACLog(@"✅ [点进动态] 已点击发送按钮，文案: %@", commentText);
+} else if (inputTV) {
+id del = inputTV.delegate;
+if (del && [del respondsToSelector:@selector(textView:shouldChangeTextInRange:replacementText:)]) {
+((BOOL (*)(id, SEL, id, NSRange, id))objc_msgSend)(del, @selector(textView:shouldChangeTextInRange:replacementText:), inputTV, NSMakeRange(inputTV.text.length, 0), @"\n");
+}
+done = YES;
+ACLog(@"✅ [点进动态] 已尝试回车发送，文案: %@", commentText);
+}
+if (done) sLastCommentedDetailPid = currentPid;
+else ACLog(@"[点进动态] 未找到评论输入框/发送按钮（跳过 %@）", currentPid ?: @"?");
+});
 }
 }
 NSString *clsName = NSStringFromClass([self class]);
