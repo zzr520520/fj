@@ -1164,75 +1164,101 @@ self.autoCommentSending = YES;
 NSString *text = self.autoCommentText.length > 0 ? self.autoCommentText : @"不错";
 [self ac_commentPostId:pid text:text];
 }
+// 前置声明：评论引擎位于点赞引擎之前，深搜助手定义在后
+static void ACFindMomentCardsInView(UIView *view, NSMutableArray<UIView *> *results);
+static UIButton *ACFindButtonWithActionDeep(UIView *view, NSString *actionPart);
+static UITextView *ACFindTextViewDeep(UIView *view);
+static UIButton *ACFindButtonWithTitleDeep(UIView *view, NSString *titlePart);
+
 - (void)ac_commentPostId:(NSString *)postId text:(NSString *)text {
+// 原生评论：与点赞同路——点卡片评论气泡 → 注入文字 → 点发送，由 App 自产合法加签，告别自拼 HTTP 500
+dispatch_async(dispatch_get_main_queue(), ^{
+UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+if (@available(iOS 13.0, *)) {
+if (!keyWin) {
 @try {
-NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
-if (token.length == 0) {
+for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+if ([sc isKindOfClass:[UIWindowScene class]] && sc.activationState == UISceneActivationStateForegroundActive) {
+keyWin = ((UIWindowScene *)sc).keyWindow;
+if (keyWin) break;
+}
+}
+} @catch (NSException *e) {}
+}
+}
+NSMutableArray<UIView *> *cards = [NSMutableArray array];
+ACFindMomentCardsInView(keyWin, cards);
+// 优先匹配 postId 对应卡片，匹配不到取屏上第一张
+UIView *targetCard = nil;
+if (postId.length >= 6) {
+for (UIView *c in cards) {
+NSString *cid = ACExtractCardPostId(c);
+if (cid.length && [cid isEqualToString:postId]) { targetCard = c; break; }
+}
+}
+if (!targetCard) targetCard = cards.firstObject;
+if (!targetCard) {
+ACLog(@"[原生评论] 屏幕暂无卡片，2 秒后继续队列");
 self.autoCommentSending = NO;
-ACLog(@"[自动评论] 跳过 %@：token 未捕获", postId);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[[ACForwardHelperManager shared] ac_pumpAutoCommentQueue];
+});
 return;
 }
-NSString *host = [self ac_activeBusinessHost];
-// 头部对齐官方点赞报文（同族接口）：纯 URL 无 Query，Header 仅官方 7 项
-NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/comment/publish", host]];
-NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-req.HTTPMethod = @"POST";
-req.timeoutInterval = 10.0;
-[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-[req setValue:token forHTTPHeaderField:@"token"];
-[req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
-NSString *verVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
-if (verVal.length == 0) verVal = @"2.1.9 (1102)";
-[req setValue:verVal forHTTPHeaderField:@"version"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, 4B77DFD1-5EFA-4610-B3B6-7136D60B2002 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
-// 官方同族接口均带 X-Lts-Id，取嗅探到的最新有效值
-NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-if (ltsId.length > 50) {
-[req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
-}
-uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
-static uint64_t acReqSeq = 0;
-acReqSeq = (acReqSeq + 1) & 0x7F;
-[req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acReqSeq] forHTTPHeaderField:@"X-Request-No"];
-// postId 沿用官方报文的字符串形态
-NSDictionary *cmtBody = @{@"content": (text ?: @"不错"), @"postId": (postId ?: @"")};
-NSData *body = [NSJSONSerialization dataWithJSONObject:cmtBody options:0 error:nil];
-if (!body) { self.autoCommentSending = NO; return; }
-req.HTTPBody = body;
-[req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
-ACLog(@"[自动评论] 发送 postId=%@ text=%@ ltsLen=%lu", postId, text, (unsigned long)ltsId.length);
-acInternalRequest = YES;
-NSURLSession *acSession = ACDedicatedPluginSession();
-if (!acSession) { self.autoCommentSending = NO; acInternalRequest = NO; return; }
-NSURLSessionDataTask *t = [acSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-dispatch_async(dispatch_get_main_queue(), ^{
-ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-mgr.autoCommentSending = NO;
-NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
-NSString *raw = data.length ? ([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"") : @"";
-NSInteger code = 0;
-NSDictionary *jd = ACSafeDict([NSJSONSerialization JSONObjectWithData:(data ?: [NSData data]) options:0 error:nil]);
-if (jd) code = [ACSafeStr(jd[@"code"]) integerValue];
-if (code == 200) {
-mgr.lastMomentLog = [NSString stringWithFormat:@"💬 已自动评论：%@", text];
-} else {
-mgr.lastMomentLog = [NSString stringWithFormat:@"⚠️ 自动评论失败 HTTP %ld / code %ld %@", (long)status, (long)code,
-raw.length > 60 ? [raw substringToIndex:60] : raw];
-}
-ACLog(@"[自动评论] 回调 %@ HTTP %ld code=%ld body=%@", postId, (long)status, (long)code, raw.length > 160 ? [raw substringToIndex:160] : raw);
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-[mgr saveAllCustomSettings];
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[mgr ac_pumpAutoCommentQueue];
-});
-});
-}];
-acInternalRequest = NO;
-[t resume];
-} @catch (NSException *e) {
+UIButton *commentBtn = ACFindButtonWithActionDeep(targetCard, @"comment");
+if (!commentBtn) {
+ACLog(@"[原生评论] 卡片上未找到评论按钮（跳过 %@）", postId);
 self.autoCommentSending = NO;
-ACLog(@"[自动评论] 异常 %@: %@", e.name, e.reason);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[[ACForwardHelperManager shared] ac_pumpAutoCommentQueue];
+});
+return;
 }
+ACLog(@"🎯 [原生评论] 触发卡片评论按钮点击！");
+[commentBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+UIViewController *top = keyWin.rootViewController;
+while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
+UITextView *cInput = ACFindTextViewDeep(top.view) ?: ACFindTextViewDeep(keyWin);
+BOOL injected = NO;
+if (cInput) {
+cInput.text = text ?: @"不错";
+id del = cInput.delegate;
+if (del && [del respondsToSelector:@selector(textViewDidChange:)]) {
+((void (*)(id, SEL, id))objc_msgSend)(del, @selector(textViewDidChange:), cInput);
+}
+[[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification object:cInput];
+injected = YES;
+ACLog(@"[原生评论] 注入评论文字: %@", cInput.text);
+}
+UIButton *sendBtn = ACFindButtonWithActionDeep(top.view, @"send")
+?: ACFindButtonWithTitleDeep(top.view, @"发")
+?: ACFindButtonWithTitleDeep(top.view, @"送");
+BOOL sent = NO;
+if (sendBtn && sendBtn != commentBtn) {
+[sendBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+sent = YES;
+ACLog(@"✅ [原生评论] 已点击发送按钮！");
+}
+if (!sent && injected && cInput) {
+// 兜底：模拟回车键发送（多数评论框回车即发）
+id del2 = cInput.delegate;
+if (del2 && [del2 respondsToSelector:@selector(textView:shouldChangeTextInRange:replacementText:)]) {
+BOOL allow = ((BOOL (*)(id, SEL, id, NSRange, id))objc_msgSend)(del2, @selector(textView:shouldChangeTextInRange:replacementText:), cInput, NSMakeRange(cInput.text.length, 0), @"\n");
+if (allow) cInput.text = [cInput.text stringByAppendingString:@"\n"];
+ACLog(@"[原生评论] 尝试回车键发送");
+}
+}
+self.lastMomentLog = sent ? [NSString stringWithFormat:@"💬 已自动评论：%@", (text ?: @"不错")]
+: @"⚠️ 评论未闭环（未找到发送入口）";
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+[self saveAllCustomSettings];
+self.autoCommentSending = NO;
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[[ACForwardHelperManager shared] ac_pumpAutoCommentQueue];
+});
+});
+});
 }
 #pragma mark - 自动点赞引擎（复用信息流响应，不重复安装网络钩子）
 - (void)ac_handleFeedResponseForAutoLike:(NSDictionary *)json {
@@ -1342,6 +1368,55 @@ return nil;
 }
 
 // 后台静默下拉刷新飞行圈（UIRefreshControl / MJRefresh / 控制器刷新方法 三级降级）
+// 全局深度查找飞行圈/个人主页控制器（BFS 穿透 TabBarController → NavigationController → 子控制器，双入口）
+static UIViewController *ACFindMomentsOrProfileController(void) {
+UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+if (@available(iOS 13.0, *)) {
+if (!keyWin) {
+@try {
+for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+if ([sc isKindOfClass:[UIWindowScene class]] && sc.activationState == UISceneActivationStateForegroundActive) {
+keyWin = ((UIWindowScene *)sc).keyWindow;
+if (keyWin) break;
+}
+}
+} @catch (NSException *e) {}
+}
+}
+if (!keyWin) {
+for (UIWindow *w in [UIApplication sharedApplication].windows) {
+if (w.isKeyWindow) { keyWin = w; break; }
+}
+}
+UIViewController *root = keyWin.rootViewController;
+if (!root) return nil;
+NSMutableArray<UIViewController *> *queue = [NSMutableArray arrayWithObject:root];
+int guardCount = 0;
+while (queue.count > 0 && guardCount++ < 200) {
+UIViewController *vc = queue.firstObject;
+[queue removeObjectAtIndex:0];
+if (!vc) continue;
+NSString *clsName = NSStringFromClass([vc class]);
+if ([clsName containsString:@"AirMomentsViewController"] ||
+[clsName containsString:@"AirUserProfileViewController"] ||
+[clsName containsString:@"AirUserMomentsViewController"] ||
+[clsName containsString:@"AirMineViewController"]) {
+@try { [vc loadViewIfNeeded]; } @catch (NSException *e) {}
+return vc;
+}
+if ([vc isKindOfClass:[UITabBarController class]]) {
+[queue addObjectsFromArray:((UITabBarController *)vc).viewControllers];
+}
+if ([vc isKindOfClass:[UINavigationController class]]) {
+[queue addObjectsFromArray:((UINavigationController *)vc).viewControllers];
+}
+if (vc.childViewControllers.count > 0) {
+[queue addObjectsFromArray:vc.childViewControllers];
+}
+}
+return nil;
+}
+
 static void ACTriggerMomentsBackgroundRefresh(void) {
 dispatch_async(dispatch_get_main_queue(), ^{
 if (!sMomentsMainVC) {
@@ -1358,16 +1433,8 @@ if (keyWin) break;
 } @catch (NSException *e) {}
 }
 }
-UIViewController *root = keyWin.rootViewController;
-if ([root isKindOfClass:[UITabBarController class]]) {
-UITabBarController *tab = (UITabBarController *)root;
-for (UIViewController *child in tab.viewControllers) {
-if ([NSStringFromClass([child class]) containsString:@"Moment"]) {
-sMomentsMainVC = child;
-break;
-}
-}
-}
+UIViewController *deepVC = ACFindMomentsOrProfileController();
+if (deepVC) sMomentsMainVC = deepVC;
 }
 UIViewController *mVC = sMomentsMainVC;
 if (!mVC) return;
@@ -1918,19 +1985,9 @@ for (UIWindow *w2 in [UIApplication sharedApplication].windows) {
 if (w2.isKeyWindow) { win = w2; break; }
 }
 }
-// 寻找飞行圈控制器
+// 寻找飞行圈控制器（BFS 深度穿透 TabBar → NavigationController → 子控制器，飞行圈/个人主页双入口）
 UIViewController *momentsVC = sMomentsMainVC;
-if (!momentsVC && win) {
-UIViewController *root = win.rootViewController;
-if ([root isKindOfClass:[UITabBarController class]]) {
-for (UIViewController *c in ((UITabBarController *)root).viewControllers) {
-if ([NSStringFromClass([c class]) containsString:@"Moments"] || [NSStringFromClass([c class]) containsString:@"Moment"]) {
-momentsVC = c;
-break;
-}
-}
-}
-}
+if (!momentsVC) momentsVC = ACFindMomentsOrProfileController();
 if (!momentsVC) {
 ACLog(@"[原生发布] 错误：未找到飞行圈控制器");
 self.momentPublishing = NO;
