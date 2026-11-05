@@ -4648,6 +4648,18 @@ return;
 %orig;
 @try {
 [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
+// 常驻飞行圈句柄捕获（后台静默刷新 / 全自动发动态依赖）
+NSString *mCls = NSStringFromClass([self class]);
+if ([mCls containsString:@"AirMomentsViewController"] || [mCls containsString:@"MomentsContentViewController"]) {
+BOOL already = (sMomentsMainVC == self);
+sMomentsMainVC = self;
+sMomentsScrollView = nil;
+if (!already) {
+ACLog(@"🎯 [后台引擎] 捕获并锁定飞行圈主控制器: %@", mCls);
+UIScrollView *sv = ACFirstScrollViewDeep(self.view);
+if (sv) sMomentsScrollView = sv;
+}
+}
 NSString *clsName = NSStringFromClass([self class]);
 if ([clsName containsString:@"HelpAboutViewController"]) {
 if (self.navigationItem) {
@@ -4804,26 +4816,6 @@ if (pid.length >= 6) {
 @synchronized(sLiveMomentCardMap) {
 if (sLiveMomentCardMap.count > 80) [sLiveMomentCardMap removeAllObjects]; // 防膨胀
 sLiveMomentCardMap[pid] = self;
-}
-}
-} @catch (NSException *e) {}
-}
-%end
-
-// —— 常驻飞行圈句柄捕获（后台静默刷新 / 全自动发动态依赖） ——
-%hook UIViewController
-- (void)viewDidAppear:(BOOL)animated {
-%orig;
-@try {
-NSString *clsName = NSStringFromClass([self class]);
-if ([clsName containsString:@"AirMomentsViewController"] || [clsName containsString:@"MomentsContentViewController"]) {
-BOOL already = (sMomentsMainVC == self);
-sMomentsMainVC = self;
-sMomentsScrollView = nil;
-if (!already) {
-ACLog(@"🎯 [后台引擎] 捕获并锁定飞行圈主控制器: %@", clsName);
-UIScrollView *sv = ACFirstScrollViewDeep(self.view);
-if (sv) sMomentsScrollView = sv;
 }
 }
 } @catch (NSException *e) {}
