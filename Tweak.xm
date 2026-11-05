@@ -82,6 +82,12 @@ static inline NSArray *ACFeedRecordsFromJSON(NSDictionary *json) {
     if (recs.count > 0) return recs;
     return ACSafeArray(json[@"rows"]);
 }
+// 探针实证：官方真实 X-Lts-Id 约 144 字符、含 [a]/[d] 混淆段、结尾并非 [s]；
+// 旧的 length>=140 且以 [s] 结尾判定把官方值全部丢弃，导致插件发出的请求 Lts=0 → 服务端 500
+static inline BOOL ACIsValidLtsId(NSString *v) {
+    if (![v isKindOfClass:[NSString class]]) return NO;
+    return (v.length >= 100);
+}
 // 递归清洗：去掉 NSNull 等不可 plist/JSON 序列化对象，避免 writeToFile / dataWithJSONObject 静默失败
 static inline id ACJSONSafeObject(id obj, NSInteger depth) {
 if (depth > 8 || !obj) return nil;
@@ -641,7 +647,7 @@ NSSet *allowed = [NSSet setWithObjects:@"token", @"x-userid", @"version", @"chan
 if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
 NSString *lk = k.lowercaseString;
 if (![allowed containsObject:lk]) return;
-if ([lk isEqualToString:@"x-lts-id"] && ((NSString *)v).length < 140) return;
+if ([lk isEqualToString:@"x-lts-id"] && !ACIsValidLtsId(v)) return;
 safeHeaders[lk] = v;
 }];
 [ud setObject:safeHeaders forKey:@"AC_Saved_HTTPHeaders"];
@@ -728,7 +734,7 @@ if (!([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] || [lk isEqualToString:@"x-lts-id"] ||
 [lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] || [lk isEqualToString:@"sign"] ||
 [lk isEqualToString:@"deviceid"] || [lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"])) return;
-if ([lk isEqualToString:@"x-lts-id"] && ((NSString *)v).length < 140) return;
+if ([lk isEqualToString:@"x-lts-id"] && !ACIsValidLtsId(v)) return;
 clean[lk] = v;
 }];
 [self.latestHTTPHeaders addEntriesFromDictionary:clean];
@@ -1135,44 +1141,34 @@ ACLog(@"[自动评论] 跳过 %@：token 未捕获", postId);
 return;
 }
 NSString *host = [self ac_activeBusinessHost];
-// 【关键修复】Query 带 postId（兼容 @RequestParam），content 留在 Body（中文需转义，不宜放 Query）
-NSString *path = [NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/comment/publish?postId=%@", host, postId];
-NSURL *url = [NSURL URLWithString:path];
+// 头部对齐官方点赞报文（同族接口）：纯 URL 无 Query，Header 仅官方 7 项
+NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/comment/publish", host]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
 req.timeoutInterval = 10.0;
-[req setValue:host forHTTPHeaderField:@"Host"];
-[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-[req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
-[req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
-[req setValue:@"application/json;charset=UTF-8" forHTTPHeaderField:@"Content-Type"];
-[req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
-[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
-// 【关键修复】只带基础鉴权头；绝不塞入发动态专用的 X-Lts-Id（加签绑定路径，跨接口使用会导致服务端 500）
+[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
 NSString *verVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
-if (verVal.length == 0) verVal = @"2.2.0";
+if (verVal.length == 0) verVal = @"2.1.9 (1102)";
 [req setValue:verVal forHTTPHeaderField:@"version"];
-[req setValue:verVal forHTTPHeaderField:@"appVersion"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, 4B77DFD1-5EFA-4610-B3B6-7136D60B2002 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
+// 官方同族接口均带 X-Lts-Id，取嗅探到的最新有效值
+NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+if (ltsId.length > 50) {
+[req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+}
 uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
 static uint64_t acReqSeq = 0;
 acReqSeq = (acReqSeq + 1) & 0x7F;
 [req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acReqSeq] forHTTPHeaderField:@"X-Request-No"];
-// 【关键修复】postId 兼容数值型 Long 与字符串两种反序列化
-unsigned long long numPostId = strtoull([postId UTF8String], NULL, 10);
-NSDictionary *cmtBody;
-if (numPostId > 0) {
-cmtBody = @{@"content": text ?: @"不错", @"postId": @(numPostId)};
-} else {
-cmtBody = @{@"content": text ?: @"不错", @"postId": postId ?: @""};
-}
+// postId 沿用官方报文的字符串形态
+NSDictionary *cmtBody = @{@"content": (text ?: @"不错"), @"postId": (postId ?: @"")};
 NSData *body = [NSJSONSerialization dataWithJSONObject:cmtBody options:0 error:nil];
 if (!body) { self.autoCommentSending = NO; return; }
 req.HTTPBody = body;
 [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
-ACLog(@"[自动评论] 发送 postId=%@ text=%@ (Query+Body双参, Long=%llu)", postId, text, numPostId);
+ACLog(@"[自动评论] 发送 postId=%@ text=%@ ltsLen=%lu", postId, text, (unsigned long)ltsId.length);
 acInternalRequest = YES;
 NSURLSession *acSession = ACDedicatedPluginSession();
 if (!acSession) { self.autoCommentSending = NO; acInternalRequest = NO; return; }
@@ -1270,44 +1266,37 @@ ACLog(@"[自动点赞] 跳过 %@：token 未捕获", postId);
 return;
 }
 NSString *host = [self ac_activeBusinessHost];
-// 【关键修复】URL Query 与 Body 双重带参，兼容后端 @RequestParam 与 @RequestBody 两种取参方式
-NSString *path = [NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/like/post?postId=%@&id=%@&likeStatus=1", host, postId, postId];
-NSURL *url = [NSURL URLWithString:path];
+// 像素级对齐官方原生点赞报文（探针实证）：纯 URL 无 Query，Header 仅官方 7 项
+NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/like/post", host]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
 req.timeoutInterval = 10.0;
-[req setValue:host forHTTPHeaderField:@"Host"];
-[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-[req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
-[req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
-[req setValue:@"application/json;charset=UTF-8" forHTTPHeaderField:@"Content-Type"];
-[req setValue:@"keep-alive" forHTTPHeaderField:@"Connection"];
-[req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
-// 【关键修复】只带基础鉴权头；绝不塞入发动态专用的 X-Lts-Id（其加签绑定接口路径，跨接口使用会导致服务端解签异常 500）
+[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
 NSString *verVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
-if (verVal.length == 0) verVal = @"2.2.0";
+if (verVal.length == 0) verVal = @"2.1.9 (1102)"; // 官方实测版本
 [req setValue:verVal forHTTPHeaderField:@"version"];
-[req setValue:verVal forHTTPHeaderField:@"appVersion"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
+[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, 4B77DFD1-5EFA-4610-B3B6-7136D60B2002 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
+// 官方点赞请求带 X-Lts-Id（探针实证），取嗅探到的最新有效值
+NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+if (ltsId.length > 50) {
+[req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+} else {
+ACLog(@"[自动点赞] 警告：尚未捕获到有效 X-Lts-Id，先手动点一次赞触发嗅探");
+}
+// X-Request-No 与官方同构 = (毫秒时间戳 << 7) | 0~127 序号（探针实测同 15 位格式）
 uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
 static uint64_t acLikeSeq = 0;
 acLikeSeq = (acLikeSeq + 1) & 0x7F;
 [req setValue:[NSString stringWithFormat:@"%015llu", (nowMs << 7) | acLikeSeq] forHTTPHeaderField:@"X-Request-No"];
-// 【关键修复】postId 兼容数值型 Long 与字符串两种反序列化
-unsigned long long numPostId = strtoull([postId UTF8String], NULL, 10);
-NSDictionary *bodyDict;
-if (numPostId > 0) {
-bodyDict = @{@"postId": @(numPostId), @"id": @(numPostId), @"likeStatus": @(1)};
-} else {
-bodyDict = @{@"postId": postId ?: @"", @"id": postId ?: @"", @"likeStatus": @(1)};
-}
+// 官方真实 Body：postId 为字符串，动作为 actionType="1"（旧字段 likeStatus/id 为臆造，服务端空指针 500）
+NSDictionary *bodyDict = @{@"postId": (postId ?: @""), @"actionType": @"1"};
 NSData *body = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
 if (!body) { self.isLikeSending = NO; return; }
 req.HTTPBody = body;
 [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)body.length] forHTTPHeaderField:@"Content-Length"];
-ACLog(@"[自动点赞] 发送 postId=%@ (Query+Body双参, Long=%llu)", postId, numPostId);
+ACLog(@"[自动点赞] 发送官方对齐包 postId=%@ ltsLen=%lu", postId, (unsigned long)ltsId.length);
 acInternalRequest = YES;
 NSURLSession *acSession = ACDedicatedPluginSession();
 if (!acSession) { self.isLikeSending = NO; acInternalRequest = NO; return; }
@@ -1771,6 +1760,8 @@ if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id"
 NSTimeInterval ltsAge = self.latestLtsAt > 0 ? [[NSDate date] timeIntervalSince1970] - self.latestLtsAt : -1;
 if (ltsId.length > 50) {
 [req setValue:ltsId forHTTPHeaderField:@"X-Lts-Id"];
+} else {
+ACLog(@"[发布] 警告：尚未捕获到有效 X-Lts-Id，先在飞行圈手动操作一次再定时发布");
 }
 // 修复：X-Request-No 与 App 原生一致 = (毫秒时间戳 << 7) | 0~127 序号，15 位数字
 uint64_t nowMs = (uint64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
@@ -4202,12 +4193,12 @@ mgr.lastPublishHeaders = [headers mutableCopy];
 if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
 NSString *lk = k.lowercaseString;
 if ([lk isEqualToString:@"x-lts-id"]) {
-// 修复：只接受 App 正常业务请求生成的 LtsId（约 150 字符且以 [s] 结尾），
-// COS SDK 等短格式会让服务端直接 500
-if (v.length >= 140 && [v hasSuffix:@"[s]"]) {
+// 探针实证：官方 LtsId 约 144 字符、结尾并非 [s]；旧 [s] 判定把官方值全部丢弃导致 Lts=0 → 500
+if (ACIsValidLtsId(v)) {
 mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
 mgr.latestHTTPHeaders[@"x-lts-id"] = v;
 mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
+ACLog(@"[嗅探] 锁定最新 X-Lts-Id 长度: %lu", (unsigned long)v.length);
 }
 return;
 }
@@ -4280,10 +4271,11 @@ ACLog(@"[抓包] 原生发布模板 Lts=%lu", (unsigned long)ACHeaderValue(heade
 if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
 NSString *lk = k.lowercaseString;
 if ([lk isEqualToString:@"x-lts-id"]) {
-if (v.length >= 140 && [v hasSuffix:@"[s]"]) {
+if (ACIsValidLtsId(v)) {
 mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
 mgr.latestHTTPHeaders[@"x-lts-id"] = v;
 mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
+ACLog(@"[嗅探] 锁定最新 X-Lts-Id 长度: %lu", (unsigned long)v.length);
 }
 return;
 }
@@ -4313,7 +4305,7 @@ BOOL stable = ([lowerField isEqualToString:@"token"] ||
 [lowerField isEqualToString:@"x-userid"] ||
 [lowerField isEqualToString:@"version"] ||
 [lowerField isEqualToString:@"channel"]);
-BOOL validLts = ([lowerField isEqualToString:@"x-lts-id"] && value.length >= 140 && [value hasSuffix:@"[s]"]);
+BOOL validLts = ([lowerField isEqualToString:@"x-lts-id"] && ACIsValidLtsId(value));
 if (stable || validLts) {
 [ACForwardHelperManager shared].latestHTTPHeaders[field] = value;
 [ACForwardHelperManager shared].latestHTTPHeaders[lowerField] = value;
@@ -4330,7 +4322,7 @@ if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
 if (acInternalRequest) return;
 if (![field isKindOfClass:[NSString class]] || ![value isKindOfClass:[NSString class]]) return;
 NSString *lf = field.lowercaseString;
-if ([lf isEqualToString:@"x-lts-id"] && value.length >= 140 && [value hasSuffix:@"[s]"]) {
+if ([lf isEqualToString:@"x-lts-id"] && ACIsValidLtsId(value)) {
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 mgr.latestHTTPHeaders[@"X-Lts-Id"] = value;
 mgr.latestHTTPHeaders[@"x-lts-id"] = value;
@@ -4344,7 +4336,7 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 [headers enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
 if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
 NSString *lk = k.lowercaseString;
-if ([lk isEqualToString:@"x-lts-id"] && v.length >= 140 && [v hasSuffix:@"[s]"]) {
+if ([lk isEqualToString:@"x-lts-id"] && ACIsValidLtsId(v)) {
 mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
 mgr.latestHTTPHeaders[@"x-lts-id"] = v;
 mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
