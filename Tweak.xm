@@ -1279,11 +1279,8 @@ ACLog(@"[自动评论] 解析信息流异常 %@: %@", e.name, e.reason);
 }
 }
 - (void)ac_enqueueAutoCommentForPostId:(NSString *)postId {
-if (postId.length < 5) return;
-if (!self.autoCommentQueue) self.autoCommentQueue = [NSMutableArray array];
-if ([self.autoCommentQueue containsObject:postId]) return;
-[self.autoCommentQueue addObject:postId];
-[self ac_pumpAutoCommentQueue];
+// 已停用后台盲评队列：自动评论只走「点进动态详情页 0.35 秒秒评」通道（viewDidAppear hook）
+return;
 }
 - (void)ac_pumpAutoCommentQueue {
 if (self.autoCommentSending) return;
