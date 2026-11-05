@@ -2292,13 +2292,42 @@ for (UIWindow *w2 in [UIApplication sharedApplication].windows) {
 if (w2.isKeyWindow) { win = w2; break; }
 }
 }
+// 自动切换 TabBar 到飞行圈（在任意页面触发发布都能正确弹出编辑页）
+@try {
+UIViewController *root = win.rootViewController;
+if ([root isKindOfClass:[UITabBarController class]]) {
+UITabBarController *tab = (UITabBarController *)root;
+for (NSUInteger i = 0; i < tab.viewControllers.count; i++) {
+UIViewController *c = tab.viewControllers[i];
+if ([NSStringFromClass([c class]) containsString:@"Moments"] ||
+[NSStringFromClass([c class]) containsString:@"Moment"]) {
+if (tab.selectedIndex != i) {
+tab.selectedIndex = i;
+ACLog(@"[原生发布] 自动切换 Tab 到飞行圈 (Index: %lu)", (unsigned long)i);
+}
+break;
+}
+}
+}
+} @catch (NSException *e) {}
 // 寻找飞行圈控制器（BFS 深度穿透 TabBar → NavigationController → 子控制器，飞行圈/个人主页双入口）
 UIViewController *momentsVC = sMomentsMainVC;
 if (!momentsVC) momentsVC = ACFindMomentsOrProfileController();
 if (!momentsVC) {
+// 刚切 Tab 视图可能未加载，0.5 秒后重试（最多 3 次）
+static NSInteger acPubFindRetry = 0;
+if (acPubFindRetry < 3) {
+acPubFindRetry++;
+ACLog(@"[原生发布] 飞行圈控制器未就绪，0.5 秒后重试 (%ld/3)", (long)acPubFindRetry);
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[self ac_runMomentPublishFlow:task keyWin:win completion:completion];
+});
+} else {
+acPubFindRetry = 0;
 ACLog(@"[原生发布] 错误：未找到飞行圈控制器");
 self.momentPublishing = NO;
 if (completion) completion(NO, @"未找到飞行圈");
+}
 return;
 }
 // 步骤 1：Swift 带冒号方法优先（运行时真实名为 publishButtonTapped:），无参与导航栏按钮兜底
