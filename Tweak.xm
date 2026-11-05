@@ -63,6 +63,19 @@ static inline BOOL ACIsBusinessHost(NSString *host) {
         [h containsString:@"cloudfront"] || [h containsString:@"aliyuncs"]) return NO;
     return [h containsString:@"airchat"];
 }
+// 兼容新老信息流接口的响应结构：data.records / records / data.list / data.rows
+static inline NSArray *ACFeedRecordsFromJSON(NSDictionary *json) {
+    NSDictionary *data = ACSafeDict(json[@"data"]);
+    NSArray *recs = ACSafeArray(data[@"records"]);
+    if (recs.count > 0) return recs;
+    recs = ACSafeArray(json[@"records"]);
+    if (recs.count > 0) return recs;
+    recs = ACSafeArray(data[@"list"]);
+    if (recs.count > 0) return recs;
+    recs = ACSafeArray(data[@"rows"]);
+    if (recs.count > 0) return recs;
+    return ACSafeArray(json[@"rows"]);
+}
 // 递归清洗：去掉 NSNull 等不可 plist/JSON 序列化对象，避免 writeToFile / dataWithJSONObject 静默失败
 static inline id ACJSONSafeObject(id obj, NSInteger depth) {
 if (depth > 8 || !obj) return nil;
@@ -415,6 +428,8 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 // —— 自动点赞后台巡检（独立会话） ——
 - (void)ac_startAutoLikePollTimer;
 - (void)ac_pollFeedForAutoLike;
+// —— 动态业务网关解析（升级后 .cc/.cn/.ltd 自适应） ——
+- (NSString *)ac_activeBusinessHost;
 // —— 后台静音保活 ——
 - (void)ac_applyKeepAliveState;
 @end
@@ -685,7 +700,9 @@ NSMutableDictionary *clean = [NSMutableDictionary dictionary];
 if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
 NSString *lk = k.lowercaseString;
 if (!([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
-[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] || [lk isEqualToString:@"x-lts-id"])) return;
+[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] || [lk isEqualToString:@"x-lts-id"] ||
+[lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] || [lk isEqualToString:@"sign"] ||
+[lk isEqualToString:@"deviceid"] || [lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"])) return;
 if ([lk isEqualToString:@"x-lts-id"] && ((NSString *)v).length < 140) return;
 clean[lk] = v;
 }];
@@ -1026,8 +1043,7 @@ if (weakSelf.autoMomentEnabled) [weakSelf onMomentTimerTick];
 - (void)ac_handleFeedResponse:(NSDictionary *)json {
 @try {
 if (!self.autoCommentEnabled) return;
-NSDictionary *data = ACSafeDict(json[@"data"]);
-NSArray *records = ACSafeArray(data[@"records"]);
+NSArray *records = ACFeedRecordsFromJSON(json);
 if (records.count == 0) return;
 NSDateFormatter *df = [[NSDateFormatter alloc] init];
 df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
@@ -1093,7 +1109,7 @@ self.autoCommentSending = NO;
 ACLog(@"[自动评论] 跳过 %@：token 未捕获", postId);
 return;
 }
-NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/interaction/comment/publish"];
+NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/comment/publish", [self ac_activeBusinessHost]]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
@@ -1104,7 +1120,10 @@ req.HTTPMethod = @"POST";
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
+NSString *verVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
+if (verVal.length == 0) verVal = @"2.2.0"; // 网关版本淘汰兜底；正常情况优先用嗅探到的实时版本
+[req setValue:verVal forHTTPHeaderField:@"version"];
+[req setValue:verVal forHTTPHeaderField:@"appVersion"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
@@ -1155,8 +1174,7 @@ ACLog(@"[自动评论] 异常 %@: %@", e.name, e.reason);
 - (void)ac_handleFeedResponseForAutoLike:(NSDictionary *)json {
 @try {
 if (!self.autoLikeEnabled) return;
-NSDictionary *data = ACSafeDict(json[@"data"]);
-NSArray *records = ACSafeArray(data[@"records"]);
+NSArray *records = ACFeedRecordsFromJSON(json);
 if (records.count == 0) return;
 if (self.autoLikeEnabledAt <= 0) self.autoLikeEnabledAt = [[NSDate date] timeIntervalSince1970];
 NSDateFormatter *df = [[NSDateFormatter alloc] init];
@@ -1215,7 +1233,7 @@ self.isLikeSending = NO;
 ACLog(@"[自动点赞] 跳过 %@：token 未捕获", postId);
 return;
 }
-NSURL *url = [NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/v2/post/interaction/like/post"];
+NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/interaction/like/post", [self ac_activeBusinessHost]]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
 req.HTTPMethod = @"POST";
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
@@ -1226,7 +1244,10 @@ req.HTTPMethod = @"POST";
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
+NSString *verVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
+if (verVal.length == 0) verVal = @"2.2.0"; // 网关版本淘汰兜底；正常情况优先用嗅探到的实时版本
+[req setValue:verVal forHTTPHeaderField:@"version"];
+[req setValue:verVal forHTTPHeaderField:@"appVersion"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
 if (ltsId.length == 0) ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
@@ -1292,8 +1313,9 @@ if (!self.autoLikeEnabled && !self.autoCommentEnabled) return;
 NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
 if (token.length == 0) return;
 self.autoLikePolling = YES;
+// 旧接口 /airchat/c/post/pageIds 升级后已废弃，切换为存活的动态分页接口（响应结构与 data.records 兼容）
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
-[NSURL URLWithString:@"https://apiv1.airchat.cc/airchat/c/post/pageIds?channelType=1&current=1&size=50"]];
+[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/page?current=1&size=20", [self ac_activeBusinessHost]]]];
 req.HTTPMethod = @"GET";
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
@@ -1670,8 +1692,8 @@ return;
 acInternalRequest = NO;
 self.momentPublishing = YES;
 self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-// 405 修复：固定业务网关 apiv1.airchat.cc，绝不跟随嗅探值/COS 域名，避免 POST 被重定向到对象存储
-NSString *acPubHost = @"apiv1.airchat.cc";
+// 405 修复：业务网关动态解析（嗅探到的存活域名优先，回落 .cn），绝不使用 COS/CDN 域名，避免 POST 被重定向到对象存储
+NSString *acPubHost = [self ac_activeBusinessHost];
 ACLog(@"[发布] 目标主机 %@（嗅探值：%@）", acPubHost, self.lastAirchatHost ?: @"无");
 NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/publish", acPubHost]];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
@@ -1689,7 +1711,10 @@ req.timeoutInterval = 15.0;
 [req setValue:kACNativeUserAgent forHTTPHeaderField:@"User-Agent"];
 [req setValue:token forHTTPHeaderField:@"token"];
 [req setValue:(self.selfUserId ?: @"") forHTTPHeaderField:@"x-userid"];
-[req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"version") ?: @"2.1.8 (1017)") forHTTPHeaderField:@"version"];
+NSString *pubVerVal = ACHeaderValue(self.latestHTTPHeaders, @"version");
+if (pubVerVal.length == 0) pubVerVal = @"2.2.0"; // 网关版本淘汰兜底；正常情况优先用嗅探到的实时版本
+[req setValue:pubVerVal forHTTPHeaderField:@"version"];
+[req setValue:pubVerVal forHTTPHeaderField:@"appVersion"];
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"channel") ?: @"ios, iPhone iOS 17.2.1, FAED9A3E-2D82-42C8-806D-9917EA95EB68 (iPhone16,2), zh, Asia/Shanghai") forHTTPHeaderField:@"channel"];
 // X-Lts-Id 优先取最近一次“原生发布动态”请求的模板；全局池只接受合法长格式
 NSString *ltsId = ACHeaderValue(self.lastPublishHeaders, @"X-Lts-Id");
@@ -2550,6 +2575,11 @@ if ([lk isEqualToString:@"content-length"] || [lk isEqualToString:@"host"] ||
 [req setValue:v forHTTPHeaderField:k];
 }];
 }
+// 动态解析当前可用的业务网关：优先用嗅探到的存活域名；升级后 .cc 可能被废弃，回落 .cn 主力网关
+- (NSString *)ac_activeBusinessHost {
+if (ACIsBusinessHost(self.lastAirchatHost)) return self.lastAirchatHost;
+return @"apiv1.airchat.cn";
+}
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
 if (!targetUserId || targetUserId.length == 0 || ACHeaderValue(self.latestHTTPHeaders, @"token").length == 0) {
 if (completion) completion();
@@ -2558,7 +2588,7 @@ return;
 @try {
 dispatch_group_t apiGroup = dispatch_group_create();
 dispatch_group_enter(apiGroup);
-NSMutableURLRequest *req1 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/userfriends/add"]];
+NSMutableURLRequest *req1 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/userfriends/add", [self ac_activeBusinessHost]]]];
 req1.HTTPMethod = @"POST";
 [self ac_applyCapturedHeadersToRequest:req1];
 [req1 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -2567,7 +2597,7 @@ req1.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"friendId": targetUse
 dispatch_group_leave(apiGroup);
 }] resume];
 dispatch_group_enter(apiGroup);
-NSMutableURLRequest *req2 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cc/client/biz/useronechat/add"]];
+NSMutableURLRequest *req2 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/useronechat/add", [self ac_activeBusinessHost]]]];
 req2.HTTPMethod = @"POST";
 [self ac_applyCapturedHeadersToRequest:req2];
 [req2 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -4127,7 +4157,10 @@ mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
 return;
 }
 if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
-[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"]) {
+[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
+[lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] ||
+[lk isEqualToString:@"sign"] || [lk isEqualToString:@"deviceid"] ||
+[lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"]) {
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
@@ -4153,7 +4186,8 @@ completionHandler(newData, response, error);
 return %orig(request, wrappedHandler);
 }
 }
-if ([urlStr containsString:@"/post/app/batchQueryPostInfo"] && completionHandler) {
+// 兼容新老两种信息流接口（老：batchQueryPostInfo；新：client/biz/v2 分页接口）
+if (([urlStr containsString:@"/post/app/batchQueryPostInfo"] || [urlStr containsString:@"/client/biz/v2/post/app/page"]) && completionHandler) {
 void (^origHandler)(NSData *, NSURLResponse *, NSError *) = [completionHandler copy];
 void (^feedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
 if (origHandler) origHandler(data, response, error);
@@ -4198,7 +4232,10 @@ mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
 return;
 }
 if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
-[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"]) {
+[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
+[lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] ||
+[lk isEqualToString:@"sign"] || [lk isEqualToString:@"deviceid"] ||
+[lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"]) {
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
@@ -4257,7 +4294,10 @@ mgr.latestHTTPHeaders[@"x-lts-id"] = v;
 mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
 }
 if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
-[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"]) {
+[lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
+[lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] ||
+[lk isEqualToString:@"sign"] || [lk isEqualToString:@"deviceid"] ||
+[lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"]) {
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
