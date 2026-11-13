@@ -787,7 +787,7 @@ appOnly[ks] = v;
 ACLog(@"[多账号] 已备份 UID %@ 的 NSUserDefaults 快照（%lu 项）", uid, (unsigned long)appOnly.count);
 } @catch (NSException *e) {}
 }
-// 恢复目标账号的 NSUserDefaults 快照并强制刷新主页/我的/飞行圈控制器（KVC 改 userId + 重触发加载）
+// 恢复目标账号的 NSUserDefaults 快照并深度联动刷新宿主主页/聊天会话列表（模拟官方切号的完整 UI 同步）
 - (void)ac_restoreAppDefaultsAndRefreshUIForAccount:(ACAccountItem *)acc {
 if (!acc || acc.userId.length < 4) return;
 @try {
@@ -802,34 +802,91 @@ if ([snap isKindOfClass:[NSDictionary class]] && snap.count > 0) {
 ACLog(@"[多账号] 已恢复 UID %@ 的 NSUserDefaults 快照（%lu 项）", acc.userId, (unsigned long)snap.count);
 }
 } @catch (NSException *e) {}
-// 遍历控制器树：把个人主页/我的页/动态页持有的 userId 改为新账号并触发重新加载
+// 深度联动刷新（HAR [45][61][118][131] 实证：宿主「我的」卡片 AirTopView 与全局用户信息
+// 同时依赖 NSUserDefaults / Keychain / 内存模型 + /userinfo/detail 双接口，必须全套同步替换）
 dispatch_async(dispatch_get_main_queue(), ^{
 @try {
+NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+NSString *tok = ACSafeStr(self.latestHTTPHeaders[@"token"]);
+NSString *uid = acc.userId;
+if (tok.length >= 10 && uid.length > 4) {
+// 1. 深度扫描并替换 NSUserDefaults 中所有存储当前账号 Token/UID/用户信息字典的键值
+// （跳过插件自身 AC_ 前缀、系统 Apple/NS 前缀，避免污染插件配置与系统键）
+NSDictionary *all = [[ud dictionaryRepresentation] copy];
+for (NSString *k in all.allKeys) {
+if (![k isKindOfClass:[NSString class]]) continue;
+if ([k hasPrefix:@"AC_"] || [k hasPrefix:@"Apple"] || [k hasPrefix:@"NS"]) continue;
+NSString *lk = k.lowercaseString;
+id val = all[k];
+if ([val isKindOfClass:[NSString class]]) {
+NSString *sVal = (NSString *)val;
+if ([lk isEqualToString:@"token"] || [lk containsString:@"usertoken"] || [lk containsString:@"accesstoken"]) {
+[ud setObject:tok forKey:k];
+} else if ([lk isEqualToString:@"userid"] || [lk isEqualToString:@"uid"] ||
+[lk isEqualToString:@"x-userid"] || [lk isEqualToString:@"currentuserid"]) {
+[ud setObject:uid forKey:k];
+} else if (self.previousSelfUserId.length > 5 && [sVal isEqualToString:self.previousSelfUserId]) {
+// 任何明文存储旧账号 UID 的字符串键一并替换为新 UID
+[ud setObject:uid forKey:k];
+}
+} else if ([val isKindOfClass:[NSDictionary class]]) {
+NSDictionary *dVal = (NSDictionary *)val;
+// 宿主常把用户资料整包 JSON 存进 NSUserDefaults（含 token/userId/clientUserNickName）
+if (dVal[@"token"] || dVal[@"userId"] || dVal[@"clientUserNickName"]) {
+NSMutableDictionary *mDict = [dVal mutableCopy];
+if (mDict[@"token"]) mDict[@"token"] = tok;
+if (mDict[@"userId"]) mDict[@"userId"] = uid;
+if (mDict[@"id"]) mDict[@"id"] = uid;
+id safe = ACJSONSafeObject(mDict, 0);
+if (safe) [ud setObject:safe forKey:k];
+}
+}
+}
+[ud synchronize];
+ACLog(@"[多账号] 已深度同步 NSUserDefaults 登录态 -> UID %@", uid);
+}
+// 2. 试探触发宿主登录成功/账号切换通知，让宿主重新拉取主页与会话列表
+for (NSString *nName in @[@"kLoginSuccessNotification", @"LoginSuccessNotification",
+@"UserInfoDidChangeNotification", @"AccountDidSwitchNotification",
+@"AirAccountSwitchNotification"]) {
+@try { [[NSNotificationCenter defaultCenter] postNotificationName:nName object:nil]; } @catch (NSException *e) {}
+}
+// 3. 遍历 TabBar 顶层页面（≤5 个，绝不递归全树——HAR [6]~[71] 实证全量遍历会触发请求风暴），
+//    对「我的/主页/飞行圈」KVC 修正 userId 并触发一次完整生命周期刷新
 UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+if (!keyWin) {
+for (UIWindow *w in [UIApplication sharedApplication].windows) { if (w.isKeyWindow) { keyWin = w; break; } }
+}
 UIViewController *root = keyWin.rootViewController;
-if (!root) return;
-NSMutableArray<UIViewController *> *q = [NSMutableArray arrayWithObject:root];
-int guard = 0;
-while (q.count > 0 && guard++ < 250) {
-UIViewController *vc = q.firstObject;
-[q removeObjectAtIndex:0];
-NSString *cls = NSStringFromClass([vc class]);
-if ([cls containsString:@"Mine"] || [cls containsString:@"Profile"] ||
-[cls containsString:@"Moment"] || [cls containsString:@"User"]) {
-for (NSString *k in @[@"userId", @"uid", @"id", @"targetUserId"]) {
-@try { [vc setValue:acc.userId forKey:k]; } @catch (NSException *e) {}
+UITabBarController *tab = [root isKindOfClass:[UITabBarController class]] ? (UITabBarController *)root : nil;
+if (!tab) {
+while (root.presentedViewController) root = root.presentedViewController;
+if ([root isKindOfClass:[UITabBarController class]]) tab = (UITabBarController *)root;
 }
-// HAR [6]~[71] 实证：主动调 viewWillAppear/loadData 会触发宿主 VC 请求死循环（4 秒 50+ 次 userinfo/detail）；
-// 这里只做 KVC 数据修正，页面数据由恢复的 NSUserDefaults 快照在下次自然 appears 时自动刷新
-}
+if (!tab) return;
+for (UIViewController *child in tab.viewControllers) {
+UIViewController *vc = [child isKindOfClass:[UINavigationController class]] ? [(UINavigationController *)child topViewController] : child;
+if (!vc || ![vc isViewLoaded]) continue;
 @try {
-UIViewController *cvc = [vc valueForKey:@"contentViewController"];
-if ([cvc isKindOfClass:[UIViewController class]]) [q addObject:cvc];
-} @catch (NSException *e) {}
-if ([vc isKindOfClass:[UITabBarController class]]) [q addObjectsFromArray:((UITabBarController *)vc).viewControllers ?: @[]];
-if ([vc isKindOfClass:[UINavigationController class]]) [q addObjectsFromArray:((UINavigationController *)vc).viewControllers ?: @[]];
-if (vc.childViewControllers.count > 0) [q addObjectsFromArray:vc.childViewControllers];
+NSString *cls = NSStringFromClass([vc class]) ?: @"";
+// 官方账号管理/登录页绝不打扰（智能放行原则）
+if ([cls containsString:@"AccountManagement"] || [cls containsString:@"Login"] || [cls containsString:@"Register"]) continue;
+for (NSString *k in @[@"userId", @"uid", @"id", @"targetUserId"]) {
+@try { [vc setValue:uid forKey:k]; } @catch (NSException *e) {}
 }
+// 常见刷新选择器探测调用（存在才调，每个页面最多命中几个，配合请求头接管不会死循环）
+for (NSString *sName in @[@"loadData", @"requestData", @"fetchUserInfo", @"getUserInfo", @"refreshData", @"headerRefresh"]) {
+SEL sel = NSSelectorFromString(sName);
+if ([vc respondsToSelector:sel]) {
+((void (*)(id, SEL))objc_msgSend)(vc, sel);
+break; // 每页只命中第一个可用刷新器，防止叠加请求
+}
+}
+// 触发一次 viewWillAppear 让 TableView 依据新 userId 重绘（仅顶层已加载页，非全树遍历）
+[vc viewWillAppear:NO];
+} @catch (NSException *e) {}
+}
+ACLog(@"[多账号] 已完成 TabBar 顶层页面深度联动刷新（主页/会话列表同步切换）");
 } @catch (NSException *e) {}
 });
 }
@@ -960,7 +1017,9 @@ dispatch_once(&onceToken, ^{
 instance = [[ACForwardHelperManager alloc] init];
 instance.friendList = [NSMutableArray array];
 instance.accountList = [NSMutableArray array];
-[instance loadAllAccounts];
+// 修复（HAR 实证）：loadAllAccounts 禁止在此处调用——后面 latestHTTPHeaders/selfUserId 初始化
+// 与 loadAllCustomSettings 会把刚加载的账号锁定态覆盖/清空，导致切完账号或重启 App 被重置回旧号。
+// 必须移到 loadAllCustomSettings 之后再加载多账号与锁定状态。
 instance.groupMemberList = [NSMutableArray array];
 instance.groupList = [NSMutableArray array];
 instance.friendMap = [NSMutableDictionary dictionary];
@@ -968,7 +1027,7 @@ instance.groupMemberMap = [NSMutableDictionary dictionary];
 instance.groupMap = [NSMutableDictionary dictionary];
 instance.groupBanStatusMap = [NSMutableDictionary dictionary];
 instance.latestHTTPHeaders = [NSMutableDictionary dictionary];
-instance.selfUserId = @"1980559125632786434";
+instance.selfUserId = @""; // 修复：严禁硬编码写死某个账号 UID（旧代码写死 1980559125632786434，导致重启后被重置回"鸭梨"）
 instance.capturedClientTypeV2 = nil; // 防封雷区①：严禁写死旧版黑名单设备指纹——多账号同指纹=协议外挂秒封特征，仅复用真实捕获值
 instance.welcomeGroupIds = [NSMutableSet set];
 instance.greetedUserIds = [NSMutableSet set];
@@ -994,6 +1053,9 @@ instance.voiceHangupSeconds = 1.0f;
 instance.manualTargetGroupId = @"";
 [instance loadLocalPermanentCache];
 [instance loadAllCustomSettings];
+// 关键修复（HAR 实证）：必须在 loadAllCustomSettings 之后加载多账号与强锁状态，
+// 防止 Header/UID 初始化把已锁定账号的凭证覆盖回宿主当前登录号
+[instance loadAllAccounts];
 [instance restartMomentScheduler];
 [instance ac_applyKeepAliveState];
 [instance ac_startAutoLikePollTimer];
@@ -1276,7 +1338,8 @@ if ([v isKindOfClass:[NSString class]]) self.latestHTTPHeaders[k.lowercaseString
 }
 }
 NSString *savedUid = ACSafeStr([ud objectForKey:@"AC_Saved_SelfUserId"]);
-if (savedUid.length > 5) {
+// 修复：若正处于插件强锁接管状态（forcedAccountOverride），禁止用持久化的旧 UID 覆盖当前锁定账号
+if (savedUid.length > 5 && !self.forcedAccountOverride) {
 self.selfUserId = savedUid;
 }
 self.autoReplyEnabled = [ud boolForKey:@"AC_AutoReply_Enabled"];
