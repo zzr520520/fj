@@ -188,6 +188,10 @@ return NO;
 static NSString *g_lastLoginAccount = nil;
 static NSString *g_lastLoginPassword = nil;
 static NSString * const kACNativeUserAgent = @"airchat/1102 CFNetwork/1490.0.4 Darwin/23.2.0";
+// 【HAR 222400】最近一次登录/续期接口签发的新鲜 Token + 时间戳：请求级修复（ACRewriteRequestWithAccountListToken）
+// 遇到携带该 Token 的请求时绝不降级为 accountList 旧凭证，防止官方刚重登的账号被陈旧 Token 反向覆盖
+static NSString *g_acFreshLoginToken = nil;
+static NSTimeInterval g_acFreshLoginAt = 0;
 
 // 根治 Alamofire RequestTaskMap SIGTRAP：
 // 插件自己的请求绝不能借用 App 的 Alamofire Session——那会让 Alamofire 的
@@ -1146,69 +1150,222 @@ return;
 performUIReload();
 });
 }
-// 将目标账号同步写入宿主 NSUserDefaults 的登录态键 + 官方「最多3个账号」槽位数组（突破官方限制的软方案）
+// 【HAR 222400】判断字符串是否为 JSON 序列化文本（HandyJSON 账号对象/官方切换器槽位都以 JSON 字符串形态存在 NSUserDefaults）
+static BOOL ACIsJSONSerializedString(NSString *str) {
+    if (str.length < 2) return NO;
+    NSString *t = [str stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return (([t hasPrefix:@"{"] && [t hasSuffix:@"}"]) || ([t hasPrefix:@"["] && [t hasSuffix:@"]"]));
+}
+
+// 【HAR 222400】递归深度替换任意 JSON 对象（字典/数组/JSON 字符串）中同 UID 账号的 Token 与槽位资料：
+// 官方切换器（AirAccountChangeViewController）的账号槽位是 HandyJSON 序列化后的 JSON 字符串（NSString）
+// 或 Swift Codable 的二进制（NSData），旧的浅层遍历（仅 NSDictionary/NSArray）根本碰不到里面
+// 已被顶下线的旧 Token → 官方切换器反序列化出来仍是旧 Token → 切换无效 + 重启 401。
+// UID 不匹配的其他账号条目原样保留；嵌套深度超过 12 层放弃防失控。
+static id ACDeepUpdateAccountObject(id obj, ACAccountItem *acc, BOOL *modified, NSInteger depth) {
+    if (depth > 12 || !obj || !acc) return obj;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)obj;
+        NSString *uid = nil;
+        for (NSString *k in @[@"userId", @"userid", @"uid", @"id"]) {
+            NSString *v = ACSafeStr(dict[k]);
+            if (v.length > 0 && ![v isEqualToString:@"null"]) { uid = v; break; }
+        }
+        BOOL hasRealToken = (ACSafeStr(dict[@"token"]).length >= 16 ||
+        ACSafeStr(dict[@"accessToken"]).length >= 16 ||
+        ACSafeStr(dict[@"userToken"]).length >= 16);
+        if (hasRealToken && (uid.length == 0 || [uid isEqualToString:acc.userId])) {
+            // 命中目标账号（或无 UID 的纯凭证对象）：替换为最新有效 Token
+            NSMutableDictionary *mDict = [dict mutableCopy];
+            if (mDict[@"token"]) mDict[@"token"] = acc.token;
+            if (mDict[@"accessToken"]) mDict[@"accessToken"] = acc.token;
+            if (mDict[@"userToken"]) mDict[@"userToken"] = acc.token;
+            if (uid.length > 0) {
+                if (mDict[@"userId"]) mDict[@"userId"] = acc.userId;
+                if (mDict[@"userid"]) mDict[@"userid"] = acc.userId;
+                if (mDict[@"uid"]) mDict[@"uid"] = acc.userId;
+                if (mDict[@"id"]) mDict[@"id"] = acc.userId;
+                if (acc.remark.length > 0) {
+                    if (mDict[@"nickName"]) mDict[@"nickName"] = acc.remark;
+                    if (mDict[@"nickname"]) mDict[@"nickname"] = acc.remark;
+                    if (mDict[@"clientUserNickName"]) mDict[@"clientUserNickName"] = acc.remark;
+                }
+                if (acc.account.length > 0 && mDict[@"account"]) mDict[@"account"] = acc.account;
+            }
+            if (modified) *modified = YES;
+            return mDict;
+        }
+        NSMutableDictionary *mDict = [dict mutableCopy];
+        for (NSString *k in dict) {
+            BOOL subMod = NO;
+            id newVal = ACDeepUpdateAccountObject(dict[k], acc, &subMod, depth + 1);
+            if (subMod && newVal) { mDict[k] = newVal; if (modified) *modified = YES; }
+        }
+        return mDict;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *arr = (NSArray *)obj;
+        // 官方「最多3个账号」切换槽位数组：元素可能是 NSDictionary，也可能是 HandyJSON 序列化的 JSON 字符串！
+        BOOL isAccountArray = NO;
+        BOOL hasTarget = NO;
+        for (id elem in arr) {
+            NSDictionary *d = nil;
+            if ([elem isKindOfClass:[NSDictionary class]]) {
+                d = (NSDictionary *)elem;
+            } else if ([elem isKindOfClass:[NSString class]] && ACIsJSONSerializedString((NSString *)elem)) {
+                NSData *jd = [(NSString *)elem dataUsingEncoding:NSUTF8StringEncoding];
+                d = jd ? ACSafeDict([NSJSONSerialization JSONObjectWithData:jd options:0 error:nil]) : nil;
+            }
+            if (d && (ACSafeStr(d[@"token"]).length >= 16 || ACSafeStr(d[@"accessToken"]).length >= 16)) {
+                isAccountArray = YES;
+                NSString *u = ACSafeStr(d[@"userId"] ?: d[@"userid"] ?: d[@"id"]);
+                if (u.length > 0 && [u isEqualToString:acc.userId]) hasTarget = YES;
+            }
+        }
+        NSMutableArray *mArr = [arr mutableCopy];
+        for (NSInteger i = 0; i < (NSInteger)mArr.count; i++) {
+            BOOL subMod = NO;
+            id newVal = ACDeepUpdateAccountObject(mArr[i], acc, &subMod, depth + 1);
+            if (subMod && newVal) { mArr[i] = newVal; if (modified) *modified = YES; }
+        }
+        if (isAccountArray && !hasTarget && mArr.count > 0) {
+            // 该账号不在官方槽位：用首个槽位做模板生成新条目并置顶（软突破官方 3 槽位限制）
+            id tpl = mArr.firstObject;
+            NSDictionary *tplDict = nil;
+            if ([tpl isKindOfClass:[NSDictionary class]]) {
+                tplDict = (NSDictionary *)tpl;
+            } else if ([tpl isKindOfClass:[NSString class]] && ACIsJSONSerializedString((NSString *)tpl)) {
+                NSData *jd = [(NSString *)tpl dataUsingEncoding:NSUTF8StringEncoding];
+                tplDict = jd ? ACSafeDict([NSJSONSerialization JSONObjectWithData:jd options:0 error:nil]) : nil;
+            }
+            if (tplDict.count > 0) {
+                NSMutableDictionary *newElem = [tplDict mutableCopy];
+                newElem[@"token"] = acc.token;
+                if (newElem[@"accessToken"]) newElem[@"accessToken"] = acc.token;
+                if (newElem[@"userId"]) newElem[@"userId"] = acc.userId;
+                if (newElem[@"userid"]) newElem[@"userid"] = acc.userId;
+                if (newElem[@"id"]) newElem[@"id"] = acc.userId;
+                if (acc.remark.length > 0) {
+                    if (newElem[@"nickName"]) newElem[@"nickName"] = acc.remark;
+                    if (newElem[@"nickname"]) newElem[@"nickname"] = acc.remark;
+                }
+                if (acc.account.length > 0 && newElem[@"account"]) newElem[@"account"] = acc.account;
+                id outElem = nil;
+                if ([tpl isKindOfClass:[NSString class]]) {
+                    NSData *outData = [NSJSONSerialization dataWithJSONObject:newElem options:0 error:nil];
+                    if (outData) outElem = [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding];
+                } else {
+                    outElem = newElem;
+                }
+                if (outElem) {
+                    if (mArr.count >= 3) [mArr removeLastObject];
+                    [mArr insertObject:outElem atIndex:0];
+                    if (modified) *modified = YES;
+                }
+            }
+        }
+        return (modified && *modified) ? (id)mArr : obj;
+    }
+    if ([obj isKindOfClass:[NSString class]] && ACIsJSONSerializedString((NSString *)obj)) {
+        NSData *jd = [(NSString *)obj dataUsingEncoding:NSUTF8StringEncoding];
+        id parsed = jd ? [NSJSONSerialization JSONObjectWithData:jd options:NSJSONReadingMutableContainers error:nil] : nil;
+        if (parsed) {
+            BOOL subMod = NO;
+            id updated = ACDeepUpdateAccountObject(parsed, acc, &subMod, depth + 1);
+            if (subMod && updated) {
+                NSData *outData = [NSJSONSerialization dataWithJSONObject:updated options:0 error:nil];
+                if (outData) {
+                    if (modified) *modified = YES;
+                    return [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding];
+                }
+            }
+        }
+    }
+    return obj;
+}
+
+// 将目标账号深度同步进宿主 NSUserDefaults：登录态键 + 官方「最多3个账号」槽位（NSDictionary/NSArray/JSON字符串/NSData 全覆盖）
 - (void)ac_syncAccountToHostUserDefaults:(ACAccountItem *)acc {
-if (!acc || acc.userId.length < 4 || acc.token.length < 10) return;
-@try {
-NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-NSDictionary *all = [[ud dictionaryRepresentation] copy];
-for (NSString *k in all.allKeys) {
-if (![k isKindOfClass:[NSString class]]) continue;
-if ([k hasPrefix:@"AC_"] || [k hasPrefix:@"Apple"] || [k hasPrefix:@"NS"]) continue;
-NSString *lk = k.lowercaseString;
-id val = all[k];
-if ([val isKindOfClass:[NSString class]]) {
-if ([lk isEqualToString:@"token"] || [lk containsString:@"usertoken"] ||
-[lk containsString:@"accesstoken"] || [lk containsString:@"authtoken"]) {
-[ud setObject:acc.token forKey:k];
-} else if ([lk isEqualToString:@"userid"] || [lk isEqualToString:@"uid"] ||
-[lk isEqualToString:@"x-userid"] || [lk isEqualToString:@"currentuserid"]) {
-[ud setObject:acc.userId forKey:k];
-}
-} else if ([val isKindOfClass:[NSDictionary class]]) {
-NSDictionary *dv = (NSDictionary *)val;
-if (dv[@"token"] || dv[@"userId"] || dv[@"clientUserNickName"] || dv[@"nickName"]) {
-NSMutableDictionary *md = [dv mutableCopy];
-if (md[@"token"]) md[@"token"] = acc.token;
-if (md[@"userId"]) md[@"userId"] = acc.userId;
-if (md[@"id"]) md[@"id"] = acc.userId;
-if (md[@"uid"]) md[@"uid"] = acc.userId;
-id safe = ACJSONSafeObject(md, 0);
-if (safe) [ud setObject:safe forKey:k];
-}
-} else if ([val isKindOfClass:[NSArray class]]) {
-// 官方「切换账号列表」槽位（HAR [17]~[28]：官方最多保留 3 个账号）——目标账号置顶替换
-NSArray *arr = (NSArray *)val;
-if (arr.count > 0 && [arr.firstObject isKindOfClass:[NSDictionary class]]) {
-NSDictionary *first = ACSafeDict(arr.firstObject);
-if (first[@"token"] || first[@"userId"] || first[@"nickName"] || first[@"account"]) {
-NSMutableDictionary *tpl = [first mutableCopy];
-tpl[@"token"] = acc.token;
-if (tpl[@"userId"]) tpl[@"userId"] = acc.userId;
-if (tpl[@"id"]) tpl[@"id"] = acc.userId;
-if (tpl[@"nickName"]) tpl[@"nickName"] = acc.remark ?: tpl[@"nickName"];
-if (tpl[@"nickname"]) tpl[@"nickname"] = acc.remark ?: tpl[@"nickname"];
-if (acc.account.length > 0 && tpl[@"account"]) tpl[@"account"] = acc.account;
-NSMutableArray *newArr = [NSMutableArray arrayWithObject:tpl];
-for (NSDictionary *old in arr) {
-if (![old isKindOfClass:[NSDictionary class]]) continue;
-NSString *oldUid = ACSafeStr(old[@"userId"] ?: old[@"id"]);
-if (oldUid.length > 0 && ![oldUid isEqualToString:acc.userId] && newArr.count < 3) [newArr addObject:old];
-}
-id safe = ACJSONSafeObject(newArr, 0);
-if (safe) [ud setObject:safe forKey:k];
-}
-}
-}
-}
-// 同步更新插件持久化的请求头模板，保证下次启动 Header 一致
-NSMutableDictionary *savedHeaders = [ACSafeDict([[NSUserDefaults standardUserDefaults] objectForKey:@"AC_Saved_HTTPHeaders"]) mutableCopy] ?: [NSMutableDictionary dictionary];
-savedHeaders[@"token"] = acc.token;
-savedHeaders[@"x-userid"] = acc.userId;
-[[NSUserDefaults standardUserDefaults] setObject:savedHeaders forKey:@"AC_Saved_HTTPHeaders"];
-[ud synchronize];
-ACLog(@"[多账号] 已同步宿主 NSUserDefaults 官方账号槽位 -> %@", acc.remark ?: acc.userId);
-} @catch (NSException *e) { ACLog(@"[多账号] 同步宿主槽位异常 %@", e.reason); }
+    if (!acc || acc.userId.length < 4 || acc.token.length < 10) return;
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSDictionary *all = [[ud dictionaryRepresentation] copy];
+        NSString *acUidLower = acc.userId.lowercaseString;
+        for (NSString *k in all.allKeys) {
+            if (![k isKindOfClass:[NSString class]]) continue;
+            if ([k hasPrefix:@"AC_"] || [k hasPrefix:@"AirChat_"] || [k hasPrefix:@"Apple"] || [k hasPrefix:@"NS"] || [k hasPrefix:@"WebKit"]) continue;
+            NSString *lk = k.lowercaseString;
+            id val = all[k];
+            if ([val isKindOfClass:[NSString class]]) {
+                NSString *strVal = (NSString *)val;
+                // 1. 单独存储的 token / userId 字符串键
+                if ([lk isEqualToString:@"token"] || [lk containsString:@"usertoken"] ||
+                [lk containsString:@"accesstoken"] || [lk containsString:@"authtoken"]) {
+                    [ud setObject:acc.token forKey:k];
+                    continue;
+                }
+                if ([lk isEqualToString:@"userid"] || [lk isEqualToString:@"uid"] ||
+                [lk isEqualToString:@"x-userid"] || [lk isEqualToString:@"currentuserid"]) {
+                    [ud setObject:acc.userId forKey:k];
+                    continue;
+                }
+                // 2. HandyJSON / JSON 序列化的账号对象或官方切换器槽位数组（含已被顶下线的旧 Token）
+                if (strVal.length < 200000) {
+                    NSString *acDesc = strVal.lowercaseString;
+                    if ([acDesc containsString:acUidLower] || [acDesc containsString:@"token"]) {
+                        BOOL mod = NO;
+                        id newVal = ACDeepUpdateAccountObject(strVal, acc, &mod, 0);
+                        if (mod && newVal) [ud setObject:newVal forKey:k];
+                    }
+                }
+            } else if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
+                // 3. NSDictionary / NSArray（官方槽位可能是字典数组）
+                NSString *acDesc = [[val description] lowercaseString];
+                if ([acDesc containsString:acUidLower] || [acDesc containsString:@"token"]) {
+                    BOOL mod = NO;
+                    id newVal = ACDeepUpdateAccountObject(val, acc, &mod, 0);
+                    if (mod && newVal) {
+                        id safe = ACJSONSafeObject(newVal, 0);
+                        if (safe) [ud setObject:safe forKey:k];
+                    }
+                }
+            } else if ([val isKindOfClass:[NSData class]]) {
+                // 4. NSData（Swift Codable / JSON Data / Plist Data）
+                NSData *dv = (NSData *)val;
+                if (dv.length <= 10 || dv.length >= 500000) continue;
+                id jsonObj = [NSJSONSerialization JSONObjectWithData:dv options:NSJSONReadingMutableContainers error:nil];
+                if (jsonObj) {
+                    NSString *acDesc = [[jsonObj description] lowercaseString];
+                    if (![acDesc containsString:acUidLower] && ![acDesc containsString:@"token"]) continue;
+                    BOOL mod = NO;
+                    id updated = ACDeepUpdateAccountObject(jsonObj, acc, &mod, 0);
+                    if (mod && updated) {
+                        NSData *outData = [NSJSONSerialization dataWithJSONObject:updated options:0 error:nil];
+                        if (outData) [ud setObject:outData forKey:k];
+                    }
+                } else {
+                    NSPropertyListFormat fmt = NSPropertyListBinaryFormat_v1_0;
+                    id plistObj = [NSPropertyListSerialization propertyListWithData:dv options:NSPropertyListMutableContainersAndLeaves format:&fmt error:nil];
+                    if (!plistObj) continue;
+                    NSString *acDesc = [[plistObj description] lowercaseString];
+                    if (![acDesc containsString:acUidLower] && ![acDesc containsString:@"token"]) continue;
+                    BOOL mod = NO;
+                    id updated = ACDeepUpdateAccountObject(plistObj, acc, &mod, 0);
+                    if (mod && updated) {
+                        NSData *outData = [NSPropertyListSerialization dataWithPropertyList:updated format:fmt options:0 error:nil];
+                        if (outData) [ud setObject:outData forKey:k];
+                    }
+                }
+            }
+        }
+        // 同步更新插件持久化的请求头模板，保证下次启动 Header 一致
+        NSMutableDictionary *savedHeaders = [ACSafeDict([[NSUserDefaults standardUserDefaults] objectForKey:@"AC_Saved_HTTPHeaders"]) mutableCopy] ?: [NSMutableDictionary dictionary];
+        savedHeaders[@"token"] = acc.token;
+        savedHeaders[@"x-userid"] = acc.userId;
+        [[NSUserDefaults standardUserDefaults] setObject:savedHeaders forKey:@"AC_Saved_HTTPHeaders"];
+        [ud synchronize];
+        ACLog(@"[多账号] 已深度同步宿主 NSUserDefaults（HandyJSON/NSData 旧 Token 全量替换）-> %@", acc.remark ?: acc.userId);
+    } @catch (NSException *e) { ACLog(@"[多账号] 同步宿主槽位异常 %@", e.reason); }
 }
 // 轻量全页刷新：TabBar 顶层页（≤5，不递归全树防请求风暴）KVC 修正 + 单一刷新选择器 + viewWillAppear 重绘
 - (void)ac_forceRefreshHostAppUI {
@@ -6411,9 +6568,120 @@ return mReq;
 return request;
 }
 }
+// 【HAR 222400】按 UID 从 accountList 查找最新有效 Token（32 位纯字母数字校验）
+static NSString *ACFindSavedTokenForUID(NSString *uid) {
+    if (uid.length == 0) return nil;
+    for (ACAccountItem *item in [ACForwardHelperManager shared].accountList) {
+        if ([ACSafeStr(item.userId) isEqualToString:uid] && ACIsValidAuthToken(item.token)) return item.token;
+    }
+    return nil;
+}
+
+// 【HAR 222400 核心修复】请求级身份/Token 修复（发送前最后一道防线）：
+// ① iOS 17 下 Alamofire 走私有子类 __NSURLSessionLocal（重写 dataTaskWithRequest: 不调 super），
+//    原有 %hook NSURLSession / %hook NSMutableURLRequest 对宿主请求完全失效（HAR [19] lts=0、[21] 旧 Token 直发）；
+// ② 宿主残留的已被顶下线旧 Token（v2boQZEV...）必须在发送前替换为 accountList 里该 UID 的新 Token
+//    （hpgxj8Znl...），服务端不再返回 401，从源头杜绝「401 伪装 200」引发的 Swift 强制解包 SIGTRAP 闪退。
+static NSURLRequest *ACRewriteRequestWithAccountListToken(NSURLRequest *request) {
+    if (!request || !request.URL || acInternalRequest) return request;
+    NSString *host = request.URL.host ?: @"";
+    if (![host containsString:@"airchat"]) return request;
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    NSDictionary *headers = request.allHTTPHeaderFields;
+    NSString *reqUid = ACHeaderValue(headers, @"x-userid");
+    NSString *reqTok = ACHeaderValue(headers, @"token");
+    BOOL acHotLocked = (sHotSwitchUserId.length > 3);
+    // 1. 嗅探 Alamofire 请求头：iOS 17 下这些头从未进过 NSMutableURLRequest 钩子（X-Lts-Id 一直捕获不到 → lts=0）
+    if (headers.count > 0) {
+        for (NSString *k in headers) {
+            if (![k isKindOfClass:[NSString class]]) continue;
+            id v = headers[k];
+            if (![v isKindOfClass:[NSString class]]) continue;
+            NSString *val = (NSString *)v;
+            NSString *lk = k.lowercaseString;
+            if ([lk isEqualToString:@"x-lts-id"] && ACIsValidLtsId(val)) {
+                if (!acHotLocked) {
+                    mgr.latestHTTPHeaders[@"X-Lts-Id"] = val;
+                    mgr.latestHTTPHeaders[@"x-lts-id"] = val;
+                    mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
+                }
+            } else if ([lk isEqualToString:@"user-agent"] && [val.lowercaseString containsString:@"airchat/"]) {
+                mgr.latestHTTPHeaders[@"User-Agent"] = val;
+                mgr.latestHTTPHeaders[@"user-agent"] = val;
+            } else if ([lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
+            [lk isEqualToString:@"x-request-no"] || [lk isEqualToString:@"accept-language"]) {
+                if (!acHotLocked) mgr.latestHTTPHeaders[k] = val;
+            }
+        }
+        if (reqUid.length > 5) ACNativeAuthStore()[@"x-userid"] = reqUid;
+        if (reqTok.length > 0) ACNativeAuthStore()[@"token"] = reqTok; // 宿主真实凭证入副本（供收割/保存面板取用）
+        if (ACIsValidAuthToken(reqTok) && !acHotLocked) mgr.latestHTTPHeaders[@"token"] = reqTok;
+        if (reqUid.length > 5 && !acHotLocked && ![ACSafeStr(mgr.selfUserId) isEqualToString:reqUid]) {
+            mgr.selfUserId = reqUid; // 无锁时跟随宿主当前真实登录身份（与原嗅探同规）
+        }
+    }
+    // 2. 官方账号管理/登录页出现新身份流量 = 用户正在官方切号：自动解除插件锁定
+    if (acHotLocked && reqUid.length > 5 && ![reqUid isEqualToString:sHotSwitchUserId] && ACIsInNativeAccountOrLoginScreen()) {
+        sHotSwitchUserId = nil;
+        mgr.forcedAccountOverride = NO;
+        acHotLocked = NO;
+        ACLog(@"[多账号] 检测到官方切号流量，已自动解除插件锁定");
+    }
+    // 3. 官方账号管理/登录页：绝不锁死请求，官方切换完全畅通
+    if (ACIsInNativeAccountOrLoginScreen()) return request;
+    NSString *urlStr = request.URL.absoluteString ?: @"";
+    if ([urlStr containsString:@"/auth/"] || [urlStr containsString:@"validateToken"]) return request;
+    // 4. 官方刚签发的新鲜 Token（10 分钟内）：绝不降级为 accountList 旧凭证，由收割流程自然回写
+    if (!acHotLocked && reqTok.length == 32 && [reqTok isEqualToString:g_acFreshLoginToken] &&
+    ([[NSDate date] timeIntervalSince1970] - g_acFreshLoginAt) < 600.0) {
+        return request;
+    }
+    // 5. 计算目标身份：热切锁 > accountList 匹配 UID 的最新 Token
+    NSString *targetUid = nil;
+    NSString *targetTok = nil;
+    if (acHotLocked) {
+        targetUid = sHotSwitchUserId;
+        NSString *lockedTok = ACHeaderValue(mgr.latestHTTPHeaders, @"token");
+        targetTok = ACIsValidAuthToken(lockedTok) ? lockedTok : ACFindSavedTokenForUID(targetUid);
+    } else if (reqUid.length > 5) {
+        NSString *savedForReq = ACFindSavedTokenForUID(reqUid);
+        if (savedForReq) {
+            targetUid = reqUid;   // 宿主带着该 UID 的旧/作废 Token 出请求，而 accountList 里有新 Token → 无条件修复
+            targetTok = savedForReq;
+        } else if (ACIsValidAuthToken(reqTok)) {
+            return request;       // 官方新登录的陌生账号（不在 accountList）：尊重官方身份，绝不降级
+        }
+    } else if (ACIsValidAuthToken(reqTok)) {
+        // 无 x-userid 但带 Token：仅当当前身份在 accountList 有新 Token 且请求 Token 不同才修复
+        NSString *curTok = ACFindSavedTokenForUID(ACSafeStr(mgr.selfUserId));
+        if (curTok && ![reqTok isEqualToString:curTok]) {
+            targetUid = mgr.selfUserId;
+            targetTok = curTok;
+        }
+    }
+    // 6. 计算是否需要改写（只修已有身份头的请求，绝不给匿名请求凭空注入身份）
+    if (targetUid.length > 5) {
+        BOOL needUid = (reqUid.length > 0 && ![reqUid isEqualToString:targetUid]) || (acHotLocked && reqUid.length == 0);
+        BOOL needTok = (ACIsValidAuthToken(targetTok) && reqTok.length > 0 && ![reqTok isEqualToString:targetTok]);
+        if (needUid || needTok) {
+            NSMutableURLRequest *mReq = [request mutableCopy];
+            if (reqUid.length > 0 || acHotLocked) [mReq setValue:targetUid forHTTPHeaderField:@"x-userid"];
+            if (needTok) {
+                [mReq setValue:targetTok forHTTPHeaderField:@"token"];
+                mgr.latestHTTPHeaders[@"token"] = targetTok;
+                mgr.latestHTTPHeaders[@"x-userid"] = targetUid;
+            }
+            if (![ACSafeStr(mgr.selfUserId) isEqualToString:targetUid]) mgr.selfUserId = targetUid;
+            ACLog(@"[多账号] 请求级 Token 修复 %@ -> UID %@", ACSafeStr(request.URL.path), targetUid);
+            return mReq;
+        }
+    }
+    return request;
+}
+
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-request = ACForceOverrideAccountRequest(request); // 多账号全局接管：实时替换旧账号 UID
+request = ACRewriteRequestWithAccountListToken(ACForceOverrideAccountRequest(request)); // 多账号全局接管 + accountList 旧 Token 修复
 // 拦截退出注销请求：不发真注销到服务端（防 Token 被销毁），本地伪造 200 让 App 登出流程正常走完
 // （URL 已被重写到 127.0.0.1:1，需同时匹配改写后标记路径，否则伪造逻辑不再命中）
 if ((ACIsLogoutRequest(request) || [request.URL.absoluteString containsString:@"__plugin_blocked__"]) && completionHandler) {
@@ -6549,7 +6817,7 @@ return %orig;
 // Alamofire 5 走的是 delegate 版本（无 completionHandler），
 // 在这里抓 Session 实例与最终请求头，发布时复用同一个 Session 即可自动带上会话级头
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-request = ACForceOverrideAccountRequest(request); // 多账号全局接管：实时替换旧账号 UID
+request = ACRewriteRequestWithAccountListToken(ACForceOverrideAccountRequest(request)); // 多账号全局接管 + accountList 旧 Token 修复
 if (!acInternalRequest && request && request.URL) {
 NSString *urlStr = request.URL.absoluteString ?: @"";
 // [57] 无 completionHandler 变体同样捕获 doLoginNoEn 明文账密
@@ -6783,17 +7051,11 @@ if ([lk isEqualToString:@"x-userid"] && v.length > 5 && !(acHotLocked && ![v isE
 + (id)JSONObjectWithData:(NSData *)data options:(NSJSONReadingOptions)opt error:(NSError * _Nullable *)error {
 id res = %orig;
 NSDictionary *dict = ACSafeDict(res);
-// 【HAR 205944 防退登护盾】服务器单点互斥顶号后，宿主 Swift 内存里的旧 Token 残余请求会收到
-// code==401「Token已被顶下线」，宿主全局 401 拦截器随即触发强制退出登录把用户踢回登录页！
-// 只要插件当前持有合法锁定 Token，就把这类 401 响应伪装成 code:200 空数据直接化解；
-// 插件自发的内部请求（直登/预检，acInternalRequest 标记期间）正常透传真实响应不受影响。
-if (dict && [ACSafeStr(dict[@"code"]) integerValue] == 401 && !acInternalRequest) {
-NSString *acShieldTok = ACHeaderValue([ACForwardHelperManager shared].latestHTTPHeaders, @"token");
-if (ACIsValidAuthToken(acShieldTok)) {
-ACLog(@"[防退登护盾] 已拦截宿主 401 响应(%@)，伪装 200 阻止全局强制退出登录", ACSafeStr(dict[@"msg"]));
-return @{@"code": @200, @"msg": @"操作成功", @"data": @{}};
-}
-}
+// 【HAR 222400 崩溃根因修复】此处的「401 伪装 200 护盾」已彻底删除：
+// 崩溃日志 airchat-2026-11-13-222356.ips 实证（EXC_BREAKPOINT/SIGTRAP 主线程）——被顶下线后宿主收到
+// 伪造的 code:200 + 空 data，Swift 网络回调对 data 强制解包/强制转换（as!/!）当场崩溃！
+// 401 响应必须原样透传给宿主自行处理；根治方案改为「发送前」把旧 Token 替换为 accountList
+// 里的有效新 Token（见 ACRewriteRequestWithAccountListToken），让 401 从源头不再发生。
 // 修复：只处理成功响应中的业务数据；0.5s 节流，避免全 App 每个 JSON 都触发解析+落盘
 if (dict && dict[@"code"] && dict[@"data"] && ![dict[@"data"] isKindOfClass:[NSNull class]]) {
 // 信息流响应结构 { data: { records: [ {id, userId, contentText, createTime...} ] } }
@@ -6817,7 +7079,38 @@ dispatch_async(dispatch_get_main_queue(), ^{
 id acDataField = dict[@"data"];
 if ([acDataField isKindOfClass:[NSString class]] && ACIsValidAuthToken((NSString *)acDataField)) {
 ACNativeAuthStore()[@"token"] = (NSString *)acDataField;
+g_acFreshLoginToken = [(NSString *)acDataField copy]; // 标记官方刚签发的新鲜 Token，请求级修复绝不降级
+g_acFreshLoginAt = [[NSDate date] timeIntervalSince1970];
 ACLog(@"[多账号] 已捕获登录接口返回的合法 32 位新 Token，等待 userinfo/detail 收割入库");
+}
+// 【HAR 222400】部分登录/刷新接口以字典形式返回 {token, userId}：立即回写 accountList 对应账号的 Token，
+// 保证请求级修复永远拿最新有效凭证；绝不篡改 401 响应结构（否则 Swift 强制解包 SIGTRAP）
+NSDictionary *acTokData = ACSafeDict(dict[@"data"]);
+if (acTokData) {
+NSString *acNewTok = ACSafeStr(acTokData[@"token"]);
+NSString *acNewUid = nil;
+for (NSString *acUk in @[@"userId", @"id", @"uid"]) {
+NSString *acUv = ACSafeStr(acTokData[acUk]);
+if (acUv.length >= 5 && ![acUv isEqualToString:@"null"]) { acNewUid = acUv; break; }
+}
+if (ACIsValidAuthToken(acNewTok) && acNewUid.length >= 5) {
+g_acFreshLoginToken = [acNewTok copy];
+g_acFreshLoginAt = [[NSDate date] timeIntervalSince1970];
+ACNativeAuthStore()[@"token"] = acNewTok;
+dispatch_async(dispatch_get_main_queue(), ^{
+ACForwardHelperManager *acMgrTok = [ACForwardHelperManager shared];
+for (ACAccountItem *acExist in acMgrTok.accountList) {
+if ([ACSafeStr(acExist.userId) isEqualToString:acNewUid]) {
+if (![acExist.token isEqualToString:acNewTok]) {
+acExist.token = [acNewTok copy];
+[acMgrTok saveAllAccounts];
+ACLog(@"[多账号] 登录接口刷新了账号 %@ 的 Token，accountList 已同步", acNewUid);
+}
+break;
+}
+}
+});
+}
 }
 // 全自动无感保存/更新当前登录账号（官方「账号管理」添加或切换新号后必经 /userinfo/detail，自动入库）
 // HAR [103] 串号修复：服务器严格按请求 token 返回该 token 归属账号的资料，
@@ -7325,7 +7618,33 @@ ACSwizzleIMP(c, @"addAdvancedMsgListener:", (IMP)ac_addAdvancedMsgListenerHook, 
 ACSwizzleIMP(c, @"addGroupListener:", (IMP)ac_addGroupListenerHook, &ac_orig_addGroupListener);
 }
 
+// 【HAR 222400】iOS 17（Darwin 23.2.0）下 Alamofire 实际使用私有子类 __NSURLSessionLocal，
+// 它重写了 dataTaskWithRequest: 且不调用父类实现，%hook NSURLSession 完全拦不到宿主请求；
+// 本 group 仅在运行时检测到该私有类时才 %init 注册（iOS 16 及以下自动跳过，绝不崩溃）。
+%group ACiOS17SessionHooks
+%hook __NSURLSessionLocal
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    request = ACRewriteRequestWithAccountListToken(ACForceOverrideAccountRequest(request));
+    return %orig(request);
+}
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    request = ACRewriteRequestWithAccountListToken(ACForceOverrideAccountRequest(request));
+    return %orig(request, completionHandler);
+}
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData {
+    request = ACRewriteRequestWithAccountListToken(ACForceOverrideAccountRequest(request));
+    return %orig(request, bodyData);
+}
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    request = ACRewriteRequestWithAccountListToken(ACForceOverrideAccountRequest(request));
+    return %orig(request, bodyData, completionHandler);
+}
+%end
+%end
+
 %ctor {
+// 【HAR 222400】仅当运行时存在私有子类 __NSURLSessionLocal（iOS 17+）才注册该组钩子，低版本安全跳过
+if (objc_getClass("__NSURLSessionLocal")) %init(ACiOS17SessionHooks);
 // 延迟到 App 完成基础初始化后再安装钩子/注册监听，失败则多次重试
 void (^install)(void) = ^{
 ACInstallTIMHooks();
