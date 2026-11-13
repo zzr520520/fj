@@ -7643,6 +7643,8 @@ ACSwizzleIMP(c, @"addGroupListener:", (IMP)ac_addGroupListenerHook, &ac_orig_add
 %end
 
 %ctor {
+// 文件内含 %group 时 Logos 要求所有组显式初始化：默认组（_ungrouped）+ iOS17 会话组
+%init();
 // 【HAR 222400】仅当运行时存在私有子类 __NSURLSessionLocal（iOS 17+）才注册该组钩子，低版本安全跳过
 if (objc_getClass("__NSURLSessionLocal")) %init(ACiOS17SessionHooks);
 // 延迟到 App 完成基础初始化后再安装钩子/注册监听，失败则多次重试
