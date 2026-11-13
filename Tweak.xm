@@ -4956,7 +4956,7 @@ NSString *pwd = alert.textFields[2].text;
 // 且 loadAllAccounts 过滤无 token 条目 → 重启后账号凭空消失，多账号功能整体死路）。
 // 热切换锁定期间 latestHTTPHeaders 是插件账号，「保存当前登录账号」改取原生会话凭证副本。
 NSString *curToken = nil, *curUid = nil, *curChannel = nil;
-if (sHotSwitchUserId.length > 3 && ACNativeAuthStore()[@"token"].length > 10) {
+if (sHotSwitchUserId.length > 3 && ACSafeStr(ACNativeAuthStore()[@"token"]).length > 10) {
 curToken = ACNativeAuthStore()[@"token"];
 curUid = ACNativeAuthStore()[@"x-userid"];
 curChannel = ACNativeAuthStore()[@"channel"];
