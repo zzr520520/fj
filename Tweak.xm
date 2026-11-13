@@ -114,7 +114,7 @@ return nil;
 }
 // 插件自身发出的请求（发布动态）不参与 Header 嗅探，避免自我污染
 static BOOL acInternalRequest = NO;
-static NSString * const kACNativeUserAgent = @"airchat/1017 CFNetwork/1490.0.4 Darwin/23.2.0";
+static NSString * const kACNativeUserAgent = @"airchat/1102 CFNetwork/1490.0.4 Darwin/23.2.0";
 
 // 根治 Alamofire RequestTaskMap SIGTRAP：
 // 插件自己的请求绝不能借用 App 的 Alamofire Session——那会让 Alamofire 的
@@ -929,7 +929,7 @@ if (self.capturedClientTypeV2) {
 }
 if (self.latestHTTPHeaders.count > 0) {
 NSMutableDictionary *safeHeaders = [NSMutableDictionary dictionary];
-NSSet *allowed = [NSSet setWithObjects:@"token", @"x-userid", @"version", @"channel", @"x-lts-id", nil];
+NSSet *allowed = [NSSet setWithObjects:@"token", @"x-userid", @"version", @"channel", @"x-lts-id", @"x-request-no", @"user-agent", @"accept-language", nil];
 [self.latestHTTPHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) {
 if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
 NSString *lk = k.lowercaseString;
@@ -1019,9 +1019,12 @@ if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) 
 NSString *lk = k.lowercaseString;
 if (!([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] || [lk isEqualToString:@"x-lts-id"] ||
+[lk isEqualToString:@"x-request-no"] || [lk isEqualToString:@"accept-language"] ||
+[lk isEqualToString:@"user-agent"] ||
 [lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] || [lk isEqualToString:@"sign"] ||
 [lk isEqualToString:@"deviceid"] || [lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"])) return;
 if ([lk isEqualToString:@"x-lts-id"] && !ACIsValidLtsId(v)) return;
+if ([lk isEqualToString:@"user-agent"] && ![v.lowercaseString containsString:@"airchat/"]) return;
 clean[lk] = v;
 }];
 [self.latestHTTPHeaders addEntriesFromDictionary:clean];
@@ -1720,30 +1723,42 @@ if (w.isKeyWindow) { keyWin = w; break; }
 UIViewController *root = keyWin.rootViewController;
 if (!root) return nil;
 NSMutableArray<UIViewController *> *queue = [NSMutableArray arrayWithObject:root];
+UIViewController *fallbackProfileVC = nil;
 int guardCount = 0;
-while (queue.count > 0 && guardCount++ < 200) {
+while (queue.count > 0 && guardCount++ < 300) {
 UIViewController *vc = queue.firstObject;
 [queue removeObjectAtIndex:0];
 if (!vc) continue;
 NSString *clsName = NSStringFromClass([vc class]);
-if ([clsName containsString:@"AirMomentsViewController"] ||
-[clsName containsString:@"AirUserProfileViewController"] ||
-[clsName containsString:@"AirUserMomentsViewController"] ||
-[clsName containsString:@"AirMineViewController"]) {
+// 优先返回外层飞行圈主控制器（持有导航栏与发动态按钮）；内层 MomentsContent 列表页没有发布按钮，禁止命中
+if ([clsName containsString:@"AirMomentsViewController"] && ![clsName containsString:@"Content"]) {
 @try { [vc loadViewIfNeeded]; } @catch (NSException *e) {}
 return vc;
 }
+if (!fallbackProfileVC && ([clsName containsString:@"AirUserProfileViewController"] ||
+[clsName containsString:@"AirUserMomentsViewController"] ||
+[clsName containsString:@"AirMineViewController"])) {
+fallbackProfileVC = vc;
+}
+// 关键：App 使用 RTRootNavigationController，真实控制器包在 RTContainerController.contentViewController 里
+@try {
+UIViewController *contentVC = [vc valueForKey:@"contentViewController"];
+if ([contentVC isKindOfClass:[UIViewController class]]) [queue addObject:contentVC];
+} @catch (NSException *e) {}
 if ([vc isKindOfClass:[UITabBarController class]]) {
-[queue addObjectsFromArray:((UITabBarController *)vc).viewControllers];
+[queue addObjectsFromArray:((UITabBarController *)vc).viewControllers ?: @[]];
 }
 if ([vc isKindOfClass:[UINavigationController class]]) {
-[queue addObjectsFromArray:((UINavigationController *)vc).viewControllers];
+[queue addObjectsFromArray:((UINavigationController *)vc).viewControllers ?: @[]];
 }
 if (vc.childViewControllers.count > 0) {
 [queue addObjectsFromArray:vc.childViewControllers];
 }
 }
-return nil;
+if (fallbackProfileVC) {
+@try { [fallbackProfileVC loadViewIfNeeded]; } @catch (NSException *e) {}
+}
+return fallbackProfileVC;
 }
 
 static void ACTriggerMomentsBackgroundRefresh(void) {
@@ -2567,8 +2582,118 @@ if (completion) completion(YES, self.lastMomentLog);
 });
 }
 
+// HTTP 静默直发动态：HAR 实证签名对 (X-Lts-Id + X-Request-No) 成对携带即可通过验签（不校验 URL/Body）
+// 报文结构严格还原 HAR 第[11]条实测成功样例 {"contentText":...,"contentType":1,"commentPermission":1}
+- (void)ac_publishMomentViaHTTP:(ACMomentTaskItem *)task
+allowWarmupTry:(BOOL)allowWarmupTry
+completion:(void(^)(BOOL ok, NSString *msg))completion {
+NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
+NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+NSString *reqNo = ACHeaderValue(self.latestHTTPHeaders, @"X-Request-No");
+if ((token.length == 0 || ltsId.length == 0 || reqNo.length == 0) && allowWarmupTry) {
+ACLog(@"[HTTP发布] 签名对未就绪 (token=%lu lts=%lu reqNo=%lu)，触发一次原生刷新热身...",
+(unsigned long)token.length, (unsigned long)ltsId.length, (unsigned long)reqNo.length);
+ACTriggerMomentsBackgroundRefresh();
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.85 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[self ac_publishMomentViaHTTP:task allowWarmupTry:NO completion:completion];
+});
+return;
+}
+NSString *host = [self ac_activeBusinessHost];
+NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/publish", host]];
+NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+req.HTTPMethod = @"POST";
+req.timeoutInterval = 15.0;
+[self ac_applyCapturedHeadersToRequest:req];
+[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+NSMutableDictionary *body = [NSMutableDictionary dictionary];
+body[@"contentText"] = task.contentText ?: @"";
+body[@"commentPermission"] = @(1);
+NSArray *mediaList = (task.capturedMediaList.count > 0) ? task.capturedMediaList : self.latestCapturedMomentMediaList;
+if (mediaList.count > 0) {
+body[@"contentType"] = @(2);
+body[@"mediaList"] = ACJSONSafeObject(mediaList, 0) ?: @[];
+} else {
+body[@"contentType"] = @(1);
+}
+NSData *bodyData = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+req.HTTPBody = bodyData;
+if (bodyData.length > 0) {
+[req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
+}
+NSURLSession *session = ACDedicatedPluginSession();
+if (!session) {
+self.momentPublishing = NO;
+if (completion) completion(NO, @"网络会话未初始化");
+return;
+}
+ACLog(@"[HTTP发布] POST /client/biz/v2/post/app/publish (ltsLen=%lu reqNo=%@)", (unsigned long)ltsId.length, reqNo);
+acInternalRequest = YES;
+NSURLSessionDataTask *dataTask = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+dispatch_async(dispatch_get_main_queue(), ^{
+if (error || data.length == 0) {
+ACLog(@"[HTTP发布] 网络错误: %@", error.localizedDescription ?: @"空响应");
+if (allowWarmupTry) {
+self.momentPublishing = YES;
+[self ac_runMomentPublishFlow:task keyWin:nil completion:completion];
+} else {
+self.momentPublishing = NO;
+NSString *errMsg = [NSString stringWithFormat:@"⚠️ 发布失败: %@", error.localizedDescription ?: @"空响应"];
+self.lastMomentLog = errMsg;
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, errMsg);
+}
+return;
+}
+NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
+NSString *srvMsg = ACSafeStr(json[@"msg"]);
+ACLog(@"[HTTP发布] 响应 code=%ld msg=%@ data=%@", (long)code, srvMsg, json[@"data"]);
+if (code == 200) {
+task.sentCount++;
+NSDateFormatter *df = [[NSDateFormatter alloc] init];
+df.dateFormat = @"HH:mm:ss";
+task.lastSentTimeStr = [df stringFromDate:[NSDate date]];
+self.lastMomentLog = [NSString stringWithFormat:@"✅ 动态发布成功 (%@) | 累计%ld次", task.lastSentTimeStr, (long)task.sentCount];
+ACLog(@"%@", self.lastMomentLog);
+[self saveAllCustomSettings];
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+self.momentPublishing = NO;
+if (completion) completion(YES, self.lastMomentLog);
+return;
+}
+// 服务端 5 分钟频控（HAR 第[61]条：发布过于频繁，请5分钟后再次尝试。#SVIP）
+if ([srvMsg containsString:@"频繁"] || [srvMsg containsString:@"分钟"]) {
+NSInteger waitMins = ACParseRetryMinutes(srvMsg);
+self.lastMomentLog = [NSString stringWithFormat:@"⏳ 服务端限频：%@（%ld 分钟后自动重试）", srvMsg, (long)waitMins];
+ACLog(@"%@", self.lastMomentLog);
+self.momentPublishing = NO;
+[self ac_scheduleMomentRetryAfter:(waitMins * 60.0 + 5.0)];
+[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+if (completion) completion(NO, self.lastMomentLog);
+return;
+}
+// 签名对可能过期（500 请求失败）且允许热身：刷新飞行圈拿最新配对签名重试一次
+if (allowWarmupTry) {
+ACLog(@"[HTTP发布] 首发未通过(%@)，刷新签名对后重试一次...", srvMsg);
+ACTriggerMomentsBackgroundRefresh();
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[self ac_publishMomentViaHTTP:task allowWarmupTry:NO completion:completion];
+});
+return;
+}
+// 终极兜底：原生 UI 全自动链（发动态→下一步→确认发布）
+ACLog(@"[HTTP发布] 直发未通过(%@)，启动原生 UI 引擎兜底...", srvMsg);
+self.momentPublishing = YES;
+[self ac_runMomentPublishFlow:task keyWin:nil completion:completion];
+});
+}];
+acInternalRequest = NO;
+[dataTask resume];
+}
+
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
-ACLog(@"[原生发布] 启动全自动发动态流程: %@", task.contentText ?: @"");
+ACLog(@"[发布] 启动发动态流程（HTTP签名对直发优先，原生UI兜底）: %@", task.contentText ?: @"");
 if (!task || task.contentText.length == 0) {
 self.momentPublishing = NO;
 if (completion) completion(NO, @"文案为空");
@@ -2586,33 +2711,7 @@ return;
 }
 self.momentPublishing = YES;
 self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-__weak typeof(self) w = self;
-dispatch_async(dispatch_get_main_queue(), ^{
-UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
-if (@available(iOS 13.0, *)) {
-if (!keyWin) {
-@try {
-for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-if ([sc isKindOfClass:[UIWindowScene class]] && sc.activationState == UISceneActivationStateForegroundActive) {
-keyWin = ((UIWindowScene *)sc).keyWindow;
-if (keyWin) break;
-}
-}
-} @catch (NSException *e) {}
-}
-}
-// 遮挡处理：顶层是插件助手面板时先收起，避免模态冲突导致 App 无法继续 present
-UIViewController *top = keyWin.rootViewController;
-while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
-if (top && [NSStringFromClass([top class]) containsString:@"ACForwardAssistantVC"]) {
-ACLog(@"[原生发布] 检测到助手面板遮挡，先收起面板再发布");
-[top dismissViewControllerAnimated:NO completion:^{
-[w ac_runMomentPublishFlow:task keyWin:keyWin completion:completion];
-}];
-return;
-}
-[w ac_runMomentPublishFlow:task keyWin:keyWin completion:completion];
-});
+[self ac_publishMomentViaHTTP:task allowWarmupTry:YES completion:completion];
 }
 
 // （旧版 HTTP 直发入口已删除，由上方原生全自动引擎接管）
@@ -3338,6 +3437,25 @@ if ([lk isEqualToString:@"content-length"] || [lk isEqualToString:@"host"] ||
 }];
 // 强制使用当前 URL 的 host 作为 Host 头，杜绝被污染的 Host 头把 POST 分流到对象存储返回 405
 if (req.URL.host) [req setValue:req.URL.host forHTTPHeaderField:@"Host"];
+// 真实 UA 优先（HAR 实证 airchat/1102 ...），避免写死旧版 1017 与 version 头冲突被网关淘汰
+NSString *realUA = ACHeaderValue(self.latestHTTPHeaders, @"User-Agent");
+if (realUA.length == 0 || ![realUA.lowercaseString containsString:@"airchat/"]) realUA = kACNativeUserAgent;
+[req setValue:realUA forHTTPHeaderField:@"User-Agent"];
+[req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+[req setValue:@"zh-CN,zh-Hans;q=0.9" forHTTPHeaderField:@"Accept-Language"];
+// 签名对必须成对出现：X-Lts-Id + X-Request-No（HAR 实证漏任意一个服务端验签直接 code:500）
+NSString *acToken = ACHeaderValue(self.latestHTTPHeaders, @"token");
+NSString *acUid = ACHeaderValue(self.latestHTTPHeaders, @"x-userid") ?: self.selfUserId;
+NSString *acVer = ACHeaderValue(self.latestHTTPHeaders, @"version");
+NSString *acChannel = ACHeaderValue(self.latestHTTPHeaders, @"channel");
+NSString *acReqNo = ACHeaderValue(self.latestHTTPHeaders, @"X-Request-No");
+NSString *acLtsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+if (acToken.length > 0) [req setValue:acToken forHTTPHeaderField:@"token"];
+if (acUid.length > 0) [req setValue:acUid forHTTPHeaderField:@"x-userid"];
+if (acVer.length > 0) [req setValue:acVer forHTTPHeaderField:@"version"];
+if (acChannel.length > 0) [req setValue:acChannel forHTTPHeaderField:@"channel"];
+if (acReqNo.length > 0) [req setValue:acReqNo forHTTPHeaderField:@"X-Request-No"];
+if (acLtsId.length > 0) [req setValue:acLtsId forHTTPHeaderField:@"X-Lts-Id"];
 }
 // 动态解析当前可用的业务网关：嗅探域名需通过严格白名单；.cc 部分节点已被切给静态存储，强制走 .cn
 - (NSString *)ac_activeBusinessHost {
@@ -5155,7 +5273,9 @@ if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
 [lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] ||
 [lk isEqualToString:@"sign"] || [lk isEqualToString:@"deviceid"] ||
-[lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"]) {
+[lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"] ||
+[lk isEqualToString:@"x-request-no"] || [lk isEqualToString:@"accept-language"] ||
+([lk isEqualToString:@"user-agent"] && [v.lowercaseString containsString:@"airchat/"])) {
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
@@ -5232,7 +5352,9 @@ if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
 [lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] ||
 [lk isEqualToString:@"sign"] || [lk isEqualToString:@"deviceid"] ||
-[lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"]) {
+[lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"] ||
+[lk isEqualToString:@"x-request-no"] || [lk isEqualToString:@"accept-language"] ||
+([lk isEqualToString:@"user-agent"] && [v.lowercaseString containsString:@"airchat/"])) {
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
@@ -5253,7 +5375,9 @@ NSString *lowerField = field.lowercaseString;
 BOOL stable = ([lowerField isEqualToString:@"token"] ||
 [lowerField isEqualToString:@"x-userid"] ||
 [lowerField isEqualToString:@"version"] ||
-[lowerField isEqualToString:@"channel"]);
+[lowerField isEqualToString:@"channel"] ||
+[lowerField isEqualToString:@"x-request-no"] ||
+([lowerField isEqualToString:@"user-agent"] && [value.lowercaseString containsString:@"airchat/"]));
 BOOL validLts = ([lowerField isEqualToString:@"x-lts-id"] && ACIsValidLtsId(value));
 if (stable || validLts) {
 [ACForwardHelperManager shared].latestHTTPHeaders[field] = value;
@@ -5277,6 +5401,12 @@ mgr.latestHTTPHeaders[@"X-Lts-Id"] = value;
 mgr.latestHTTPHeaders[@"x-lts-id"] = value;
 mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
 }
+if (([lf isEqualToString:@"x-request-no"] ||
+([lf isEqualToString:@"user-agent"] && [value.lowercaseString containsString:@"airchat/"]))) {
+ACForwardHelperManager *mgr2 = [ACForwardHelperManager shared];
+mgr2.latestHTTPHeaders[field] = value;
+mgr2.latestHTTPHeaders[lf] = value;
+}
 }
 - (void)setAllHTTPHeaderFields:(NSDictionary<NSString *,NSString *> *)headers {
 %orig;
@@ -5294,7 +5424,9 @@ if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
 [lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] ||
 [lk isEqualToString:@"sign"] || [lk isEqualToString:@"deviceid"] ||
-[lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"]) {
+[lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"] ||
+[lk isEqualToString:@"x-request-no"] || [lk isEqualToString:@"accept-language"] ||
+([lk isEqualToString:@"user-agent"] && [v.lowercaseString containsString:@"airchat/"])) {
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
@@ -5426,7 +5558,9 @@ return;
 [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
 // 常驻飞行圈句柄捕获（后台静默刷新 / 全自动发动态依赖）
 NSString *mCls = NSStringFromClass([self class]);
-if ([mCls containsString:@"AirMomentsViewController"] || [mCls containsString:@"MomentsContentViewController"]) {
+// HAR+逆向实证：飞行圈是 JXPagingView 分页容器，外层 AirMomentsViewController 才持有发布按钮；
+// 内层 AirMomentsContentViewController 不含 "AirMomentsViewController" 子串，条件天然互斥，避免覆盖句柄
+if ([mCls containsString:@"AirMomentsViewController"] && ![mCls containsString:@"Content"]) {
 BOOL already = (sMomentsMainVC == self);
 sMomentsMainVC = self;
 sMomentsScrollView = nil;
