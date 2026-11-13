@@ -114,6 +114,16 @@ return nil;
 }
 // 插件自身发出的请求（发布动态）不参与 Header 嗅探，避免自我污染
 static BOOL acInternalRequest = NO;
+// 多账号热切换锁定：切换后禁止原生流量嗅探把 token/x-userid/channel 冲回 App 当前登录账号，
+// 否则插件身份几秒内就被还原，多账号秒切形同虚设
+static NSString *sHotSwitchUserId = nil;
+// 原生会话凭证副本：热切换锁定期间仍持续记录 App 当前真实登录态，供「保存当前登录账号」面板取用
+static NSMutableDictionary *ACNativeAuthStore(void) {
+static NSMutableDictionary *sStore = nil;
+static dispatch_once_t once;
+dispatch_once(&once, ^{ sStore = [NSMutableDictionary dictionary]; });
+return sStore;
+}
 static NSString * const kACNativeUserAgent = @"airchat/1102 CFNetwork/1490.0.4 Darwin/23.2.0";
 
 // 根治 Alamofire RequestTaskMap SIGTRAP：
@@ -625,6 +635,8 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 // —— 后台静音保活 ——
 - (void)ac_applyKeepAliveState;
 @end
+// 前置声明：账号切换后触发飞行圈后台刷新，重新嗅探新会话的签名对（X-Lts-Id + X-Request-No）
+static void ACTriggerMomentsBackgroundRefresh(void);
 @implementation ACForwardHelperManager
 
 #pragma mark - 多账号管理（保存/快速切换）
@@ -667,6 +679,14 @@ self.latestHTTPHeaders[@"x-userid"] = targetAccount.userId;
 if (targetAccount.channel.length > 0) {
 self.latestHTTPHeaders[@"channel"] = targetAccount.channel;
 }
+// 关键修复：签名对与登录会话强绑定（HAR 实证 X-Lts-Id 与 X-Request-No 成对验签），
+// 切换账号必须丢弃旧会话的签名对，否则新 token + 旧签名对 → 服务端 code:500「请求失败」
+[self.latestHTTPHeaders removeObjectForKey:@"X-Lts-Id"];
+[self.latestHTTPHeaders removeObjectForKey:@"x-lts-id"];
+[self.latestHTTPHeaders removeObjectForKey:@"X-Request-No"];
+[self.latestHTTPHeaders removeObjectForKey:@"x-request-no"];
+sHotSwitchUserId = targetAccount.userId; // 锁定插件身份，防止原生嗅探冲回 App 登录账号
+ACTriggerMomentsBackgroundRefresh(); // 触发一次原生流量，重新嗅探当前会话的签名对
 // 2. 清空旧账号的缓存数据，防止串号
 [self.friendList removeAllObjects];
 [self.friendMap removeAllObjects];
@@ -696,6 +716,13 @@ self.latestHTTPHeaders[@"token"] = item.token;
 self.latestHTTPHeaders[@"Token"] = item.token;
 self.latestHTTPHeaders[@"x-userid"] = item.userId;
 if (item.channel.length > 0) self.latestHTTPHeaders[@"channel"] = item.channel;
+// 关键修复：丢弃旧会话签名对（成对验签绑定会话），并触发原生流量重新嗅探
+[self.latestHTTPHeaders removeObjectForKey:@"X-Lts-Id"];
+[self.latestHTTPHeaders removeObjectForKey:@"x-lts-id"];
+[self.latestHTTPHeaders removeObjectForKey:@"X-Request-No"];
+[self.latestHTTPHeaders removeObjectForKey:@"x-request-no"];
+sHotSwitchUserId = item.userId; // 锁定插件身份，防止原生嗅探冲回 App 登录账号
+ACTriggerMomentsBackgroundRefresh();
 [self.friendList removeAllObjects];
 [self.friendMap removeAllObjects];
 [self.groupMemberList removeAllObjects];
@@ -4770,9 +4797,9 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 7) {
 if (indexPath.row == 0) {
-cell.textLabel.text = @"➕ 添加切换账号（账号+密码）";
+cell.textLabel.text = @"💾 保存当前登录账号";
 cell.textLabel.textColor = [UIColor systemBlueColor];
-cell.detailTextLabel.text = @"输入账号/手机号 + 密码 + 备注，保存后一键免验证码切换";
+cell.detailTextLabel.text = @"先用目标账号登录 App，再点此缓存凭证，之后一键免验证码秒切";
 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 return cell;
 }
@@ -4906,42 +4933,60 @@ ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 NSInteger idx = self.ac_selectedTabIndex;
 if (idx == 7) {
 if (indexPath.row == 0) {
-UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"➕ 添加切换账号"
-message:@"输入账号密码保存，后续点击即可免验证码快速切换"
+UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"💾 保存当前登录账号"
+message:@"自动缓存当前会话凭证用于免验证码秒切。请先用目标账号登录 App，再回来点此保存。"
 preferredStyle:UIAlertControllerStyleAlert];
 [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
 tf.placeholder = @"备注名称（如：大号-客服01）";
 }];
 [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-tf.placeholder = @"账号 / 手机号";
+tf.placeholder = @"账号 / 手机号（选填，仅备注用）";
 tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
 }];
 [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-tf.placeholder = @"登录密码";
+tf.placeholder = @"登录密码（选填，仅备注用）";
 tf.secureTextEntry = YES;
 }];
 [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-[alert addAction:[UIAlertAction actionWithTitle:@"保存并登录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+[alert addAction:[UIAlertAction actionWithTitle:@"保存凭证" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
 NSString *remark = alert.textFields[0].text;
 NSString *account = [alert.textFields[1].text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 NSString *pwd = alert.textFields[2].text;
-if (account.length == 0 || pwd.length == 0) {
+// 核心修复：保存时必须缓存当前会话凭证（旧版从不写入 token，导致切换永远报“暂无缓存凭证”，
+// 且 loadAllAccounts 过滤无 token 条目 → 重启后账号凭空消失，多账号功能整体死路）。
+// 热切换锁定期间 latestHTTPHeaders 是插件账号，「保存当前登录账号」改取原生会话凭证副本。
+NSString *curToken = nil, *curUid = nil, *curChannel = nil;
+if (sHotSwitchUserId.length > 3 && ACNativeAuthStore()[@"token"].length > 10) {
+curToken = ACNativeAuthStore()[@"token"];
+curUid = ACNativeAuthStore()[@"x-userid"];
+curChannel = ACNativeAuthStore()[@"channel"];
+} else {
+curToken = ACHeaderValue(mgr.latestHTTPHeaders, @"token");
+curUid = mgr.selfUserId.length > 3 ? mgr.selfUserId : ACHeaderValue(mgr.latestHTTPHeaders, @"x-userid");
+curChannel = ACHeaderValue(mgr.latestHTTPHeaders, @"channel");
+}
+if (curToken.length <= 10) {
 self.statusLabel.textColor = [UIColor systemRedColor];
-self.statusLabel.text = @"❌ 账号或密码为空";
+self.statusLabel.text = @"❌ 未捕获登录凭证：请先用目标账号登录 App 并刷一页飞行圈";
 return;
 }
 ACAccountItem *newItem = [[ACAccountItem alloc] init];
-newItem.remark = remark.length > 0 ? remark : account;
+newItem.remark = remark.length > 0 ? remark : (account.length > 0 ? account : (curUid.length > 0 ? curUid : @"我的账号"));
 newItem.account = account;
 newItem.password = pwd;
+newItem.token = curToken;
+newItem.userId = curUid ?: @"";
+if (curChannel.length > 0) newItem.channel = curChannel;
 NSDateFormatter *df = [[NSDateFormatter alloc] init];
 df.dateFormat = @"MM-dd HH:mm";
 newItem.saveTime = [df stringFromDate:[NSDate date]];
-// 同账号已存在则更新，避免重复堆积
+// 同一账号（按 userId 优先、账号名兜底）已存在则更新凭证，避免重复堆积
 BOOL replaced = NO;
 for (NSUInteger i2 = 0; i2 < mgr.accountList.count; i2++) {
 ACAccountItem *old = mgr.accountList[i2];
-if ([old.account isEqualToString:newItem.account]) {
+BOOL sameAcc = (newItem.userId.length > 3 && [old.userId isEqualToString:newItem.userId]) ||
+(newItem.userId.length == 0 && account.length > 0 && [old.account isEqualToString:account]);
+if (sameAcc) {
 [mgr.accountList replaceObjectAtIndex:i2 withObject:newItem];
 replaced = YES;
 break;
@@ -4950,9 +4995,8 @@ break;
 if (!replaced) [mgr.accountList insertObject:newItem atIndex:0];
 [mgr saveAllAccounts];
 [self.tableView reloadData];
-// 保存后立即尝试登录切换
-self.statusLabel.textColor = [UIColor systemBlueColor];
-self.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在登录【%@】...", newItem.remark];
+self.statusLabel.textColor = [UIColor systemGreenColor];
+self.statusLabel.text = [NSString stringWithFormat:@"✅ 已缓存【%@】凭证（uid:%@）", newItem.remark, newItem.userId ?: @""];
 [mgr loginWithAccount:newItem completion:^(BOOL ok, NSString *msg) {
 self.statusLabel.textColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
 self.statusLabel.text = msg;
@@ -5269,6 +5313,13 @@ ACLog(@"[嗅探] 锁定最新 X-Lts-Id 长度: %lu", (unsigned long)v.length);
 }
 return;
 }
+// 热切换锁定期间：token/x-userid/channel 不允许被原生流量冲回 App 当前登录账号；
+// 但原生会话凭证仍持续记录到副本，供「保存当前登录账号」面板取用
+NSString *sniffedUid = ACHeaderValue(headers, @"x-userid");
+BOOL acHotLocked = (sHotSwitchUserId.length > 3);
+BOOL acHotMismatch = (acHotLocked && (sniffedUid.length == 0 || ![sniffedUid isEqualToString:sHotSwitchUserId]));
+BOOL acIdentityKey = ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] || [lk isEqualToString:@"channel"]);
+if (acIdentityKey) ACNativeAuthStore()[lk] = v;
 if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
 [lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] ||
@@ -5276,10 +5327,12 @@ if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"] ||
 [lk isEqualToString:@"x-request-no"] || [lk isEqualToString:@"accept-language"] ||
 ([lk isEqualToString:@"user-agent"] && [v.lowercaseString containsString:@"airchat/"])) {
+if (!(acIdentityKey && acHotMismatch)) {
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
-if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
+}
+if ([lk isEqualToString:@"x-userid"] && v.length > 5 && !(acHotLocked && ![v isEqualToString:sHotSwitchUserId])) mgr.selfUserId = v;
 }];
 }
 if ([urlStr containsString:@"/post/app/publish"] && request.HTTPBody) {
@@ -5348,6 +5401,13 @@ ACLog(@"[嗅探] 锁定最新 X-Lts-Id 长度: %lu", (unsigned long)v.length);
 }
 return;
 }
+// 热切换锁定期间：token/x-userid/channel 不允许被原生流量冲回 App 当前登录账号；
+// 但原生会话凭证仍持续记录到副本，供「保存当前登录账号」面板取用
+NSString *sniffedUid = ACHeaderValue(headers, @"x-userid");
+BOOL acHotLocked = (sHotSwitchUserId.length > 3);
+BOOL acHotMismatch = (acHotLocked && (sniffedUid.length == 0 || ![sniffedUid isEqualToString:sHotSwitchUserId]));
+BOOL acIdentityKey = ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] || [lk isEqualToString:@"channel"]);
+if (acIdentityKey) ACNativeAuthStore()[lk] = v;
 if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
 [lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] ||
@@ -5355,10 +5415,12 @@ if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"] ||
 [lk isEqualToString:@"x-request-no"] || [lk isEqualToString:@"accept-language"] ||
 ([lk isEqualToString:@"user-agent"] && [v.lowercaseString containsString:@"airchat/"])) {
+if (!(acIdentityKey && acHotMismatch)) {
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
-if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
+}
+if ([lk isEqualToString:@"x-userid"] && v.length > 5 && !(acHotLocked && ![v isEqualToString:sHotSwitchUserId])) mgr.selfUserId = v;
 }];
 }
 }
@@ -5372,6 +5434,14 @@ return %orig;
 if (acInternalRequest) return;
 if (field && value && [field isKindOfClass:[NSString class]] && [value isKindOfClass:[NSString class]]) {
 NSString *lowerField = field.lowercaseString;
+// 热切换锁定：身份类 Header（token/x-userid/channel）不被原生流量冲回 App 登录账号
+BOOL acIdentityKey2 = ([lowerField isEqualToString:@"token"] || [lowerField isEqualToString:@"x-userid"] || [lowerField isEqualToString:@"channel"]);
+if (acIdentityKey2) ACNativeAuthStore()[lowerField] = value;
+BOOL acBlockIdentity = NO;
+if (sHotSwitchUserId.length > 3) {
+if ([lowerField isEqualToString:@"x-userid"]) acBlockIdentity = ![value isEqualToString:sHotSwitchUserId];
+else if ([lowerField isEqualToString:@"token"] || [lowerField isEqualToString:@"channel"]) acBlockIdentity = YES;
+}
 BOOL stable = ([lowerField isEqualToString:@"token"] ||
 [lowerField isEqualToString:@"x-userid"] ||
 [lowerField isEqualToString:@"version"] ||
@@ -5379,7 +5449,7 @@ BOOL stable = ([lowerField isEqualToString:@"token"] ||
 [lowerField isEqualToString:@"x-request-no"] ||
 ([lowerField isEqualToString:@"user-agent"] && [value.lowercaseString containsString:@"airchat/"]));
 BOOL validLts = ([lowerField isEqualToString:@"x-lts-id"] && ACIsValidLtsId(value));
-if (stable || validLts) {
+if ((stable || validLts) && !acBlockIdentity) {
 [ACForwardHelperManager shared].latestHTTPHeaders[field] = value;
 [ACForwardHelperManager shared].latestHTTPHeaders[lowerField] = value;
 if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
@@ -5420,6 +5490,13 @@ mgr.latestHTTPHeaders[@"X-Lts-Id"] = v;
 mgr.latestHTTPHeaders[@"x-lts-id"] = v;
 mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
 }
+// 热切换锁定期间：token/x-userid/channel 不允许被原生流量冲回 App 当前登录账号；
+// 但原生会话凭证仍持续记录到副本，供「保存当前登录账号」面板取用
+NSString *sniffedUid = ACHeaderValue(headers, @"x-userid");
+BOOL acHotLocked = (sHotSwitchUserId.length > 3);
+BOOL acHotMismatch = (acHotLocked && (sniffedUid.length == 0 || ![sniffedUid isEqualToString:sHotSwitchUserId]));
+BOOL acIdentityKey = ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] || [lk isEqualToString:@"channel"]);
+if (acIdentityKey) ACNativeAuthStore()[lk] = v;
 if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"version"] || [lk isEqualToString:@"channel"] ||
 [lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] ||
@@ -5427,10 +5504,12 @@ if ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"] ||
 [lk isEqualToString:@"x-request-no"] || [lk isEqualToString:@"accept-language"] ||
 ([lk isEqualToString:@"user-agent"] && [v.lowercaseString containsString:@"airchat/"])) {
+if (!(acIdentityKey && acHotMismatch)) {
 mgr.latestHTTPHeaders[k] = v;
 mgr.latestHTTPHeaders[lk] = v;
 }
-if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
+}
+if ([lk isEqualToString:@"x-userid"] && v.length > 5 && !(acHotLocked && ![v isEqualToString:sHotSwitchUserId])) mgr.selfUserId = v;
 }];
 }
 %end
