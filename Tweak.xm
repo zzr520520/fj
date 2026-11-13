@@ -855,13 +855,14 @@ req.timeoutInterval = 15.0;
 [req setValue:(ACHeaderValue(self.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
 NSString *ver = ACHeaderValue(self.latestHTTPHeaders, @"version");
 if (ver.length > 0) [req setValue:ver forHTTPHeaderField:@"version"];
-req.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"account": username, @"password": password, @"uuid": devUuid} options:0 error:nil];
+// 请求体不再塞进 HTTPBody，改用 uploadTask fromData: 发送——彻底绕开 dataTaskWithRequest: 钩子链
+NSData *acLoginBody = [NSJSONSerialization dataWithJSONObject:@{@"account": username, @"password": password, @"uuid": devUuid} options:0 error:nil];
 NSURLSession *sess = ACDedicatedPluginSession();
 acInternalRequest = NO;
 if (!sess) { if (completion) completion(NO, @"插件独立网络通道初始化失败"); return; }
 __weak typeof(self) acWSelf = self;
 ACLog(@"[直登] 正在通过 /auth/c/doLoginNoEn 免退登登录账号 %@", username);
-[[sess dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
+[[sess uploadTaskWithRequest:req fromData:acLoginBody completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
 dispatch_async(dispatch_get_main_queue(), ^{
 __strong typeof(acWSelf) acSelf = acWSelf;
 if (!acSelf) return;
@@ -879,50 +880,85 @@ ACLog(@"[直登] ❌ code=%ld msg=%@", (long)code, errMsg);
 if (completion) completion(NO, errMsg);
 return;
 }
-ACLog(@"[直登] ✅ 拿到合法 32 位新 Token，直调 v1 detail 一步解析本人 UID（对齐官方登录 [4]→[5] 链路）");
-// 【HAR 205944 [121] 实锤】/v2/ 接口有 X-Lts-Id 防重放校验，插件连续复用同一 Lts 直接被网关 500；
-// 而不带 /v2/ 的 GET /client/biz/userinfo/detail 仅凭 token 即可返回本人完整资料（id/昵称/飞机号），
-// 官方登录 [4]→[5] 正是这么做的——一次请求直接入库，废弃 validateToken→v1→v2 三步链！
+// 【HAR 205944 [120] 铁证】拿到新 Token 后立即 uploadTask 直连 POST /client/user/v2/validateToken 拿真实 UID：
+// 1) /client/user/* 不属于 /client/biz/*，不校验 X-Lts-Id 里绑定的旧账号 UID，刚登录的新 Token 必 200；
+// 2) 绝不携带旧会话 X-Lts-Id（新 Token + 旧账号 Lts → /client/biz/* 全线 500「请求失败，请稍后再试！」）；
+// 3) validateToken 一返回 userId 立即判定登录成功并入库，昵称/飞机号后台异步补拉，detail 500 也绝不阻塞
 acInternalRequest = YES;
-NSMutableURLRequest *dReq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cn/client/biz/userinfo/detail"]];
-dReq.HTTPMethod = @"GET";
-dReq.timeoutInterval = 15.0;
-[dReq setValue:newToken forHTTPHeaderField:@"token"];
-[dReq setValue:(ACHeaderValue(acSelf.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
-NSString *verD = ACHeaderValue(acSelf.latestHTTPHeaders, @"version");
-if (verD.length > 0) [dReq setValue:verD forHTTPHeaderField:@"version"];
-NSString *acLtsD = ACHeaderValue(acSelf.latestHTTPHeaders, @"X-Lts-Id");
-if (acLtsD.length > 0) [dReq setValue:acLtsD forHTTPHeaderField:@"X-Lts-Id"];
-NSString *acChD = ACHeaderValue(acSelf.latestHTTPHeaders, @"channel");
-if (acChD.length > 0) [dReq setValue:acChD forHTTPHeaderField:@"channel"];
-// v1 detail 无需 x-userid（服务器严格按 token 返回本人资料），HAR [5] 实证一次即拿全
-NSURLSession *dSess = ACDedicatedPluginSession();
+NSMutableURLRequest *vReq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cn/client/user/v2/validateToken"]];
+vReq.HTTPMethod = @"POST";
+vReq.timeoutInterval = 10.0;
+[vReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+[vReq setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+[vReq setValue:newToken forHTTPHeaderField:@"token"];
+[vReq setValue:(ACHeaderValue(acSelf.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
+NSString *verV = ACHeaderValue(acSelf.latestHTTPHeaders, @"version");
+if (verV.length > 0) [vReq setValue:verV forHTTPHeaderField:@"version"];
+NSData *vBody = [NSJSONSerialization dataWithJSONObject:@{@"token": newToken} options:0 error:nil];
+NSURLSession *vSess = ACDedicatedPluginSession();
 acInternalRequest = NO;
-if (!dSess) { if (completion) completion(NO, @"插件独立网络通道初始化失败"); return; }
-[[dSess dataTaskWithRequest:dReq completionHandler:^(NSData *d2, NSURLResponse *r2, NSError *e2) {
+if (!vSess) { if (completion) completion(NO, @"插件独立网络通道初始化失败"); return; }
+ACLog(@"[直登] ✅ 拿到合法 32 位新 Token，uploadTask 直连 validateToken 解析本人 UID");
+[[vSess uploadTaskWithRequest:vReq fromData:vBody completionHandler:^(NSData *vData, NSURLResponse *vResp, NSError *vErr) {
 dispatch_async(dispatch_get_main_queue(), ^{
 __strong typeof(acWSelf) acSelf2 = acWSelf;
 if (!acSelf2) return;
-// 插件自发请求：解析期间置 internal，绝不让防退登护盾把 401 伪装成 200 干扰登录判断
 acInternalRequest = YES;
-NSDictionary *uJson = ACSafeDict([NSJSONSerialization JSONObjectWithData:d2 options:0 error:nil]);
+NSDictionary *vJson = (vData.length > 0) ? ACSafeDict([NSJSONSerialization JSONObjectWithData:vData options:0 error:nil]) : nil;
 acInternalRequest = NO;
-NSDictionary *uData = ACSafeDict(uJson[@"data"]);
-NSString *uid = ACSafeStr(uData[@"id"]);
-NSString *nick = ACSafeStr(uData[@"clientUserNickName"] ?: uData[@"nickName"] ?: username);
-NSString *accNum = ACSafeStr(uData[@"account"] ?: uData[@"phone"] ?: username);
-if (uid.length < 5) {
-if (completion) completion(NO, @"拿到 Token 但获取账号资料失败（服务器未返回本人 UID）");
+NSDictionary *vDataDict = ACSafeDict(vJson[@"data"]);
+NSString *uid = ACSafeStr(vDataDict[@"userId"] ?: vDataDict[@"id"]);
+if ([ACSafeStr(vJson[@"code"]) integerValue] != 200 || ![vDataDict[@"isValid"] boolValue] || uid.length < 5) {
+ACLog(@"[直登] ❌ validateToken 未返回有效 UID（code=%@ isValid=%d）", ACSafeStr(vJson[@"code"]), [vDataDict[@"isValid"] boolValue]);
+if (completion) completion(NO, @"❌ validateToken 未返回有效 UID，请检查网络后重试");
 return;
 }
-// 入库（token/uid/昵称/飞机号 + 账号密码一并保存，供 Token 失效后自动重登）
-[acSelf2 ac_autoSaveOrUpdateAccountWithUid:uid token:newToken nickname:nick accountNum:accNum];
+// validateToken 成功 → 立即判定登录成功并入库（昵称先用飞机号占位，后台补拉真实昵称）
+[acSelf2 ac_autoSaveOrUpdateAccountWithUid:uid token:newToken nickname:username accountNum:username];
 for (ACAccountItem *it in acSelf2.accountList) {
-if ([it.userId isEqualToString:uid]) { it.account = accNum; it.password = password; break; }
+if ([it.userId isEqualToString:uid]) { it.account = username; it.password = password; break; }
 }
 [acSelf2 saveAllAccounts];
-ACLog(@"[直登] ✅ 已免退登添加账号: %@ (%@)", nick, accNum);
-if (completion) completion(YES, [NSString stringWithFormat:@"✅ 已免退登添加账号：%@\n（在列表点击即可随时切换）", nick]);
+ACLog(@"[直登] ✅ 已免退登添加账号: %@ (UID:%@)，昵称后台异步补拉", username, uid);
+// 后台 1.5s 后补拉本人昵称/飞机号（best-effort：绝不携带旧 X-Lts-Id，失败也不影响登录结果）
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+__strong typeof(acWSelf) acSelfN = acWSelf;
+if (!acSelfN) return;
+NSMutableURLRequest *dReq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cn/client/biz/userinfo/detail"]];
+dReq.HTTPMethod = @"GET";
+dReq.timeoutInterval = 8.0;
+[dReq setValue:newToken forHTTPHeaderField:@"token"];
+[dReq setValue:uid forHTTPHeaderField:@"x-userid"];
+[dReq setValue:(ACHeaderValue(acSelfN.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
+NSString *verN = ACHeaderValue(acSelfN.latestHTTPHeaders, @"version");
+if (verN.length > 0) [dReq setValue:verN forHTTPHeaderField:@"version"];
+NSURLSession *dSess = ACDedicatedPluginSession();
+if (!dSess) return;
+[[dSess dataTaskWithRequest:dReq completionHandler:^(NSData *d2, NSURLResponse *r2, NSError *e2) {
+dispatch_async(dispatch_get_main_queue(), ^{
+__strong typeof(acWSelf) acSelf3 = acWSelf;
+if (!acSelf3) return;
+acInternalRequest = YES;
+NSDictionary *uJson = (d2.length > 0) ? ACSafeDict([NSJSONSerialization JSONObjectWithData:d2 options:0 error:nil]) : nil;
+acInternalRequest = NO;
+if ([ACSafeStr(uJson[@"code"]) integerValue] != 200) return;
+NSDictionary *uData = ACSafeDict(uJson[@"data"]);
+NSString *nNick = ACSafeStr(uData[@"clientUserNickName"] ?: uData[@"nickName"]);
+NSString *nAcc = ACSafeStr(uData[@"account"] ?: uData[@"phone"]);
+if (nNick.length == 0 && nAcc.length == 0) return;
+for (ACAccountItem *it in acSelf3.accountList) {
+if ([it.userId isEqualToString:uid]) {
+if (nNick.length > 0) it.remark = nNick;
+if (nAcc.length >= 5) it.account = nAcc;
+break;
+}
+}
+[acSelf3 saveAllAccounts];
+ACLog(@"[直登] ✅ 后台补拉资料成功：%@ (%@)", nNick, nAcc);
+});
+}] resume];
+});
+if (completion) completion(YES, [NSString stringWithFormat:@"✅ 已免退登添加账号：%@\n（在列表点击即可随时切换）", username]);
 });
 }] resume];
 }); // 关闭外层 dispatch_async（doLoginNoEn 响应处理块）
@@ -1413,36 +1449,47 @@ return;
 }
 // Pre-flight 预检（HAR [73]~[89] 实证根因）：先用插件独立通道验证目标 Token 是否已被服务端注销，
 // 绝不把失效 Token 注入宿主 App——否则宿主全局 401 拦截器收到 "Token无效" 会把当前在线账号直接踢回登录页！
-// 【HAR 205944 [121]】预检改走不带 /v2/ 的 v1 detail：/v2/ 有 X-Lts-Id 防重放，复用宿主 Lts 会被网关 500 误判
+// 【HAR 205944 复盘铁证】预检改走 POST /client/user/v2/validateToken：
+// 1) /client/biz/* 会解密 X-Lts-Id 校验「绑定 UID 与 token 归属人一致」——预检带着当前账号的旧 Lts 查新号必 500！
+//    而 /client/user/* 不校验 Lts（[120] 实证：validateToken 100% 返回 isValid+userId）；
+// 2) 走 uploadTaskWithRequest:fromData: 彻底绕开 dataTaskWithRequest: 钩子，响应绝不被换绑拦截篡改。
 acInternalRequest = YES;
-NSMutableURLRequest *chk = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cn/client/biz/userinfo/detail"]];
-chk.HTTPMethod = @"GET";
+NSMutableURLRequest *chk = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cn/client/user/v2/validateToken"]];
+chk.HTTPMethod = @"POST";
 chk.timeoutInterval = 10.0;
+[chk setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+[chk setValue:@"application/json" forHTTPHeaderField:@"Accept"];
 [chk setValue:targetAccount.token forHTTPHeaderField:@"token"];
 [chk setValue:(ACHeaderValue(self.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
-NSString *chkLts = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-NSString *chkReqNo = ACHeaderValue(self.latestHTTPHeaders, @"X-Request-No");
-if (chkLts.length > 0) [chk setValue:chkLts forHTTPHeaderField:@"X-Lts-Id"];
-if (chkReqNo.length > 0) [chk setValue:chkReqNo forHTTPHeaderField:@"X-Request-No"];
+NSString *chkVer = ACHeaderValue(self.latestHTTPHeaders, @"version");
+if (chkVer.length > 0) [chk setValue:chkVer forHTTPHeaderField:@"version"];
+NSData *chkBody = [NSJSONSerialization dataWithJSONObject:@{@"token": targetAccount.token} options:0 error:nil];
 NSURLSession *chkSess = ACDedicatedPluginSession();
 acInternalRequest = NO;
 if (!chkSess) { [self ac_performAccountSwitch:targetAccount completion:completion]; return; }
 __weak typeof(self) acWSelf = self;
-ACLog(@"[账号切换] 预检 Token 有效性 -> %@ (%@)", targetAccount.remark, targetAccount.userId);
-[[chkSess dataTaskWithRequest:chk completionHandler:^(NSData *chkData, NSURLResponse *chkResp, NSError *chkErr) {
+ACLog(@"[账号切换] 预检 Token 有效性(validateToken) -> %@ (%@)", targetAccount.remark, targetAccount.userId);
+[[chkSess uploadTaskWithRequest:chk fromData:chkBody completionHandler:^(NSData *chkData, NSURLResponse *chkResp, NSError *chkErr) {
 dispatch_async(dispatch_get_main_queue(), ^{
 __strong typeof(acWSelf) acSelf = acWSelf;
 if (!acSelf) return;
-NSInteger acCode = -1;
-if (chkData.length > 0) {
-// 预检是插件自发请求：解析期间置 internal，绝不让防退登护盾把 401 伪装成 200 破坏预检判断
+// 预检是插件自发请求：解析期间置 internal，绝不让防退登护盾/收割逻辑干扰判断
 acInternalRequest = YES;
-NSDictionary *acJson = ACSafeDict([NSJSONSerialization JSONObjectWithData:chkData options:0 error:nil]);
+NSDictionary *acJson = (chkData.length > 0) ? ACSafeDict([NSJSONSerialization JSONObjectWithData:chkData options:0 error:nil]) : nil;
 acInternalRequest = NO;
-acCode = [ACSafeStr(acJson[@"code"]) integerValue];
+NSDictionary *acVData = ACSafeDict(acJson[@"data"]);
+BOOL acValid = [acVData[@"isValid"] boolValue];
+NSString *acSrvUid = ACSafeStr(acVData[@"userId"] ?: acVData[@"id"]);
+if ([ACSafeStr(acJson[@"code"]) integerValue] == 200 && acValid && acSrvUid.length >= 10) {
+// 凭证有效：以服务器返回的 UID 为权威（自动修正任何串号），直接切换
+if (![acSrvUid isEqualToString:targetAccount.userId]) {
+ACLog(@"[账号切换] 预检 UID 校正：%@ -> %@（以服务器返回为准）", targetAccount.userId, acSrvUid);
+targetAccount.userId = acSrvUid;
 }
-if (acCode == 401) {
-ACLog(@"[账号切换] ⚠️ 预检 401：目标账号 Token 已被服务端注销");
+[acSelf ac_performAccountSwitch:targetAccount completion:completion];
+return;
+}
+ACLog(@"[账号切换] ⚠️ 预检未通过（isValid=%d）：目标账号 Token 已被服务端注销", acValid);
 // HAR [57] 实证升级：若该账号保存过密码，直接走 /auth/c/doLoginNoEn 免退登静默重登出新 Token，
 // 重登成功后自动完成切换——不再要求用户去官方界面重登！
 if (targetAccount.password.length > 0) {
@@ -1456,7 +1503,7 @@ return;
 // 重登成功：新 Token 已自动入库，取回最新条目执行完整切换
 ACAccountItem *fresh = nil;
 for (ACAccountItem *it in acSelf.accountList) {
-if ([it.userId isEqualToString:targetAccount.userId] && it.token.length > 10) { fresh = it; break; }
+if (it.token.length > 10 && ([it.userId isEqualToString:targetAccount.userId] || [it.account isEqualToString:targetAccount.account])) { fresh = it; break; }
 }
 if (!fresh) { if (completion) completion(NO, @"❌ 重登成功但未找到账号条目"); return; }
 fresh.password = targetAccount.password;
@@ -1465,11 +1512,7 @@ fresh.password = targetAccount.password;
 return;
 }
 ACLog(@"[账号切换] ❌ 拦截切换保护当前账号不掉线（该账号未保存密码，无法自动重登）");
-if (completion) completion(NO, @"❌ 已拦截切换：该账号 Token 已在服务端失效(401)。\n当前在线账号已保护，绝不会被踢下线！\n请用「➕ 添加账号」输入该号密码免退登重加（自动刷新 Token），或点「🌐 打开官方账号管理」重登一次。");
-return;
-}
-// 200=凭证有效直接切换；其他网络/签名偶发失败不武断拦截，仍执行切换
-[acSelf ac_performAccountSwitch:targetAccount completion:completion];
+if (completion) completion(NO, @"❌ 已拦截切换：该账号 Token 已在服务端失效。\n当前在线账号已保护，绝不会被踢下线！\n请用「➕ 添加账号」输入该号密码免退登重加（自动刷新 Token），或点「🌐 打开官方账号管理」重登一次。");
 });
 }] resume];
 }
@@ -6470,8 +6513,9 @@ return %orig(request, cleanHandler);
 }
 // 【HAR 192037 [81] 实锤修复】validateToken 含子串 "validate" 曾被本拦截误杀——响应被篡改成 data:@YES，
 // 插件拿不到 data.userId、官方切号 VC 校验失败直接中断！必须精确排除 validateToken
-if ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] ||
-([urlStr containsString:@"validate"] && ![urlStr containsString:@"validateToken"])) {
+// 【HAR 205944 复盘】再加 !acInternalRequest 双保险：插件自发请求（validateToken 拿本人 UID 等）绝不被本拦截篡改
+if (!acInternalRequest && ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] ||
+([urlStr containsString:@"validate"] && ![urlStr containsString:@"validateToken"]))) {
 if (completionHandler) {
 void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
 NSDictionary *successDict = @{@"code": @200, @"msg": @"操作成功", @"data": @YES};
