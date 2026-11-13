@@ -899,6 +899,7 @@ if (completion) completion(YES, [NSString stringWithFormat:@"✅ 已免退登添
 } else {
 if (completion) completion(NO, @"插件独立网络通道初始化失败");
 }
+}); // 关闭外层 dispatch_async（doLoginNoEn 响应处理块）
 }] resume];
 }
 // 复刻官方切号链路 [23]→[24]→[28]：/client/biz/v2/userinfo/209/get/enc/id → /get/id → /get/gen
