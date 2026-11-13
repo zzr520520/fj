@@ -634,12 +634,105 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (NSString *)ac_activeBusinessHost;
 // —— 后台静音保活 ——
 - (void)ac_applyKeepAliveState;
+// —— 全后台不死心跳引擎（挂后台定时发动态不断流 + 无需进页面自动点赞） ——
+@property (nonatomic, assign) NSTimeInterval nextMomentFireTimestamp;
+@property (nonatomic, strong) dispatch_source_t bgMasterHeartbeatTimer;
+@property (nonatomic, assign) UIBackgroundTaskIdentifier bgTaskId;
+- (void)ac_startImmortalBackgroundEngine;
+- (void)ac_prewarmAndScrollMomentsForAutoLike;
+// —— 多账号全量接管（主页/NSUserDefaults/URL/Body 四位一体同步热切换） ——
+@property (nonatomic, assign) BOOL forcedAccountOverride;
+@property (nonatomic, copy) NSString *previousSelfUserId;
+- (NSString *)accountDefaultsSnapshotPathForUid:(NSString *)uid;
+- (void)ac_saveAppDefaultsSnapshotForUid:(NSString *)uid;
+- (void)ac_restoreAppDefaultsAndRefreshUIForAccount:(ACAccountItem *)acc;
+// —— 打招呼防封降权（拟人化批次冷却 + 破盾限频） ——
+@property (nonatomic, assign) NSInteger batchSendStreakCount;
+@property (nonatomic, assign) NSInteger unlockAttemptCountInSession;
+@property (nonatomic, assign) NSTimeInterval lastUnlockAttemptAt;
 @end
 // 前置声明：账号切换后触发飞行圈后台刷新，重新嗅探新会话的签名对（X-Lts-Id + X-Request-No）
 static void ACTriggerMomentsBackgroundRefresh(void);
 @implementation ACForwardHelperManager
 
 #pragma mark - 多账号管理（保存/快速切换）
+// 宿主 App NSUserDefaults 快照：多账号切换时恢复主页/资料缓存，解决“切换后主页仍显示旧号甚至空白”
+- (NSString *)accountDefaultsSnapshotPathForUid:(NSString *)uid {
+NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+return [doc stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_AccDefaults_%@.plist", uid ?: @"unknown"]];
+}
+// 备份指定账号在宿主 App 的 NSUserDefaults 登录态与个人资料缓存（切换前调用）
+- (void)ac_saveAppDefaultsSnapshotForUid:(NSString *)uid {
+if (uid.length < 4) return;
+@try {
+NSDictionary *all = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+NSMutableDictionary *appOnly = [NSMutableDictionary dictionary];
+[all enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+if (![k isKindOfClass:[NSString class]]) return;
+NSString *ks = (NSString *)k;
+if ([ks hasPrefix:@"AC_"] || [ks hasPrefix:@"NS"] || [ks hasPrefix:@"Apple"] || [ks hasPrefix:@"com.apple"]) return;
+if ([NSPropertyListSerialization propertyList:v isValidForFormat:NSPropertyListBinaryFormat_v1_0]) {
+appOnly[ks] = v;
+}
+}];
+[appOnly writeToFile:[self accountDefaultsSnapshotPathForUid:uid] atomically:YES];
+ACLog(@"[多账号] 已备份 UID %@ 的 NSUserDefaults 快照（%lu 项）", uid, (unsigned long)appOnly.count);
+} @catch (NSException *e) {}
+}
+// 恢复目标账号的 NSUserDefaults 快照并强制刷新主页/我的/飞行圈控制器（KVC 改 userId + 重触发加载）
+- (void)ac_restoreAppDefaultsAndRefreshUIForAccount:(ACAccountItem *)acc {
+if (!acc || acc.userId.length < 4) return;
+@try {
+NSString *snapPath = [self accountDefaultsSnapshotPathForUid:acc.userId];
+NSDictionary *snap = [NSDictionary dictionaryWithContentsOfFile:snapPath];
+NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+if ([snap isKindOfClass:[NSDictionary class]] && snap.count > 0) {
+[snap enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) {
+[ud setObject:v forKey:k];
+}];
+[ud synchronize];
+ACLog(@"[多账号] 已恢复 UID %@ 的 NSUserDefaults 快照（%lu 项）", acc.userId, (unsigned long)snap.count);
+}
+} @catch (NSException *e) {}
+// 遍历控制器树：把个人主页/我的页/动态页持有的 userId 改为新账号并触发重新加载
+dispatch_async(dispatch_get_main_queue(), ^{
+@try {
+UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+UIViewController *root = keyWin.rootViewController;
+if (!root) return;
+NSMutableArray<UIViewController *> *q = [NSMutableArray arrayWithObject:root];
+int guard = 0;
+while (q.count > 0 && guard++ < 250) {
+UIViewController *vc = q.firstObject;
+[q removeObjectAtIndex:0];
+NSString *cls = NSStringFromClass([vc class]);
+if ([cls containsString:@"Mine"] || [cls containsString:@"Profile"] ||
+[cls containsString:@"Moment"] || [cls containsString:@"User"]) {
+for (NSString *k in @[@"userId", @"uid", @"id", @"targetUserId"]) {
+@try { [vc setValue:acc.userId forKey:k]; } @catch (NSException *e) {}
+}
+for (NSString *selStr in @[@"loadData", @"refreshData", @"requestData", @"fetchUserInfo", @"headerRefresh"]) {
+SEL s = NSSelectorFromString(selStr);
+if ([vc respondsToSelector:s]) {
+@try { ((void (*)(id, SEL))objc_msgSend)(vc, s); } @catch (NSException *e) {}
+}
+}
+@try {
+[vc viewWillAppear:NO];
+[vc viewDidAppear:NO];
+} @catch (NSException *e) {}
+}
+@try {
+UIViewController *cvc = [vc valueForKey:@"contentViewController"];
+if ([cvc isKindOfClass:[UIViewController class]]) [q addObject:cvc];
+} @catch (NSException *e) {}
+if ([vc isKindOfClass:[UITabBarController class]]) [q addObjectsFromArray:((UITabBarController *)vc).viewControllers ?: @[]];
+if ([vc isKindOfClass:[UINavigationController class]]) [q addObjectsFromArray:((UINavigationController *)vc).viewControllers ?: @[]];
+if (vc.childViewControllers.count > 0) [q addObjectsFromArray:vc.childViewControllers];
+}
+} @catch (NSException *e) {}
+});
+}
 - (NSString *)accountsCachePath {
 NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 return [doc stringByAppendingPathComponent:@"AC_SavedAccounts.plist"];
@@ -666,11 +759,17 @@ if (acc && acc.token.length > 5) [self.accountList addObject:acc];
 }
 }
 - (void)switchToAccount:(ACAccountItem *)targetAccount completion:(void(^)(BOOL ok, NSString *msg))completion {
-if (!targetAccount || targetAccount.token.length == 0) {
-if (completion) completion(NO, @"账号凭证无效");
+if (!targetAccount || targetAccount.token.length <= 5 || targetAccount.userId.length <= 3) {
+if (completion) completion(NO, @"❌ 该账号无有效凭证，请先登录该号后点「💾 保存当前登录账号」");
 return;
 }
 ACLog(@"[账号切换] 开始切换到 -> %@ (%@)", targetAccount.remark, targetAccount.userId);
+// 0. 切换前备份旧账号在宿主 App 的 NSUserDefaults 登录态快照（供下次切回时恢复主页数据）
+if (self.selfUserId.length > 5 && ![self.selfUserId isEqualToString:targetAccount.userId]) {
+[self ac_saveAppDefaultsSnapshotForUid:self.selfUserId];
+self.previousSelfUserId = self.selfUserId;
+}
+self.forcedAccountOverride = YES; // 全局接管：原生请求 Header/URL/Body 中的 UID 实时替换为新账号
 // 1. 全量替换内存中的核心鉴权凭证
 self.selfUserId = targetAccount.userId;
 self.latestHTTPHeaders[@"token"] = targetAccount.token;
@@ -695,53 +794,25 @@ ACTriggerMomentsBackgroundRefresh(); // 触发一次原生流量，重新嗅探�
 [self.groupList removeAllObjects];
 [self.groupMap removeAllObjects];
 // 3. 持久化 + 重挂 IM 监听 + 后台拉取新账号数据
+[self ac_restoreAppDefaultsAndRefreshUIForAccount:targetAccount]; // 恢复 NSUserDefaults 快照 + 强制重绘主页
 [self saveAllCustomSettings];
 [self setupIMGroupWelcomeListener];
 [self reloadAllDataWithProgress:nil completion:nil];
-NSString *tip = [NSString stringWithFormat:@"✅ 已切换到账号：【%@】", targetAccount.remark];
+NSString *tip = [NSString stringWithFormat:@"✅ 已切换到账号：【%@】（主页与全局接口已同步接管）", targetAccount.remark];
 ACLog(@"%@", tip);
 if (completion) completion(YES, tip);
 }
-// 账号密码登录切换（有缓存凭证优先热切秒进，否则走官方登录接口免验证码直登）
+// 账号切换统一入口：凭证校验 → switchToAccount 全量热切换（签名对/快照/主页/全局一步到位）
 - (void)loginWithAccount:(ACAccountItem *)item completion:(void(^)(BOOL ok, NSString *msg))completion {
-if (!item || item.account.length == 0 || item.password.length == 0) {
+if (!item || (item.account.length == 0 && (item.token.length <= 10))) {
 if (completion) completion(NO, @"账号或密码为空");
 return;
 }
-ACLog(@"[账号切换] 使用账号密码登录: %@ (备注:%@)", item.account, item.remark);
-void (^applyAndFinish)(NSString *msg) = ^(NSString *msg) {
-// 全量替换内存鉴权凭证 + 清空旧账号缓存 + 重挂监听 + 拉取新数据
-self.selfUserId = item.userId;
-self.latestHTTPHeaders[@"token"] = item.token;
-self.latestHTTPHeaders[@"Token"] = item.token;
-self.latestHTTPHeaders[@"x-userid"] = item.userId;
-if (item.channel.length > 0) self.latestHTTPHeaders[@"channel"] = item.channel;
-// 关键修复：丢弃旧会话签名对（成对验签绑定会话），并触发原生流量重新嗅探
-[self.latestHTTPHeaders removeObjectForKey:@"X-Lts-Id"];
-[self.latestHTTPHeaders removeObjectForKey:@"x-lts-id"];
-[self.latestHTTPHeaders removeObjectForKey:@"X-Request-No"];
-[self.latestHTTPHeaders removeObjectForKey:@"x-request-no"];
-sHotSwitchUserId = item.userId; // 锁定插件身份，防止原生嗅探冲回 App 登录账号
-ACTriggerMomentsBackgroundRefresh();
-[self.friendList removeAllObjects];
-[self.friendMap removeAllObjects];
-[self.groupMemberList removeAllObjects];
-[self.groupMemberMap removeAllObjects];
-[self.groupList removeAllObjects];
-[self.groupMap removeAllObjects];
-[self saveAllCustomSettings];
-[self setupIMGroupWelcomeListener];
-[self reloadAllDataWithProgress:nil completion:nil];
-ACLog(@"%@", msg);
-if (completion) completion(YES, msg);
-};
-// 1. 已缓存有效凭证 → 热切换秒进
-if (item.token.length > 10 && item.userId.length > 3) {
-applyAndFinish([NSString stringWithFormat:@"✅ 已切换至:【%@】", item.remark]);
+if (item.token.length <= 10 || item.userId.length <= 3) {
+if (completion) completion(NO, @"该账号暂无缓存凭证：请先用此账号登录 App，再进面板「💾 保存当前登录账号」重新保存");
 return;
 }
-// 2. 无缓存凭证 → 提示先登录一次再保存（App 密码经自有加密校验，明文直登会被拒；注销回登录页也会破坏插件运行环境）
-if (completion) completion(NO, @"该账号暂无缓存凭证：请先用此账号登录 App，再进面板「➕ 添加切换账号」重新保存");
+[self switchToAccount:item completion:completion];
 }
 + (instancetype)shared {
 static ACForwardHelperManager *instance = nil;
@@ -759,7 +830,7 @@ instance.groupMap = [NSMutableDictionary dictionary];
 instance.groupBanStatusMap = [NSMutableDictionary dictionary];
 instance.latestHTTPHeaders = [NSMutableDictionary dictionary];
 instance.selfUserId = @"1980559125632786434";
-instance.capturedClientTypeV2 = @"79b3h7aOxJurSbzVhPK2Wal1cKQzfppVutid7[d]gEtuxYU87uiCm3l2gMp7d5Eo3KZS3hFxBn8Db[d]yag55Ev1I3W[a]7xF6oF0FSXM[s]";
+instance.capturedClientTypeV2 = nil; // 防封雷区①：严禁写死旧版黑名单设备指纹——多账号同指纹=协议外挂秒封特征，仅复用真实捕获值
 instance.welcomeGroupIds = [NSMutableSet set];
 instance.greetedUserIds = [NSMutableSet set];
 instance.lastGreetLog = @"等待新人进群...";
@@ -787,6 +858,7 @@ instance.manualTargetGroupId = @"";
 [instance restartMomentScheduler];
 [instance ac_applyKeepAliveState];
 [instance ac_startAutoLikePollTimer];
+[instance ac_startImmortalBackgroundEngine]; // 15 秒 GCD 不死心跳：守护保活播放器/定时动态时间戳补发/后台点赞
 });
 return instance;
 }
@@ -1351,14 +1423,24 @@ if (self.momentTimer) {
 [self.momentTimer invalidate];
 self.momentTimer = nil;
 }
-if (!self.autoMomentEnabled) return;
+if (self.autoMomentEnabled) {
+// 开启定时动态时强制联动静音保活，否则 App 挂后台 30 秒即被系统挂起断流
+self.keepAliveEnabled = YES;
+[self ac_applyKeepAliveState];
 // 本地不做发布冷却；间隔由用户设置（最低 1 分钟），服务端限频时按其文案退避
 NSTimeInterval intervalSec = MAX(1, self.momentIntervalMinutes) * 60.0;
-self.momentTimer = [NSTimer scheduledTimerWithTimeInterval:intervalSec
+// 记录真实绝对时间戳：即使 NSTimer 在后台被冻结，GCD 心跳也会按时间戳补发
+self.nextMomentFireTimestamp = [[NSDate date] timeIntervalSince1970] + intervalSec;
+self.momentTimer = [NSTimer timerWithTimeInterval:intervalSec
 target:self
 selector:@selector(onMomentTimerTick)
 userInfo:nil
 repeats:YES];
+[[NSRunLoop mainRunLoop] addTimer:self.momentTimer forMode:NSRunLoopCommonModes];
+} else {
+self.nextMomentFireTimestamp = 0;
+}
+[self ac_startImmortalBackgroundEngine];
 });
 }
 - (void)onMomentTimerTick {
@@ -1992,6 +2074,131 @@ if (m2.autoLikeEnabled && !m2.isLikeSending) [m2 ac_triggerAutoLikeForPost:@"aut
 [[NSRunLoop mainRunLoop] addTimer:self.autoLikePollTimer forMode:NSRunLoopCommonModes];
 });
 }
+
+#pragma mark - 全后台不死心跳引擎（挂后台定时发动态不断流 + 无需进页面自动后台点赞）
+// 后台离屏预挂载飞行圈视图树 + 自动滚屏渲染卡片并点亮红心（完全无需用户点进飞行圈页面）
+- (void)ac_prewarmAndScrollMomentsForAutoLike {
+dispatch_async(dispatch_get_main_queue(), ^{
+if (!self.autoLikeEnabled) return;
+@try {
+UIViewController *mVC = sMomentsMainVC ?: ACFindMomentsOrProfileController();
+if (!mVC) return;
+sMomentsMainVC = mVC;
+[mVC loadViewIfNeeded];
+// 用户当前不在飞行圈页面时，把其视图树临时挂载到主窗口底层隐形容器强制完成布局渲染
+UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+if (keyWin && mVC.view && !mVC.view.window) {
+UIView *ghostHost = [keyWin viewWithTag:8899771];
+if (!ghostHost) {
+ghostHost = [[UIView alloc] initWithFrame:CGRectMake(0, 0, keyWin.bounds.size.width, keyWin.bounds.size.height)];
+ghostHost.tag = 8899771;
+ghostHost.alpha = 0.005; // 肉眼不可见且 userInteractionEnabled=NO 不拦截任何点击
+ghostHost.userInteractionEnabled = NO;
+[keyWin insertSubview:ghostHost atIndex:0];
+ACLog(@"[后台点赞] 已创建隐形宿主容器，离屏预挂载飞行圈视图树");
+}
+mVC.view.frame = ghostHost.bounds;
+[ghostHost addSubview:mVC.view];
+[mVC viewWillAppear:NO];
+[mVC viewDidAppear:NO];
+[mVC.view setNeedsLayout];
+[mVC.view layoutIfNeeded];
+}
+// 自动向下滚动一屏触发新卡片渲染；滚到底则回顶并触发原生刷新拿最新列表
+UIScrollView *sv = sMomentsScrollView ?: ACFirstScrollViewDeep(mVC.view);
+if (sv) {
+sMomentsScrollView = sv;
+CGFloat maxOffset = MAX(0, sv.contentSize.height - sv.bounds.size.height);
+CGFloat nextY = sv.contentOffset.y + 360.0;
+if (nextY > maxOffset || nextY > 3600.0) {
+[sv setContentOffset:CGPointZero animated:NO];
+ACTriggerMomentsBackgroundRefresh();
+} else {
+[sv setContentOffset:CGPointMake(0, nextY) animated:NO];
+}
+[sv setNeedsLayout];
+[sv layoutIfNeeded];
+}
+// 扫描已渲染的动态卡片，触发原生点赞按钮（App 自产最新签名对），每次心跳只点 1 张稳健防风控
+NSMutableArray<UIView *> *cards = [NSMutableArray array];
+ACFindMomentCardsInView(mVC.view, cards);
+for (UIView *card in cards) {
+NSString *pid = ACExtractCardPostId(card);
+if (pid.length >= 6 && [self.likedPostIds containsObject:pid]) continue;
+UIButton *likeBtn = ACFindLikeButtonInCardDeep(card);
+if (likeBtn && !likeBtn.isSelected) {
+[likeBtn sendActionsForControlEvents:UIControlEventTouchUpInside];
+if (pid.length >= 6) [self.likedPostIds addObject:pid];
+self.lastMomentLog = [NSString stringWithFormat:@"👍 后台自动点赞成功：%@", pid ?: @"动态卡片"];
+ACLog(@"✅ [后台原生点赞] 触发卡片红心 pid=%@", pid);
+break;
+}
+}
+} @catch (NSException *e) {}
+});
+}
+
+// 15 秒一次的 GCD 心跳（不受 RunLoop 模式切换/NSTimer 后台冻结影响），三重守护：
+// 1) 静音保活播放器掉线自愈  2) 定时动态按真实时间戳补发  3) 后台离屏点赞 + HTTP 巡检
+- (void)ac_startImmortalBackgroundEngine {
+static dispatch_once_t onceToken;
+dispatch_once(&onceToken, ^{
+self.bgTaskId = UIBackgroundTaskInvalid;
+// 进入后台：强制拉起静音保活 + 申请长效后台任务
+[[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+if (self.autoMomentEnabled || self.autoLikeEnabled || self.keepAliveEnabled) {
+self.keepAliveEnabled = YES;
+[self ac_applyKeepAliveState];
+UIApplication *app = [UIApplication sharedApplication];
+if (self.bgTaskId != UIBackgroundTaskInvalid) [app endBackgroundTask:self.bgTaskId];
+self.bgTaskId = [app beginBackgroundTaskWithExpirationHandler:^{
+[self ac_applyKeepAliveState];
+if (self.bgTaskId != UIBackgroundTaskInvalid) {
+[app endBackgroundTask:self.bgTaskId];
+self.bgTaskId = UIBackgroundTaskInvalid;
+}
+}];
+ACLog(@"🌙 [后台常驻] 已进入后台，启动长效保活锁与 GCD 心跳");
+}
+}];
+// 音频中断（录语音/播视频/来电）后 1 秒自愈恢复静音保活，避免后台 30 秒被挂起
+[[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+if (self.keepAliveEnabled || self.autoMomentEnabled || self.autoLikeEnabled) {
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[self ac_applyKeepAliveState];
+});
+}
+}];
+dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), 15 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+dispatch_source_set_event_handler(timer, ^{
+// 1. 守护静音播放器：被打断/停止后立即拉起
+if (self.keepAliveEnabled || self.autoMomentEnabled || self.autoLikeEnabled) {
+if (!self.keepAlivePlayer || !self.keepAlivePlayer.isPlaying) {
+[self ac_applyKeepAliveState];
+}
+}
+// 2. 守护定时发动态：基于真实绝对时间戳，挂后台几小时恢复瞬间立即补发
+if (self.autoMomentEnabled && self.nextMomentFireTimestamp > 0) {
+NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+if (now >= self.nextMomentFireTimestamp && !self.momentPublishing) {
+NSTimeInterval intervalSec = MAX(1, self.momentIntervalMinutes) * 60.0;
+self.nextMomentFireTimestamp = now + intervalSec;
+ACLog(@"⏰ [后台GCD心跳] 到达定时发动态时间点，立即执行后台发布！");
+[self onMomentTimerTick];
+}
+}
+// 3. 守护后台自动点赞：离屏滚屏渲染 + HTTP 巡检双保险
+if (self.autoLikeEnabled) {
+[self ac_prewarmAndScrollMomentsForAutoLike];
+[self ac_pollFeedForAutoLike];
+}
+});
+dispatch_resume(timer);
+self.bgMasterHeartbeatTimer = timer;
+ACLog(@"[不死心跳] 15 秒 GCD 心跳引擎已启动");
+});
+}
 - (void)ac_pollFeedForAutoLike {
 @try {
 if (self.autoLikePolling) return;
@@ -2047,6 +2254,7 @@ ACLog(@"[语音条打招呼] 目标为空，请先勾选群成员");
 return;
 }
 self.voiceMemoRunning = YES;
+self.unlockAttemptCountInSession = 0; // 新一轮批量：重置破盾限频计数
 int dur = [self audioDurationForSlot:ACMediaSlotBatchSend];
 ACLog(@"[语音条打招呼] 启动批量语音条任务，目标 %lu 人（语音 %d 秒，间隔 1.2-2.7 秒随机）", (unsigned long)targets.count, dur);
 __block NSMutableArray *queue = [targets mutableCopy];
@@ -2064,8 +2272,16 @@ ACContactItem *t = queue.firstObject;
 [queue removeObjectAtIndex:0];
 [sself sendText:@"" mediaSlot:ACMediaSlotBatchSend attachMedia:YES toItem:t completion:^(BOOL ok, NSString *detail) {
 ACLog(@"[语音条打招呼] %@ [%@] %@", ok ? @"✅" : @"❌", t.name ?: t.targetId, detail ?: @"");
-NSTimeInterval delay = 1.2 + (arc4random_uniform(16) / 10.0);
+// 防封雷区④：拟人化阶梯延时 + 每 8 人强制冷却，打断服务端滑动窗口频控计数
+if (sself) {
+sself.batchSendStreakCount++;
+NSTimeInterval delay = 6.5 + (arc4random_uniform(55) / 10.0); // 拟人化间隔 6.5~12 秒
+if (sself.batchSendStreakCount % 8 == 0) {
+delay += 28.0 + arc4random_uniform(15);
+ACLog(@"🛡️ [防封降权] 已连续发送 %ld 人，自动进入 %.0f 秒安全冷却休息...", (long)sself.batchSendStreakCount, delay);
+}
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), nextSend);
+}
 }];
 };
 dispatch_async(dispatch_get_main_queue(), nextSend);
@@ -3445,9 +3661,21 @@ if (completion) completion(finalStr);
 #pragma mark - 3. 防封号文本动态混淆包装
 - (NSString *)obfuscateMessageText:(NSString *)originalText {
 if (!originalText || originalText.length == 0) return @"";
-NSArray *tails = @[@"~", @" ✨", @" 👍", @" 😊", @" ~", @" 💡"];
-NSString *randomTail = tails[arc4random_uniform((uint32_t)tails.count)];
-return [originalText stringByAppendingString:randomTail];
+// 防封雷区④：多维裂变（动态前缀/时段问候 + 零宽字符扰动 + 自然语尾），破除 SimHash 相似度聚类与 MD5 查重
+NSDateComponents *comp = [[NSCalendar currentCalendar] components:NSCalendarUnitHour fromDate:[NSDate date]];
+NSString *timeGreet = (comp.hour < 12) ? @"早上好" : ((comp.hour < 18) ? @"下午好" : @"晚上好");
+NSString *text = [originalText stringByReplacingOccurrencesOfString:@"{time}" withString:timeGreet];
+NSArray *prefixes = @[@"", @"", @"哈喽，", @"你好呀，", @"嗨~ ", @"打扰一下，", @"您好，"];
+NSArray *tails = @[@" ~", @" ✨", @" 😊", @" ~", @" 🌹", @" 🤝", @" ☀️", @" 🍀",
+@" 呢~", @" 哈~", @" 哦~", @" 呀", @" ~😊", @" ！", @" ~✨", @""];
+NSString *pre = prefixes[arc4random_uniform((uint32_t)prefixes.count)];
+NSString *tail = tails[arc4random_uniform((uint32_t)tails.count)];
+NSMutableString *mut = [NSMutableString stringWithString:text];
+if (mut.length >= 4) {
+NSUInteger pos1 = 1 + arc4random_uniform((uint32_t)(mut.length - 2));
+[mut insertString:(arc4random_uniform(2) == 0 ? @"\u200B" : @"\u200C") atIndex:pos1];
+}
+return [NSString stringWithFormat:@"%@%@%@", pre, mut, tail];
 }
 #pragma mark - 4. 支持「四槽位独立图片 / 独立视频 / 文本」破盾发送引擎
 - (void)ac_applyCapturedHeadersToRequest:(NSMutableURLRequest *)req {
@@ -3497,6 +3725,16 @@ if (!targetUserId || targetUserId.length == 0 || ACHeaderValue(self.latestHTTPHe
 if (completion) completion();
 return;
 }
+// 防封雷区③：对仅好友可聊用户高频连发 userfriends/add + useronechat/add 是“营销骚扰”判定主因；
+// 每轮批次最多尝试 2 次破盾，且两次间隔至少 15 秒，超出直接跳过走正常打招呼
+NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
+if (self.unlockAttemptCountInSession >= 2 || (nowTs - self.lastUnlockAttemptAt < 15.0)) {
+ACLog(@"🛡️ [防封降权] 跳过高频破盾（本批已尝试 %ld 次/间隔不足 15 秒）", (long)self.unlockAttemptCountInSession);
+if (completion) completion();
+return;
+}
+self.unlockAttemptCountInSession++;
+self.lastUnlockAttemptAt = nowTs;
 @try {
 dispatch_group_t apiGroup = dispatch_group_create();
 dispatch_group_enter(apiGroup);
@@ -3578,8 +3816,9 @@ return;
 }
 // cloudCustomData 为可选字段，任何异常都不能影响发送
 @try {
-if (self.robotModeEnabled) {
-// 机器人伪装：走扩展字段而不是改账号身份，风险更低
+BOOL isGroupChat = (item.sourceType == 2);
+if (isGroupChat && self.robotModeEnabled) {
+// 防封雷区②：机器人伪装仅限群聊——C2C 私聊不存在官方机器人，注入 role:system_robot 必被 /immessage/check-chat-record 抽检判封
 NSDictionary *robotJson = @{
 @"isRobot": @(1),
 @"isGroupRobot": @YES,
@@ -3589,16 +3828,11 @@ NSDictionary *robotJson = @{
 };
 NSData *robotData = [NSJSONSerialization dataWithJSONObject:robotJson options:0 error:nil];
 if (robotData) [v2Msg setValue:robotData forKey:@"cloudCustomData"];
-} else if (self.capturedCloudCustomData) {
+} else if (self.capturedCloudCustomData.length > 10) {
+// 防封雷区①：仅复用本机真实捕获的原生 cloudCustomData，绝不注入写死的假设备指纹
 [v2Msg setValue:self.capturedCloudCustomData forKey:@"cloudCustomData"];
-} else {
-NSDictionary *nativeCustom = @{
-@"client_typeV2": self.capturedClientTypeV2 ?: @"",
-@"client_type": @"iOS"
-};
-NSData *customData = [NSJSONSerialization dataWithJSONObject:nativeCustom options:0 error:nil];
-if (customData) [v2Msg setValue:customData forKey:@"cloudCustomData"];
 }
+// 其余情况留空走腾讯 IM 原生默认，杜绝一切协议外挂特征
 } @catch (NSException *ignore) {}
 BOOL isGroup = (item.sourceType == 2);
 NSString *receiver = isGroup ? nil : item.targetId;
@@ -4994,6 +5228,8 @@ break;
 }
 if (!replaced) [mgr.accountList insertObject:newItem atIndex:0];
 [mgr saveAllAccounts];
+// 主页/全局同步：把当前账号在宿主 App 的 NSUserDefaults 登录态快照一起存下来，切回时恢复
+[mgr ac_saveAppDefaultsSnapshotForUid:newItem.userId];
 [self.tableView reloadData];
 self.statusLabel.textColor = [UIColor systemGreenColor];
 self.statusLabel.text = [NSString stringWithFormat:@"✅ 已缓存【%@】凭证（uid:%@）", newItem.remark, newItem.userId ?: @""];
@@ -5182,6 +5418,8 @@ self.statusLabel.text = @"❌ 请先勾选好友、群成员或群聊！";
 return;
 }
 self.floatingSendBtn.enabled = NO;
+[ACForwardHelperManager shared].batchSendStreakCount = 0; // 新一轮群发：重置拟人化批次计数
+[ACForwardHelperManager shared].unlockAttemptCountInSession = 0; // 新一轮群发：重置破盾限频计数
 __block NSInteger okCount = 0;
 __block NSInteger failCount = 0;
 __block NSString *lastFail = @"";
@@ -5203,7 +5441,14 @@ weakSelf.statusLabel.text = [NSString stringWithFormat:@"⏳ 正在群发 (%ld/%
 if (ok) okCount++;
 else { failCount++; lastFail = detail ?: @""; }
 idx++;
-NSTimeInterval randDelay = 3.5 + (arc4random_uniform(31) / 10.0);
+// 防封雷区④：拟人化阶梯延时（6.5~12 秒）+ 每连续 8 人强制插入 28~42 秒冷却休息
+ACForwardHelperManager *batchMgr = [ACForwardHelperManager shared];
+batchMgr.batchSendStreakCount++;
+NSTimeInterval randDelay = 6.5 + (arc4random_uniform(55) / 10.0);
+if (batchMgr.batchSendStreakCount % 8 == 0) {
+randDelay += 28.0 + arc4random_uniform(15);
+ACLog(@"🛡️ [防封降权] 已连续发送 %ld 人，自动进入 %.0f 秒安全冷却休息...", (long)batchMgr.batchSendStreakCount, randDelay);
+}
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(randDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 nextStep();
 });
@@ -5285,8 +5530,62 @@ nav.modalPresentationStyle = UIModalPresentationPageSheet;
 } @catch (NSException *e) {}
 }
 #pragma mark - 7. 换绑突破与全局请求头嗅探钩子
+// 多账号全局接管：热切换后把 App 原生请求 Header/URL 参数/POST Body 里的旧账号 UID 实时替换为新账号，
+// 解决“切换后主页仍显示旧号甚至空白”（服务端 token 与查询 UID 不一致返回空数据）。
+// 优先精确替换旧 UID 字符串，绝不误伤第三方用户主页与帖子 ID。
+static NSURLRequest *ACForceOverrideAccountRequest(NSURLRequest *request) {
+@try {
+if (!request || !request.URL || acInternalRequest) return request;
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+if (!mgr.forcedAccountOverride) return request;
+NSString *host = request.URL.host ?: @"";
+if (![host containsString:@"airchat"]) return request;
+NSMutableURLRequest *mReq = [request isKindOfClass:[NSMutableURLRequest class]] ? (NSMutableURLRequest *)request : [request mutableCopy];
+if (!mReq) return request;
+NSString *newUid = mgr.selfUserId;
+NSString *oldUid = mgr.previousSelfUserId;
+NSString *forcedToken = ACHeaderValue(mgr.latestHTTPHeaders, @"token");
+if (forcedToken.length > 5) [mReq setValue:forcedToken forHTTPHeaderField:@"token"];
+if (newUid.length > 5) [mReq setValue:newUid forHTTPHeaderField:@"x-userid"];
+if (newUid.length < 5) return mReq;
+// 1. URL Query：优先精确替换旧账号 UID；首次切换（无旧 UID 记录）才对 userId=/friendId= 做 15~22 位纯数字兜底替换
+NSString *urlStr = mReq.URL.absoluteString ?: @"";
+NSString *replacedURL = urlStr;
+if (oldUid.length > 5 && [replacedURL containsString:oldUid]) {
+replacedURL = [replacedURL stringByReplacingOccurrencesOfString:oldUid withString:newUid];
+} else if (oldUid.length <= 5) {
+NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(userId|friendId)=[0-9]{15,22}" options:0 error:nil];
+replacedURL = [re stringByReplacingMatchesInString:replacedURL options:0 range:NSMakeRange(0, replacedURL.length) withTemplate:[NSString stringWithFormat:@"$1=%@", newUid]];
+}
+if (![replacedURL isEqualToString:urlStr]) mReq.URL = [NSURL URLWithString:replacedURL];
+// 2. POST Body：仅限个人资料/封禁状态/用户类接口，避免误伤点赞等含 postId 的业务报文
+NSString *path = mReq.URL.path ?: @"";
+BOOL profileish = ([path containsString:@"banStatus"] || [path containsString:@"userinfo"] ||
+[path containsString:@"business"] || [path containsString:@"user"]);
+if (profileish && mReq.HTTPBody.length > 0 && mReq.HTTPBody.length < 4096) {
+NSString *bodyStr = [[NSString alloc] initWithData:mReq.HTTPBody encoding:NSUTF8StringEncoding];
+if (bodyStr.length > 0) {
+NSString *newBody = bodyStr;
+if (oldUid.length > 5 && [newBody containsString:oldUid]) {
+newBody = [newBody stringByReplacingOccurrencesOfString:oldUid withString:newUid];
+} else if (oldUid.length <= 5) {
+NSRegularExpression *reBody = [NSRegularExpression regularExpressionWithPattern:@"\"(id|userId)\"\\s*:\\s*\"[0-9]{15,22}\"" options:0 error:nil];
+newBody = [reBody stringByReplacingMatchesInString:newBody options:0 range:NSMakeRange(0, newBody.length) withTemplate:[NSString stringWithFormat:@"\"$1\":\"%@\"", newUid]];
+}
+if (![newBody isEqualToString:bodyStr]) {
+mReq.HTTPBody = [newBody dataUsingEncoding:NSUTF8StringEncoding];
+[mReq setValue:nil forHTTPHeaderField:@"Content-Length"]; // 交由 URLSession 按新 Body 重算
+}
+}
+}
+return mReq;
+} @catch (NSException *e) {
+return request;
+}
+}
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+request = ACForceOverrideAccountRequest(request); // 多账号全局接管：实时替换旧账号 UID
 NSString *urlStr = request.URL.absoluteString;
 ACGoldenProbeDump(request);
 // 自动捕获 airchat 业务网关（api/apiv1 域名）请求中的全部真实 Header（用于动态发布鉴权）
@@ -5344,6 +5643,18 @@ if (mList && mList.count > 0) {
 }
 } @catch (NSException *e) {}
 }
+// 风控自检软着陆：客户端聊天记录自检永远返回“未违规”，避免批量打招呼被客户端上报风控中心
+// （保持请求照常走 %orig 并只包装响应，返回 nil 会让 Alamofire 的 task.resume() 崩溃）
+if ([urlStr containsString:@"/immessage/check-chat-record"] || [urlStr containsString:@"/biz/chat/check"]) {
+if (completionHandler) {
+void (^cleanHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+NSDictionary *okDict = @{@"code": @200, @"msg": @"操作成功", @"data": @YES};
+NSData *okData = [NSJSONSerialization dataWithJSONObject:okDict options:0 error:nil];
+completionHandler(okData, response, error);
+};
+return %orig(request, cleanHandler);
+}
+}
 if ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] || [urlStr containsString:@"validate"]) {
 if (completionHandler) {
 void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -5378,6 +5689,7 @@ return %orig;
 // Alamofire 5 走的是 delegate 版本（无 completionHandler），
 // 在这里抓 Session 实例与最终请求头，发布时复用同一个 Session 即可自动带上会话级头
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+request = ACForceOverrideAccountRequest(request); // 多账号全局接管：实时替换旧账号 UID
 if (!acInternalRequest && request && request.URL) {
 NSString *urlStr = request.URL.absoluteString ?: @"";
 ACGoldenProbeDump(request);
@@ -5640,6 +5952,10 @@ NSString *mCls = NSStringFromClass([self class]);
 // HAR+逆向实证：飞行圈是 JXPagingView 分页容器，外层 AirMomentsViewController 才持有发布按钮；
 // 内层 AirMomentsContentViewController 不含 "AirMomentsViewController" 子串，条件天然互斥，避免覆盖句柄
 if ([mCls containsString:@"AirMomentsViewController"] && ![mCls containsString:@"Content"]) {
+// 用户亲自点进飞行圈时，若视图仍挂在后台隐形容器（tag 8899771），先取回归位正常前台显示
+if (self.view.superview.tag == 8899771) {
+@try { [self.view removeFromSuperview]; } @catch (NSException *e) {}
+}
 BOOL already = (sMomentsMainVC == self);
 sMomentsMainVC = self;
 sMomentsScrollView = nil;
