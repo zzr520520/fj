@@ -1164,7 +1164,7 @@ if (acSelfFB) [acSelfFB ac_forceRefreshHostAppUI];
 SEL logoutSel = NSSelectorFromString(@"logout:fail:");
 if (tim && [tim respondsToSelector:logoutSel]) {
 void (^logoutSucc)(void) = ^{ performUIReload(); };
-void (^logoutFail)(int code, NSString *desc) = ^{ performUIReload(); };
+void (^logoutFail)(int code, NSString *desc) = ^(int code, NSString *desc) { performUIReload(); };
 NSMethodSignature *sig = [tim methodSignatureForSelector:logoutSel];
 if (sig) {
 NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
