@@ -124,6 +124,52 @@ static dispatch_once_t once;
 dispatch_once(&once, ^{ sStore = [NSMutableDictionary dictionary]; });
 return sStore;
 }
+// 取当前最顶层 VC（含 presented 链 / 导航 / TabBar 穿透）
+static UIViewController *ACTopMostViewController(void) {
+@try {
+UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+if (!keyWin) {
+for (UIWindow *w in [UIApplication sharedApplication].windows) { if (w.isKeyWindow) { keyWin = w; break; } }
+}
+UIViewController *top = keyWin.rootViewController;
+while (top.presentedViewController) top = top.presentedViewController;
+while ([top isKindOfClass:[UINavigationController class]]) {
+UINavigationController *nav = (UINavigationController *)top;
+UIViewController *last = nav.viewControllers.lastObject;
+if (!last) break;
+top = last;
+while (top.presentedViewController) top = top.presentedViewController;
+}
+while ([top isKindOfClass:[UITabBarController class]]) {
+UITabBarController *tab = (UITabBarController *)top;
+UIViewController *sel = tab.selectedViewController;
+if (!sel) break;
+top = sel;
+while (top.presentedViewController) top = top.presentedViewController;
+}
+return top;
+} @catch (NSException *e) { return nil; }
+}
+// 是否处于官方「账号管理/登录/注册/验证」界面（在这些界面绝不锁死请求头，让官方切号完全畅通）
+static BOOL ACIsInNativeAccountOrLoginScreen(void) {
+@try {
+UIViewController *top = ACTopMostViewController();
+if (!top) return NO;
+NSString *cls = NSStringFromClass([top class]) ?: @"";
+return ([cls containsString:@"AccountManagement"] || [cls containsString:@"Login"] ||
+[cls containsString:@"Register"] || [cls containsString:@"Verify"] ||
+[cls containsString:@"Password"] || [cls containsString:@"Setting"]);
+} @catch (NSException *e) { return NO; }
+}
+// 是否为退出登录注销请求（拦截后服务端无法销毁旧账号 Token）
+static BOOL ACIsLogoutRequest(NSURLRequest *req) {
+if (!req || !req.URL) return NO;
+NSString *path = req.URL.path.lowercaseString ?: @"";
+if ([path containsString:@"logout"] || [path containsString:@"loginout"] ||
+[path containsString:@"signout"] || [path containsString:@"exitlogin"] ||
+[path hasSuffix:@"/quit"]) return YES;
+return NO;
+}
 static NSString * const kACNativeUserAgent = @"airchat/1102 CFNetwork/1490.0.4 Darwin/23.2.0";
 
 // 根治 Alamofire RequestTaskMap SIGTRAP：
@@ -650,12 +696,74 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 @property (nonatomic, assign) NSInteger batchSendStreakCount;
 @property (nonatomic, assign) NSInteger unlockAttemptCountInSession;
 @property (nonatomic, assign) NSTimeInterval lastUnlockAttemptAt;
+// —— 全自动收割账号 + 预检防踢下线切换 + 免退登官方账号管理 ——
+- (void)ac_autoSaveOrUpdateAccountWithUid:(NSString *)uid token:(NSString *)token nickname:(NSString *)nickname accountNum:(NSString *)accountNum;
+- (void)ac_openNativeAccountManagement;
+- (void)ac_performAccountSwitch:(ACAccountItem *)acc completion:(void(^)(BOOL ok, NSString *msg))completion;
 @end
 // 前置声明：账号切换后触发飞行圈后台刷新，重新嗅探新会话的签名对（X-Lts-Id + X-Request-No）
 static void ACTriggerMomentsBackgroundRefresh(void);
 @implementation ACForwardHelperManager
 
 #pragma mark - 多账号管理（保存/快速切换）
+// 全自动收割保存账号：/userinfo/detail 响应触发（官方账号管理添加/切换新号后无需手动填表，自动入库）
+- (void)ac_autoSaveOrUpdateAccountWithUid:(NSString *)uid token:(NSString *)token nickname:(NSString *)nickname accountNum:(NSString *)accountNum {
+if (uid.length < 5 || token.length < 10) return;
+if (!self.accountList) self.accountList = [NSMutableArray array];
+NSString *label = nickname.length > 0 ? nickname : [NSString stringWithFormat:@"用户_%@", [uid substringFromIndex:MAX(0, (NSInteger)uid.length - 4)]];
+if (accountNum.length > 0) label = [NSString stringWithFormat:@"%@ (%@)", label, accountNum];
+NSInteger foundIdx = NSNotFound;
+for (NSInteger i = 0; i < (NSInteger)self.accountList.count; i++) {
+ACAccountItem *it = self.accountList[i];
+if ([it.userId isEqualToString:uid]) { foundIdx = i; break; }
+}
+if (foundIdx != NSNotFound) {
+ACAccountItem *exist = self.accountList[foundIdx];
+BOOL changed = (![exist.token isEqualToString:token] || ![exist.remark isEqualToString:label]);
+exist.token = token;
+if (label.length > 0) exist.remark = label;
+if (changed) {
+[self saveAllAccounts];
+ACLog(@"[多账号] 🔄 已自动同步账号最新凭证: %@", label);
+}
+} else {
+ACAccountItem *newAcc = [[ACAccountItem alloc] init];
+newAcc.remark = label;
+newAcc.userId = uid;
+newAcc.token = token;
+NSDateFormatter *df = [[NSDateFormatter alloc] init];
+df.dateFormat = @"MM-dd HH:mm";
+newAcc.saveTime = [df stringFromDate:[NSDate date]];
+[self.accountList addObject:newAcc];
+[self saveAllAccounts];
+ACLog(@"[多账号] ✅ 已全自动捕获并保存新账号: %@", label);
+}
+}
+// 一键免退登呼出官方账号管理页：解除插件锁定，直接在官方界面添加/切换新号（登录成功自动入库）
+- (void)ac_openNativeAccountManagement {
+self.forcedAccountOverride = NO;
+sHotSwitchUserId = nil; // 解除嗅探锁定，官方新登录 Token 可正常捕获入库
+Class accMgrCls = NSClassFromString(@"AccountManagementViewController")
+?: NSClassFromString(@"AirChat.AccountManagementViewController")
+?: NSClassFromString(@"AirAccountManagementViewController");
+UIViewController *topVC = ACTopMostViewController();
+if (accMgrCls && topVC) {
+@try {
+UIViewController *vc = [[accMgrCls alloc] init];
+vc.hidesBottomBarWhenPushed = YES;
+if (topVC.navigationController) {
+[topVC.navigationController pushViewController:vc animated:YES];
+} else {
+UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+nav.modalPresentationStyle = UIModalPresentationPageSheet;
+[topVC presentViewController:nav animated:YES completion:nil];
+}
+ACLog(@"[多账号] 已打开官方账号管理页（在此添加/切换的新号将自动入库保存）");
+return;
+} @catch (NSException *e) {}
+}
+ACLog(@"[多账号] 未找到官方账号管理页，请到【我的→设置→账号管理】操作，登录后插件会自动保存");
+}
 // 宿主 App NSUserDefaults 快照：多账号切换时恢复主页/资料缓存，解决“切换后主页仍显示旧号甚至空白”
 - (NSString *)accountDefaultsSnapshotPathForUid:(NSString *)uid {
 NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -711,16 +819,8 @@ if ([cls containsString:@"Mine"] || [cls containsString:@"Profile"] ||
 for (NSString *k in @[@"userId", @"uid", @"id", @"targetUserId"]) {
 @try { [vc setValue:acc.userId forKey:k]; } @catch (NSException *e) {}
 }
-for (NSString *selStr in @[@"loadData", @"refreshData", @"requestData", @"fetchUserInfo", @"headerRefresh"]) {
-SEL s = NSSelectorFromString(selStr);
-if ([vc respondsToSelector:s]) {
-@try { ((void (*)(id, SEL))objc_msgSend)(vc, s); } @catch (NSException *e) {}
-}
-}
-@try {
-[vc viewWillAppear:NO];
-[vc viewDidAppear:NO];
-} @catch (NSException *e) {}
+// HAR [6]~[71] 实证：主动调 viewWillAppear/loadData 会触发宿主 VC 请求死循环（4 秒 50+ 次 userinfo/detail）；
+// 这里只做 KVC 数据修正，页面数据由恢复的 NSUserDefaults 快照在下次自然 appears 时自动刷新
 }
 @try {
 UIViewController *cvc = [vc valueForKey:@"contentViewController"];
@@ -763,6 +863,45 @@ if (!targetAccount || targetAccount.token.length <= 5 || targetAccount.userId.le
 if (completion) completion(NO, @"❌ 该账号无有效凭证，请先登录该号后点「💾 保存当前登录账号」");
 return;
 }
+// Pre-flight 预检（HAR [73]~[89] 实证根因）：先用插件独立通道验证目标 Token 是否已被服务端注销，
+// 绝不把失效 Token 注入宿主 App——否则宿主全局 401 拦截器收到 "Token无效" 会把当前在线账号直接踢回登录页！
+acInternalRequest = YES;
+NSMutableURLRequest *chk = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cn/client/biz/v2/userinfo/detail"]];
+chk.HTTPMethod = @"GET";
+chk.timeoutInterval = 10.0;
+[chk setValue:targetAccount.token forHTTPHeaderField:@"token"];
+[chk setValue:targetAccount.userId forHTTPHeaderField:@"x-userid"];
+[chk setValue:(ACHeaderValue(self.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
+NSString *chkLts = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+NSString *chkReqNo = ACHeaderValue(self.latestHTTPHeaders, @"X-Request-No");
+if (chkLts.length > 0) [chk setValue:chkLts forHTTPHeaderField:@"X-Lts-Id"];
+if (chkReqNo.length > 0) [chk setValue:chkReqNo forHTTPHeaderField:@"X-Request-No"];
+NSURLSession *chkSess = ACDedicatedPluginSession();
+acInternalRequest = NO;
+if (!chkSess) { [self ac_performAccountSwitch:targetAccount completion:completion]; return; }
+__weak typeof(self) acWSelf = self;
+ACLog(@"[账号切换] 预检 Token 有效性 -> %@ (%@)", targetAccount.remark, targetAccount.userId);
+[[chkSess dataTaskWithRequest:chk completionHandler:^(NSData *chkData, NSURLResponse *chkResp, NSError *chkErr) {
+dispatch_async(dispatch_get_main_queue(), ^{
+__strong typeof(acWSelf) acSelf = acWSelf;
+if (!acSelf) return;
+NSInteger acCode = -1;
+if (chkData.length > 0) {
+NSDictionary *acJson = ACSafeDict([NSJSONSerialization JSONObjectWithData:chkData options:0 error:nil]);
+acCode = [ACSafeStr(acJson[@"code"]) integerValue];
+}
+if (acCode == 401) {
+ACLog(@"[账号切换] ❌ 预检 401：目标账号 Token 已被服务端注销，拦截切换保护当前账号不掉线");
+if (completion) completion(NO, @"❌ 已拦截切换：该账号 Token 已在服务端失效(401)，之前点过退出登录导致被注销。\n当前在线账号已保护，绝不会被踢下线！请点「🌐 打开官方账号管理」重新登录该号一次，插件会自动刷新保存。");
+return;
+}
+// 200=凭证有效直接切换；其他网络/签名偶发失败不武断拦截，仍执行切换
+[acSelf ac_performAccountSwitch:targetAccount completion:completion];
+});
+}] resume];
+}
+
+- (void)ac_performAccountSwitch:(ACAccountItem *)targetAccount completion:(void(^)(BOOL ok, NSString *msg))completion {
 ACLog(@"[账号切换] 开始切换到 -> %@ (%@)", targetAccount.remark, targetAccount.userId);
 // 0. 切换前备份旧账号在宿主 App 的 NSUserDefaults 登录态快照（供下次切回时恢复主页数据）
 if (self.selfUserId.length > 5 && ![self.selfUserId isEqualToString:targetAccount.userId]) {
@@ -2209,7 +2348,7 @@ self.autoLikePolling = YES;
 // 旧接口 /airchat/c/post/pageIds 升级后已废弃，切换为存活的动态分页接口（响应结构与 data.records 兼容）
 NSString *host = [self ac_activeBusinessHost];
 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
-[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/page?current=1&size=20", host]]];
+[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/page?channelType=1&current=1&size=20", host]]]; // HAR[72]: 缺 channelType 必报 415「请选择频道类型」
 req.HTTPMethod = @"GET";
 [req setValue:host forHTTPHeaderField:@"Host"];
 [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
@@ -5182,6 +5321,9 @@ tf.placeholder = @"登录密码（选填，仅备注用）";
 tf.secureTextEntry = YES;
 }];
 [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+[alert addAction:[UIAlertAction actionWithTitle:@"🌐 打开官方账号管理（免退登添加新号）" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+[[ACForwardHelperManager shared] ac_openNativeAccountManagement];
+}]];
 [alert addAction:[UIAlertAction actionWithTitle:@"保存凭证" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
 NSString *remark = alert.textFields[0].text;
 NSString *account = [alert.textFields[1].text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -5536,10 +5678,30 @@ nav.modalPresentationStyle = UIModalPresentationPageSheet;
 static NSURLRequest *ACForceOverrideAccountRequest(NSURLRequest *request) {
 @try {
 if (!request || !request.URL || acInternalRequest) return request;
-ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-if (!mgr.forcedAccountOverride) return request;
 NSString *host = request.URL.host ?: @"";
 if (![host containsString:@"airchat"]) return request;
+NSString *acReqPath = (request.URL.path ?: @"").lowercaseString;
+// 官方登录/验证码/注册/切换流程：自动解除插件锁定，绝不拦截官方切号
+if ([acReqPath containsString:@"login"] || [acReqPath containsString:@"sms"] ||
+[acReqPath containsString:@"verify"] || [acReqPath containsString:@"register"] ||
+[acReqPath containsString:@"oauth"] || [acReqPath containsString:@"switchaccount"]) {
+[ACForwardHelperManager shared].forcedAccountOverride = NO;
+sHotSwitchUserId = nil;
+return request;
+}
+// 拦截退出注销：重写到无效路径（服务端 404 但 Token 不会被销毁），响应由 completionHandler 钩子伪造 200
+if (ACIsLogoutRequest(request)) {
+NSMutableURLRequest *blockedReq = [request mutableCopy];
+blockedReq.URL = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/__plugin_logout_blocked__", host]];
+return blockedReq;
+}
+// 用户正处于官方「账号管理/登录」界面：绝不锁死请求，让官方切换完全畅通
+if (ACIsInNativeAccountOrLoginScreen()) {
+[ACForwardHelperManager shared].forcedAccountOverride = NO;
+return request;
+}
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+if (!mgr.forcedAccountOverride) return request;
 NSMutableURLRequest *mReq = [request isKindOfClass:[NSMutableURLRequest class]] ? (NSMutableURLRequest *)request : [request mutableCopy];
 if (!mReq) return request;
 NSString *newUid = mgr.selfUserId;
@@ -5586,6 +5748,16 @@ return request;
 %hook NSURLSession
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
 request = ACForceOverrideAccountRequest(request); // 多账号全局接管：实时替换旧账号 UID
+// 拦截退出注销请求：不发真注销到服务端（防 Token 被销毁），本地伪造 200 让 App 登出流程正常走完
+if (ACIsLogoutRequest(request) && completionHandler) {
+NSData *acFakeData = [@"{\"code\":200,\"msg\":\"操作成功\",\"data\":true}" dataUsingEncoding:NSUTF8StringEncoding];
+NSHTTPURLResponse *acFakeResp = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type": @"application/json"}];
+void (^acFakeHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *d, NSURLResponse *r, NSError *e) {
+completionHandler(acFakeData, acFakeResp, nil);
+};
+// 请求已被重写到无效路径（404），completionHandler 收到伪造 200，服务端 Token 得以保活
+return %orig(request, acFakeHandler);
+}
 NSString *urlStr = request.URL.absoluteString;
 ACGoldenProbeDump(request);
 // 自动捕获 airchat 业务网关（api/apiv1 域名）请求中的全部真实 Header（用于动态发布鉴权）
@@ -5616,6 +5788,13 @@ return;
 // 但原生会话凭证仍持续记录到副本，供「保存当前登录账号」面板取用
 NSString *sniffedUid = ACHeaderValue(headers, @"x-userid");
 BOOL acHotLocked = (sHotSwitchUserId.length > 3);
+// 官方账号管理/登录页出现新身份流量 = 用户正在官方切号：自动解除锁定并放行捕获
+if (acHotLocked && sniffedUid.length > 3 && ![sniffedUid isEqualToString:sHotSwitchUserId] && ACIsInNativeAccountOrLoginScreen()) {
+sHotSwitchUserId = nil;
+[ACForwardHelperManager shared].forcedAccountOverride = NO;
+acHotLocked = NO;
+ACLog(@"[多账号] 检测到官方切号流量，已自动解除插件锁定");
+}
 BOOL acHotMismatch = (acHotLocked && (sniffedUid.length == 0 || ![sniffedUid isEqualToString:sHotSwitchUserId]));
 BOOL acIdentityKey = ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] || [lk isEqualToString:@"channel"]);
 if (acIdentityKey) ACNativeAuthStore()[lk] = v;
@@ -5717,6 +5896,13 @@ return;
 // 但原生会话凭证仍持续记录到副本，供「保存当前登录账号」面板取用
 NSString *sniffedUid = ACHeaderValue(headers, @"x-userid");
 BOOL acHotLocked = (sHotSwitchUserId.length > 3);
+// 官方账号管理/登录页出现新身份流量 = 用户正在官方切号：自动解除锁定并放行捕获
+if (acHotLocked && sniffedUid.length > 3 && ![sniffedUid isEqualToString:sHotSwitchUserId] && ACIsInNativeAccountOrLoginScreen()) {
+sHotSwitchUserId = nil;
+[ACForwardHelperManager shared].forcedAccountOverride = NO;
+acHotLocked = NO;
+ACLog(@"[多账号] 检测到官方切号流量，已自动解除插件锁定");
+}
 BOOL acHotMismatch = (acHotLocked && (sniffedUid.length == 0 || ![sniffedUid isEqualToString:sHotSwitchUserId]));
 BOOL acIdentityKey = ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] || [lk isEqualToString:@"channel"]);
 if (acIdentityKey) ACNativeAuthStore()[lk] = v;
@@ -5751,8 +5937,16 @@ BOOL acIdentityKey2 = ([lowerField isEqualToString:@"token"] || [lowerField isEq
 if (acIdentityKey2) ACNativeAuthStore()[lowerField] = value;
 BOOL acBlockIdentity = NO;
 if (sHotSwitchUserId.length > 3) {
+// 官方账号管理/登录页出现新身份流量 = 用户正在官方切号：自动解除锁定
+if ([lowerField isEqualToString:@"x-userid"] && ![value isEqualToString:sHotSwitchUserId] && ACIsInNativeAccountOrLoginScreen()) {
+sHotSwitchUserId = nil;
+[ACForwardHelperManager shared].forcedAccountOverride = NO;
+ACLog(@"[多账号] 检测到官方切号流量，已自动解除插件锁定");
+}
+if (sHotSwitchUserId.length > 3) {
 if ([lowerField isEqualToString:@"x-userid"]) acBlockIdentity = ![value isEqualToString:sHotSwitchUserId];
 else if ([lowerField isEqualToString:@"token"] || [lowerField isEqualToString:@"channel"]) acBlockIdentity = YES;
+}
 }
 BOOL stable = ([lowerField isEqualToString:@"token"] ||
 [lowerField isEqualToString:@"x-userid"] ||
@@ -5806,6 +6000,13 @@ mgr.latestLtsAt = [[NSDate date] timeIntervalSince1970];
 // 但原生会话凭证仍持续记录到副本，供「保存当前登录账号」面板取用
 NSString *sniffedUid = ACHeaderValue(headers, @"x-userid");
 BOOL acHotLocked = (sHotSwitchUserId.length > 3);
+// 官方账号管理/登录页出现新身份流量 = 用户正在官方切号：自动解除锁定并放行捕获
+if (acHotLocked && sniffedUid.length > 3 && ![sniffedUid isEqualToString:sHotSwitchUserId] && ACIsInNativeAccountOrLoginScreen()) {
+sHotSwitchUserId = nil;
+[ACForwardHelperManager shared].forcedAccountOverride = NO;
+acHotLocked = NO;
+ACLog(@"[多账号] 检测到官方切号流量，已自动解除插件锁定");
+}
 BOOL acHotMismatch = (acHotLocked && (sniffedUid.length == 0 || ![sniffedUid isEqualToString:sHotSwitchUserId]));
 BOOL acIdentityKey = ([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] || [lk isEqualToString:@"channel"]);
 if (acIdentityKey) ACNativeAuthStore()[lk] = v;
@@ -5843,6 +6044,23 @@ dispatch_async(dispatch_get_main_queue(), ^{
 @catch (NSException *e) { ACLog(@"[自动评论] 触发异常 %@", e.reason); }
 @try { [[ACForwardHelperManager shared] ac_handleFeedResponseForAutoLike:dict]; }
 @catch (NSException *e) { ACLog(@"[自动点赞] 触发异常 %@", e.reason); }
+});
+}
+}
+// 全自动无感保存/更新当前登录账号（官方「账号管理」添加或切换新号后必经 /userinfo/detail，自动入库）
+NSDictionary *acUData = ACSafeDict(dict[@"data"]);
+NSString *acUid = ACSafeStr(acUData[@"id"]);
+if (acUid.length > 5 && acUData[@"clientUserNickName"] && (acUData[@"account"] || acUData[@"phone"])) {
+ACForwardHelperManager *acMgrAuto = [ACForwardHelperManager shared];
+NSString *acTok = ACHeaderValue(acMgrAuto.latestHTTPHeaders, @"token");
+NSString *acCapUid = acMgrAuto.selfUserId;
+// 确保捕获的 token 确实属于这个 uid（或当前还没有对齐 uid）
+if (acTok.length > 10 && ([acCapUid isEqualToString:acUid] || acCapUid.length == 0)) {
+NSString *acNick = ACSafeStr(acUData[@"clientUserNickName"]);
+NSString *acAccNum = ACSafeStr(acUData[@"account"] ?: acUData[@"phone"]);
+dispatch_async(dispatch_get_main_queue(), ^{
+@try { [[ACForwardHelperManager shared] ac_autoSaveOrUpdateAccountWithUid:acUid token:acTok nickname:acNick accountNum:acAccNum]; }
+@catch (NSException *e) { ACLog(@"[多账号] 自动入库异常 %@", e.reason); }
 });
 }
 }
