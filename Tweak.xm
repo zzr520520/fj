@@ -1024,7 +1024,7 @@ if (!([lk isEqualToString:@"token"] || [lk isEqualToString:@"x-userid"] ||
 [lk isEqualToString:@"appversion"] || [lk isEqualToString:@"signature"] || [lk isEqualToString:@"sign"] ||
 [lk isEqualToString:@"deviceid"] || [lk isEqualToString:@"device-id"] || [lk isEqualToString:@"timestamp"])) return;
 if ([lk isEqualToString:@"x-lts-id"] && !ACIsValidLtsId(v)) return;
-if ([lk isEqualToString:@"user-agent"] && ![v.lowercaseString containsString:@"airchat/"]) return;
+if ([lk isEqualToString:@"user-agent"] && ![[(NSString *)v lowercaseString] containsString:@"airchat/"]) return;
 clean[lk] = v;
 }];
 [self.latestHTTPHeaders addEntriesFromDictionary:clean];
