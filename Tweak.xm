@@ -88,6 +88,20 @@ static inline BOOL ACIsValidLtsId(NSString *v) {
     if (![v isKindOfClass:[NSString class]]) return NO;
     return (v.length >= 100);
 }
+// HAR 183315 污染根治：真实登录 Token（如 nbFB2jb4p9p2ka5z52eAwnfZMniBBCFo）恒为恰好 32 位纯字母数字；
+// 而 /client/biz/v2/userinfo/209/get/enc/id 返回的是 24 位含 = / + 的 Base64 密钥（如 Q0EdQ2hMGW9nbQB/EBpIYQc=），
+// 旧的「24~64 位无空格字符串」判定把它误当登录 Token，把本地账号的真 Token 全部覆盖污染！
+static inline BOOL ACIsValidAuthToken(NSString *v) {
+    if (![v isKindOfClass:[NSString class]] || v.length != 32) return NO;
+    static NSCharacterSet *acInvalidTokSet = nil;
+    static dispatch_once_t acTokOnce;
+    dispatch_once(&acTokOnce, ^{
+        NSCharacterSet *alnum = [NSCharacterSet characterSetWithCharactersInString:
+            @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"];
+        acInvalidTokSet = [alnum invertedSet];
+    });
+    return ([v rangeOfCharacterFromSet:acInvalidTokSet].location == NSNotFound);
+}
 // 递归清洗：去掉 NSNull 等不可 plist/JSON 序列化对象，避免 writeToFile / dataWithJSONObject 静默失败
 static inline id ACJSONSafeObject(id obj, NSInteger depth) {
 if (depth > 8 || !obj) return nil;
@@ -705,6 +719,7 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 // —— 免退登明文直登 + IM UserSig 重连 + 宿主账号槽位同步（HAR 172623 实证）——
 - (void)ac_loginWithUsername:(NSString *)username password:(NSString *)password completion:(void(^)(BOOL ok, NSString *msg))completion;
 - (void)ac_reconnectTencentIMForAccount:(ACAccountItem *)acc;
+- (void)ac_hotReloadHostRootViewControllerForAccount:(ACAccountItem *)acc;
 - (void)ac_syncAccountToHostUserDefaults:(ACAccountItem *)acc;
 - (void)ac_forceRefreshHostAppUI;
 - (void)ac_performAccountSwitch:(ACAccountItem *)acc completion:(void(^)(BOOL ok, NSString *msg))completion;
@@ -854,25 +869,31 @@ if (error || data.length == 0) { if (completion) completion(NO, error.localizedD
 NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
 NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
 NSString *newToken = [json[@"data"] isKindOfClass:[NSString class]] ? json[@"data"] : nil;
-if (code != 200 || newToken.length < 10) {
+// HAR 183315 修复：Token 必须严格 32 位纯字母数字（ACIsValidAuthToken），杜绝任何非标串入库
+if (code != 200 || !ACIsValidAuthToken(newToken)) {
 NSString *errMsg = ACSafeStr(json[@"msg"]) ?: @"登录失败，请检查账号密码";
 ACLog(@"[直登] ❌ code=%ld msg=%@", (long)code, errMsg);
 if (completion) completion(NO, errMsg);
 return;
 }
-ACLog(@"[直登] ✅ 拿到新 Token（长度 %lu），拉取账号资料...", (unsigned long)newToken.length);
-// Step 2：GET /client/biz/v2/userinfo/detail 拿真实 UID/昵称/飞机号（以返回 data.id 为权威，绝不依赖请求头配对）
+ACLog(@"[直登] ✅ 拿到合法 32 位新 Token，三步链解析 UID: validateToken → v1 detail → v2 detail");
+// Step 2（HAR 183315 [8] 实证修复）：带 /v2/ 的 userinfo/detail 在 x-userid 为空时直接 500！
+// 三步链：POST /client/user/v2/validateToken（无需 x-userid）解析 data.userId
+//        → 兜底 GET /client/biz/userinfo/detail（不带 /v2/，HAR [89] 实证无需 x-userid 也返回 data.id）
+//        → 最后带 x-userid 调 GET /client/biz/v2/userinfo/detail 拿 clientUserNickName/account
+void (^acFetchV2Detail)(NSString *knownUid) = ^(NSString *knownUid) {
 acInternalRequest = YES;
 NSMutableURLRequest *dReq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cn/client/biz/v2/userinfo/detail"]];
 dReq.HTTPMethod = @"GET";
 dReq.timeoutInterval = 15.0;
 [dReq setValue:newToken forHTTPHeaderField:@"token"];
+if (knownUid.length > 0) [dReq setValue:knownUid forHTTPHeaderField:@"x-userid"];
 [dReq setValue:(ACHeaderValue(acSelf.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
 NSString *ver2 = ACHeaderValue(acSelf.latestHTTPHeaders, @"version");
 if (ver2.length > 0) [dReq setValue:ver2 forHTTPHeaderField:@"version"];
 NSURLSession *dSess = ACDedicatedPluginSession();
 acInternalRequest = NO;
-if (dSess) {
+if (!dSess) { if (completion) completion(NO, @"插件独立网络通道初始化失败"); return; }
 [[dSess dataTaskWithRequest:dReq completionHandler:^(NSData *d2, NSURLResponse *r2, NSError *e2) {
 dispatch_async(dispatch_get_main_queue(), ^{
 __strong typeof(acWSelf) acSelf2 = acWSelf;
@@ -880,6 +901,7 @@ if (!acSelf2) return;
 NSDictionary *uJson = ACSafeDict([NSJSONSerialization JSONObjectWithData:d2 options:0 error:nil]);
 NSDictionary *uData = ACSafeDict(uJson[@"data"]);
 NSString *uid = ACSafeStr(uData[@"id"]);
+if (uid.length < 5) uid = knownUid; // v2 detail 偶发失败时以 validateToken/v1 解析出的 uid 兜底
 NSString *nick = ACSafeStr(uData[@"clientUserNickName"] ?: uData[@"nickName"] ?: username);
 NSString *accNum = ACSafeStr(uData[@"account"] ?: uData[@"phone"] ?: username);
 if (uid.length < 5) {
@@ -896,9 +918,63 @@ ACLog(@"[直登] ✅ 已免退登添加账号: %@ (%@)", nick, accNum);
 if (completion) completion(YES, [NSString stringWithFormat:@"✅ 已免退登添加账号：%@\n（在列表点击即可随时切换）", nick]);
 });
 }] resume];
-} else {
-if (completion) completion(NO, @"插件独立网络通道初始化失败");
+};
+// Step 2a: POST /client/user/v2/validateToken —— 无需 x-userid 即可从 token 解析出真实 userId
+acInternalRequest = YES;
+NSMutableURLRequest *vReq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cn/client/user/v2/validateToken"]];
+vReq.HTTPMethod = @"POST";
+vReq.timeoutInterval = 15.0;
+[vReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+[vReq setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+[vReq setValue:newToken forHTTPHeaderField:@"token"];
+[vReq setValue:(ACHeaderValue(acSelf.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
+NSString *ver1 = ACHeaderValue(acSelf.latestHTTPHeaders, @"version");
+if (ver1.length > 0) [vReq setValue:ver1 forHTTPHeaderField:@"version"];
+vReq.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"token": newToken} options:0 error:nil];
+NSURLSession *vSess = ACDedicatedPluginSession();
+acInternalRequest = NO;
+if (!vSess) { if (completion) completion(NO, @"插件独立网络通道初始化失败"); return; }
+[[vSess dataTaskWithRequest:vReq completionHandler:^(NSData *d1, NSURLResponse *r1, NSError *e1) {
+dispatch_async(dispatch_get_main_queue(), ^{
+__strong typeof(acWSelf) acSelf1 = acWSelf;
+if (!acSelf1) return;
+NSString *parsedUid = nil;
+NSDictionary *j1 = ACSafeDict([NSJSONSerialization JSONObjectWithData:d1 options:0 error:nil]);
+NSDictionary *vData = ACSafeDict(j1[@"data"]);
+if ([ACSafeStr(j1[@"code"]) integerValue] == 200 && [vData[@"isValid"] boolValue]) {
+NSString *u = ACSafeStr(vData[@"userId"]);
+if (u.length > 5) parsedUid = u;
 }
+if (parsedUid.length > 0) { acFetchV2Detail(parsedUid); return; }
+// Step 2b 兜底：GET /client/biz/userinfo/detail（不带 /v2/，无需 x-userid，返回 data.id）
+acInternalRequest = YES;
+NSMutableURLRequest *v1Req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://apiv1.airchat.cn/client/biz/userinfo/detail"]];
+v1Req.HTTPMethod = @"GET";
+v1Req.timeoutInterval = 15.0;
+[v1Req setValue:newToken forHTTPHeaderField:@"token"];
+[v1Req setValue:(ACHeaderValue(acSelf1.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
+NSString *verB = ACHeaderValue(acSelf1.latestHTTPHeaders, @"version");
+if (verB.length > 0) [v1Req setValue:verB forHTTPHeaderField:@"version"];
+NSURLSession *v1Sess = ACDedicatedPluginSession();
+acInternalRequest = NO;
+if (!v1Sess) { if (completion) completion(NO, @"插件独立网络通道初始化失败"); return; }
+[[v1Sess dataTaskWithRequest:v1Req completionHandler:^(NSData *d1b, NSURLResponse *r1b, NSError *e1b) {
+dispatch_async(dispatch_get_main_queue(), ^{
+__strong typeof(acWSelf) acSelf1b = acWSelf;
+if (!acSelf1b) return;
+NSString *v1Uid = nil;
+NSDictionary *j1b = ACSafeDict([NSJSONSerialization JSONObjectWithData:d1b options:0 error:nil]);
+NSDictionary *v1Data = ACSafeDict(j1b[@"data"]);
+if ([ACSafeStr(j1b[@"code"]) integerValue] == 200) {
+NSString *u = ACSafeStr(v1Data[@"id"]);
+if (u.length > 5) v1Uid = u;
+}
+if (v1Uid.length > 0) { acFetchV2Detail(v1Uid); return; }
+if (completion) completion(NO, @"拿到 Token 但 validateToken 与资料接口均未返回 UID");
+});
+}] resume];
+});
+}] resume];
 }); // 关闭外层 dispatch_async（doLoginNoEn 响应处理块）
 }] resume];
 }
@@ -999,6 +1075,108 @@ acInternalRequest = NO;
 if (!s0) { stepId(); return; }
 ACLog(@"[IM] 开始官方 UserSig 链路: 209/get/enc/id → get/id → get/gen (UID %@)", uid);
 [[s0 dataTaskWithRequest:en completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) { stepId(); }] resume];
+}
+// 核心突破（HAR 183315 [40]~[42] vs [80]~[87]）：切号后免手动重启 App，
+// 由插件热重建宿主 Main.storyboard 根控制器——宿主加载主界面时会自动为新账号执行
+// 原生加密 IM 握手（/209/get/enc/id → /get/id → /get/gen → V2TIMManager login），
+// 「对话」列表与「我的」主页当场同步切换，无需杀后台重启！
+- (void)ac_hotReloadHostRootViewControllerForAccount:(ACAccountItem *)acc {
+if (!acc || acc.userId.length < 4) return;
+__weak typeof(self) acWSelf = self;
+dispatch_async(dispatch_get_main_queue(), ^{
+// 1. 先断开旧账号的 V2TIMManager 会话（无论登出成败都继续热重载，
+//    新根控制器加载时宿主会自动为新账号跑完整原生 IM 握手并重连）
+Class timCls = NSClassFromString(@"V2TIMManager");
+id tim = (timCls && [timCls respondsToSelector:@selector(sharedInstance)]) ? ((id (*)(id, SEL))objc_msgSend)(timCls, @selector(sharedInstance)) : nil;
+void (^performUIReload)(void) = ^{
+dispatch_async(dispatch_get_main_queue(), ^{
+UIWindow *targetWindow = [UIApplication sharedApplication].keyWindow;
+if (!targetWindow) {
+for (UIWindow *w in [UIApplication sharedApplication].windows) {
+if (w.isKeyWindow || !w.isHidden) { targetWindow = w; break; }
+}
+}
+if (!targetWindow) return;
+// 2. 如有 Modal 弹窗（如插件面板）先静默收起，避免根控制器替换时视图层级冲突
+if (targetWindow.rootViewController.presentedViewController) {
+[targetWindow.rootViewController dismissViewControllerAnimated:NO completion:nil];
+}
+// 3. 触发宿主原生初始化管理器（注意 Swift 模块前缀为全小写 airchat.）
+NSArray *initClasses = @[@"airchat.AirInitializationDataManager", @"AirInitializationDataManager",
+@"airchat.AirAccountLoginBussiness", @"AirAccountLoginBussiness"];
+for (NSString *clsName in initClasses) {
+Class c = NSClassFromString(clsName);
+if (!c) continue;
+id sharedObj = nil;
+for (NSString *sName in @[@"shared", @"sharedInstance", @"defaultManager", @"manager"]) {
+SEL sSel = NSSelectorFromString(sName);
+if ([c respondsToSelector:sSel]) {
+@try { sharedObj = ((id (*)(id, SEL))objc_msgSend)(c, sSel); } @catch (NSException *e) {}
+if (sharedObj) break;
+}
+}
+id receiver = sharedObj ?: (id)c;
+for (NSString *mName in @[@"initData", @"initializationData", @"reloadUserData", @"loginSuccess"]) {
+SEL mSel = NSSelectorFromString(mName);
+if ([receiver respondsToSelector:mSel]) {
+@try { ((void (*)(id, SEL))objc_msgSend)(receiver, mSel); } @catch (NSException *e) {}
+}
+}
+}
+// 4. 从 Main.storyboard 重新实例化主界面根控制器（与重启 App 走完全相同的原生初始化链路！）
+UIViewController *newRootVC = nil;
+@try {
+UIStoryboard *mainSB = [UIStoryboard storyboardWithName:@"Main" bundle:[NSBundle mainBundle]];
+if (mainSB) newRootVC = [mainSB instantiateInitialViewController];
+} @catch (NSException *e) { ACLog(@"[热重载] Main.storyboard 实例化异常: %@", e.reason); }
+if (!newRootVC && targetWindow.rootViewController) {
+Class oldRootCls = [targetWindow.rootViewController class];
+@try { newRootVC = [[oldRootCls alloc] init]; } @catch (NSException *e) {}
+}
+if (newRootVC) {
+[UIView transitionWithView:targetWindow duration:0.25
+options:UIViewAnimationOptionTransitionCrossDissolve
+animations:^{
+BOOL oldState = [UIView areAnimationsEnabled];
+[UIView setAnimationsEnabled:NO];
+targetWindow.rootViewController = newRootVC;
+[targetWindow makeKeyAndVisible];
+[UIView setAnimationsEnabled:oldState];
+} completion:^(BOOL finished) {
+ACLog(@"[热重载] ✅ 宿主主界面已热重建，账号 %@ 的对话列表/主页/IM 由原生链路自动接管", acc.userId);
+// 宿主重建主界面后立即触发一次飞行圈流量，重新嗅探新会话签名对
+ACTriggerMomentsBackgroundRefresh();
+// 0.6s 后（等宿主完成 [80]~[87] IM 握手）重挂插件 IM 监听并刷新数据
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+__strong typeof(acWSelf) acSelfLate = acWSelf;
+if (!acSelfLate) return;
+[acSelfLate setupIMGroupWelcomeListener];
+[acSelfLate reloadAllDataWithProgress:nil completion:nil];
+});
+}];
+} else {
+// 兜底：无法热重建根控制器时退回强制刷新所有页面
+__strong typeof(acWSelf) acSelfFB = acWSelf;
+if (acSelfFB) [acSelfFB ac_forceRefreshHostAppUI];
+}
+});
+};
+SEL logoutSel = NSSelectorFromString(@"logout:fail:");
+if (tim && [tim respondsToSelector:logoutSel]) {
+void (^logoutSucc)(void) = ^{ performUIReload(); };
+void (^logoutFail)(int code, NSString *desc) = ^{ performUIReload(); };
+NSMethodSignature *sig = [tim methodSignatureForSelector:logoutSel];
+if (sig) {
+NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+[inv setTarget:tim]; [inv setSelector:logoutSel];
+[inv setArgument:(void *)&logoutSucc atIndex:2];
+[inv setArgument:(void *)&logoutFail atIndex:3];
+[inv invoke];
+return;
+}
+}
+performUIReload();
+});
 }
 // 将目标账号同步写入宿主 NSUserDefaults 的登录态键 + 官方「最多3个账号」槽位数组（突破官方限制的软方案）
 - (void)ac_syncAccountToHostUserDefaults:(ACAccountItem *)acc {
@@ -1241,16 +1419,49 @@ if ([acc isKindOfClass:[ACAccountItem class]]) [arr addObject:[acc toDict]];
 @synchronized (self) {
 self.accountList = [NSMutableArray array];
 NSArray *arr = [NSArray arrayWithContentsOfFile:[self accountsCachePath]];
+BOOL acCleanedPolluted = NO;
 if ([arr isKindOfClass:[NSArray class]]) {
 for (NSDictionary *d in arr) {
 ACAccountItem *acc = [ACAccountItem fromDict:d];
-if (acc && acc.token.length > 5) [self.accountList addObject:acc];
+if (!acc) continue;
+// HAR 183315 污染清理：/209/get/enc/id 返回的 24 位 Base64 密钥（Q0EdQ2hMGW9nbQB/EBpIYQc=）
+// 曾被旧宽松判定误存为 Token。启动时严格校验 32 位纯字母数字，非法 Token 一律置空
+// （条目保留，账号+密码还在，可免退登静默重登）
+if (acc.token.length > 0 && !ACIsValidAuthToken(acc.token)) {
+ACLog(@"[多账号] 启动清理：账号 %@ 的 Token 非法（长度 %lu，含非字母数字字符，疑被 209/enc/id 密钥污染），已置空待重登",
+acc.remark ?: acc.userId, (unsigned long)acc.token.length);
+acc.token = @"";
+acCleanedPolluted = YES;
+}
+// 有合法 Token 的条目正常保留；Token 被清理但仍有账号+密码的条目也保留（供静默重登）
+if (acc.token.length > 5 || (acc.account.length > 0 && acc.password.length > 0)) {
+[self.accountList addObject:acc];
 }
 }
+}
+if (acCleanedPolluted) [self saveAllAccounts];
 }
 }
 - (void)switchToAccount:(ACAccountItem *)targetAccount completion:(void(^)(BOOL ok, NSString *msg))completion {
 if (!targetAccount || targetAccount.token.length <= 5 || targetAccount.userId.length <= 3) {
+// HAR 183315 修复：Token 缺失/被污染清理但保存过账密 → 免退登静默重登出新 Token 后自动切换
+if (targetAccount && targetAccount.account.length > 0 && targetAccount.password.length > 0) {
+ACLog(@"[账号切换] 账号 %@ 无有效 Token，用已存账密静默重登...", targetAccount.remark ?: targetAccount.account);
+__weak typeof(self) acWSelf = self;
+[self ac_loginWithUsername:targetAccount.account password:targetAccount.password completion:^(BOOL ok, NSString *msg) {
+__strong typeof(acWSelf) acSelf = acWSelf;
+if (!acSelf) return;
+if (!ok) { if (completion) completion(NO, [NSString stringWithFormat:@"❌ 静默重登失败：%@", msg]); return; }
+ACAccountItem *fresh = nil;
+for (ACAccountItem *it in acSelf.accountList) {
+if (it.token.length > 5 && ([it.userId isEqualToString:targetAccount.userId] || [it.account isEqualToString:targetAccount.account])) { fresh = it; break; }
+}
+if (!fresh) { if (completion) completion(NO, @"❌ 重登成功但未找到账号条目"); return; }
+fresh.password = targetAccount.password;
+[acSelf ac_performAccountSwitch:fresh completion:completion];
+}];
+return;
+}
 if (completion) completion(NO, @"❌ 该账号无有效凭证，请先登录该号后点「💾 保存当前登录账号」");
 return;
 }
@@ -1351,10 +1562,10 @@ ACTriggerMomentsBackgroundRefresh(); // 触发一次原生流量，重新嗅探�
 [self saveAllCustomSettings];
 [self setupIMGroupWelcomeListener];
 [self reloadAllDataWithProgress:nil completion:nil];
-// 根治「会话断连」+「对话列表不切换」（HAR [82]~[101] vs [17]~[28]）：
-// 插件旧方案只改 HTTP 头，未走官方 209/get/enc/id → get/id → get/gen 链路重取 IM UserSig 重连 V2TIMManager，
-// 导致 wss 长连接 400、对话停留在旧账号本地缓存。这里补齐完整官方 IM 重连链路。
-[self ac_reconnectTencentIMForAccount:targetAccount];
+// 根治「会话断连」+「对话列表不切换」+「需重启才切换」（HAR 183315 [40]~[42] vs [80]~[87]）：
+// 免重启热重载宿主 Main.storyboard 根控制器，让宿主原生执行 [80]~[87] 加密 IM 握手，
+// 对话列表/主页/IM 长连接当场全部切换到新账号（热重载内部已含 V2TIMManager logout）
+[self ac_hotReloadHostRootViewControllerForAccount:targetAccount];
 NSString *tip = [NSString stringWithFormat:@"✅ 已切换到账号：【%@】（主页与全局接口已同步接管）", targetAccount.remark];
 ACLog(@"%@", tip);
 if (completion) completion(YES, tip);
@@ -1365,8 +1576,9 @@ if (!item || (item.account.length == 0 && (item.token.length <= 10))) {
 if (completion) completion(NO, @"账号或密码为空");
 return;
 }
-if (item.token.length <= 10 || item.userId.length <= 3) {
-if (completion) completion(NO, @"该账号暂无缓存凭证：请先用此账号登录 App，再进面板「💾 保存当前登录账号」重新保存");
+// HAR 183315 修复：Token 缺失/被污染清理但保存过账密 → 放行给 switchToAccount 走静默重登链路
+if ((item.token.length <= 10 || item.userId.length <= 3) && !(item.account.length > 0 && item.password.length > 0)) {
+if (completion) completion(NO, @"该账号暂无缓存凭证：请点「➕ 添加账号」输入该号账密免退登重加（自动刷新 Token）");
 return;
 }
 [self switchToAccount:item completion:completion];
@@ -6532,15 +6744,13 @@ dispatch_async(dispatch_get_main_queue(), ^{
 });
 }
 }
-// [57] doLoginNoEn 等登录接口返回的全新 Token（data 为 24~64 位无空格字符串）：提前记入原生会话副本，
-// 供紧随其后的 /userinfo/detail 收割时正确配对（官方登录新号后 App 会立刻拉 detail）
+// [57] doLoginNoEn 等登录接口返回的全新 Token：必须严格 32 位纯字母数字才入库！
+// HAR 183315 [80] 实证：/209/get/enc/id 返回 24 位 Base64 密钥 "Q0EdQ2hMGW9nbQB/EBpIYQc="，
+// 旧的 24~64 位宽松判定把它误当登录 Token，把本地所有账号的真 Token 全部覆盖污染 → 全部 401！
 id acDataField = dict[@"data"];
-if ([acDataField isKindOfClass:[NSString class]]) {
-NSString *acStrData = (NSString *)acDataField;
-if (acStrData.length >= 24 && acStrData.length <= 64 && ![acStrData containsString:@" "] && ![acStrData hasPrefix:@"http"]) {
-ACNativeAuthStore()[@"token"] = acStrData;
-ACLog(@"[多账号] 已捕获登录接口返回的新 Token（长度 %lu），等待 userinfo/detail 收割入库", (unsigned long)acStrData.length);
-}
+if ([acDataField isKindOfClass:[NSString class]] && ACIsValidAuthToken((NSString *)acDataField)) {
+ACNativeAuthStore()[@"token"] = (NSString *)acDataField;
+ACLog(@"[多账号] 已捕获登录接口返回的合法 32 位新 Token，等待 userinfo/detail 收割入库");
 }
 // 全自动无感保存/更新当前登录账号（官方「账号管理」添加或切换新号后必经 /userinfo/detail，自动入库）
 // HAR [103] 串号修复：服务器严格按请求 token 返回该 token 归属账号的资料，
@@ -6549,10 +6759,11 @@ NSDictionary *acUData = ACSafeDict(dict[@"data"]);
 NSString *acUid = ACSafeStr(acUData[@"id"]);
 if (!acInternalRequest && acUid.length > 5 && acUData[@"clientUserNickName"] && (acUData[@"account"] || acUData[@"phone"])) {
 ACForwardHelperManager *acMgrAuto = [ACForwardHelperManager shared];
-// token 来源优先用最后实际发出的请求头副本（ACNativeAuthStore），避免 latestHTTPHeaders 嗅探时序错位
+// token 来源优先用最后实际发出的请求头副本（ACNativeAuthStore），避免 latestHTTPHeaders 嗅探时序错位；
+// 且必须通过 32 位纯字母数字校验（ACIsValidAuthToken），杜绝 24 位 Base64 密钥/其它接口串污染入库
 NSString *acTok = ACSafeStr(ACNativeAuthStore()[@"token"]);
-if (acTok.length <= 10) acTok = ACHeaderValue(acMgrAuto.latestHTTPHeaders, @"token");
-if (acTok.length > 10) {
+if (!ACIsValidAuthToken(acTok)) acTok = ACHeaderValue(acMgrAuto.latestHTTPHeaders, @"token");
+if (ACIsValidAuthToken(acTok)) {
 NSString *acNick = ACSafeStr(acUData[@"clientUserNickName"]);
 NSString *acAccNum = ACSafeStr(acUData[@"account"] ?: acUData[@"phone"]);
 dispatch_async(dispatch_get_main_queue(), ^{
