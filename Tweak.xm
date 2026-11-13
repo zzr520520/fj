@@ -868,8 +868,8 @@ dReq.HTTPMethod = @"GET";
 dReq.timeoutInterval = 15.0;
 [dReq setValue:newToken forHTTPHeaderField:@"token"];
 [dReq setValue:(ACHeaderValue(acSelf.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
-ver = ACHeaderValue(acSelf.latestHTTPHeaders, @"version");
-if (ver.length > 0) [dReq setValue:ver forHTTPHeaderField:@"version"];
+NSString *ver2 = ACHeaderValue(acSelf.latestHTTPHeaders, @"version");
+if (ver2.length > 0) [dReq setValue:ver2 forHTTPHeaderField:@"version"];
 NSURLSession *dSess = ACDedicatedPluginSession();
 acInternalRequest = NO;
 if (dSess) {
@@ -899,7 +899,6 @@ if (completion) completion(YES, [NSString stringWithFormat:@"✅ 已免退登添
 } else {
 if (completion) completion(NO, @"插件独立网络通道初始化失败");
 }
-}];
 }] resume];
 }
 // 复刻官方切号链路 [23]→[24]→[28]：/client/biz/v2/userinfo/209/get/enc/id → /get/id → /get/gen
@@ -931,10 +930,10 @@ if (!sig) return;
 NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
 [inv setTarget:tim]; [inv setSelector:loginSel];
 NSString *imId = uid;
-[inv setArgument:&imId atIndex:2];
-[inv setArgument:&userSig atIndex:3];
-[inv setArgument:&succBlock atIndex:4];
-[inv setArgument:&failBlock atIndex:5];
+[inv setArgument:(void *)&imId atIndex:2];
+[inv setArgument:(void *)&userSig atIndex:3];
+[inv setArgument:(void *)&succBlock atIndex:4];
+[inv setArgument:(void *)&failBlock atIndex:5];
 [inv invoke];
 });
 };
@@ -1056,7 +1055,7 @@ if (safe) [ud setObject:safe forKey:k];
 }
 }
 // 同步更新插件持久化的请求头模板，保证下次启动 Header 一致
-NSMutableDictionary *savedHeaders = [[ACSafeDict([[NSUserDefaults standardUserDefaults] objectForKey:@"AC_Saved_HTTPHeaders"]) mutableCopy] ?: [NSMutableDictionary dictionary]];
+NSMutableDictionary *savedHeaders = [ACSafeDict([[NSUserDefaults standardUserDefaults] objectForKey:@"AC_Saved_HTTPHeaders"]) mutableCopy] ?: [NSMutableDictionary dictionary];
 savedHeaders[@"token"] = acc.token;
 savedHeaders[@"x-userid"] = acc.userId;
 [[NSUserDefaults standardUserDefaults] setObject:savedHeaders forKey:@"AC_Saved_HTTPHeaders"];
