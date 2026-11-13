@@ -720,6 +720,7 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_loginWithUsername:(NSString *)username password:(NSString *)password completion:(void(^)(BOOL ok, NSString *msg))completion;
 - (void)ac_reconnectTencentIMForAccount:(ACAccountItem *)acc;
 - (void)ac_hotReloadHostRootViewControllerForAccount:(ACAccountItem *)acc;
+- (void)ac_triggerOfficialAccountChangeOffscreen;
 - (void)ac_syncAccountToHostUserDefaults:(ACAccountItem *)acc;
 - (void)ac_forceRefreshHostAppUI;
 - (void)ac_performAccountSwitch:(ACAccountItem *)acc completion:(void(^)(BOOL ok, NSString *msg))completion;
@@ -891,6 +892,11 @@ if (knownUid.length > 0) [dReq setValue:knownUid forHTTPHeaderField:@"x-userid"]
 [dReq setValue:(ACHeaderValue(acSelf.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
 NSString *ver2 = ACHeaderValue(acSelf.latestHTTPHeaders, @"version");
 if (ver2.length > 0) [dReq setValue:ver2 forHTTPHeaderField:@"version"];
+// 【HAR 192037 [7] 实锤】myJoinGroupPage / v2 detail 缺 X-Lts-Id 网关直接 500！插件内部请求必须带上
+NSString *acLts2 = ACHeaderValue(acSelf.latestHTTPHeaders, @"X-Lts-Id");
+if (acLts2.length > 0) [dReq setValue:acLts2 forHTTPHeaderField:@"X-Lts-Id"];
+NSString *acCh2 = ACHeaderValue(acSelf.latestHTTPHeaders, @"channel");
+if (acCh2.length > 0) [dReq setValue:acCh2 forHTTPHeaderField:@"channel"];
 NSURLSession *dSess = ACDedicatedPluginSession();
 acInternalRequest = NO;
 if (!dSess) { if (completion) completion(NO, @"插件独立网络通道初始化失败"); return; }
@@ -930,6 +936,10 @@ vReq.timeoutInterval = 15.0;
 [vReq setValue:(ACHeaderValue(acSelf.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
 NSString *ver1 = ACHeaderValue(acSelf.latestHTTPHeaders, @"version");
 if (ver1.length > 0) [vReq setValue:ver1 forHTTPHeaderField:@"version"];
+NSString *acLts1 = ACHeaderValue(acSelf.latestHTTPHeaders, @"X-Lts-Id");
+if (acLts1.length > 0) [vReq setValue:acLts1 forHTTPHeaderField:@"X-Lts-Id"];
+NSString *acCh1 = ACHeaderValue(acSelf.latestHTTPHeaders, @"channel");
+if (acCh1.length > 0) [vReq setValue:acCh1 forHTTPHeaderField:@"channel"];
 vReq.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"token": newToken} options:0 error:nil];
 NSURLSession *vSess = ACDedicatedPluginSession();
 acInternalRequest = NO;
@@ -955,6 +965,10 @@ v1Req.timeoutInterval = 15.0;
 [v1Req setValue:(ACHeaderValue(acSelf1.latestHTTPHeaders, @"User-Agent") ?: kACNativeUserAgent) forHTTPHeaderField:@"User-Agent"];
 NSString *verB = ACHeaderValue(acSelf1.latestHTTPHeaders, @"version");
 if (verB.length > 0) [v1Req setValue:verB forHTTPHeaderField:@"version"];
+NSString *acLtsB = ACHeaderValue(acSelf1.latestHTTPHeaders, @"X-Lts-Id");
+if (acLtsB.length > 0) [v1Req setValue:acLtsB forHTTPHeaderField:@"X-Lts-Id"];
+NSString *acChB = ACHeaderValue(acSelf1.latestHTTPHeaders, @"channel");
+if (acChB.length > 0) [v1Req setValue:acChB forHTTPHeaderField:@"channel"];
 NSURLSession *v1Sess = ACDedicatedPluginSession();
 acInternalRequest = NO;
 if (!v1Sess) { if (completion) completion(NO, @"插件独立网络通道初始化失败"); return; }
@@ -1076,9 +1090,9 @@ if (!s0) { stepId(); return; }
 ACLog(@"[IM] 开始官方 UserSig 链路: 209/get/enc/id → get/id → get/gen (UID %@)", uid);
 [[s0 dataTaskWithRequest:en completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) { stepId(); }] resume];
 }
-// 核心突破（HAR 183315 [40]~[42] vs [80]~[87]）：切号后免手动重启 App，
-// 由插件热重建宿主 Main.storyboard 根控制器——宿主加载主界面时会自动为新账号执行
-// 原生加密 IM 握手（/209/get/enc/id → /get/id → /get/gen → V2TIMManager login），
+// 核心突破（HAR 192037 白屏根治 + 183315 [40]~[42] vs [80]~[87]）：切号后免手动重启 App，
+// 绝不替换 window.rootViewController（Main.storyboard 是空白模板 → 替换即白屏），改为：
+// 离屏驱动官方 AirAccountChangeViewController 切槽位 0 + 原地刷新 TabBar 子页面 + 209 链路重连 IM，
 // 「对话」列表与「我的」主页当场同步切换，无需杀后台重启！
 - (void)ac_hotReloadHostRootViewControllerForAccount:(ACAccountItem *)acc {
 if (!acc || acc.userId.length < 4) return;
@@ -1123,42 +1137,27 @@ if ([receiver respondsToSelector:mSel]) {
 }
 }
 }
-// 4. 从 Main.storyboard 重新实例化主界面根控制器（与重启 App 走完全相同的原生初始化链路！）
-UIViewController *newRootVC = nil;
-@try {
-UIStoryboard *mainSB = [UIStoryboard storyboardWithName:@"Main" bundle:[NSBundle mainBundle]];
-if (mainSB) newRootVC = [mainSB instantiateInitialViewController];
-} @catch (NSException *e) { ACLog(@"[热重载] Main.storyboard 实例化异常: %@", e.reason); }
-if (!newRootVC && targetWindow.rootViewController) {
-Class oldRootCls = [targetWindow.rootViewController class];
-@try { newRootVC = [[oldRootCls alloc] init]; } @catch (NSException *e) {}
-}
-if (newRootVC) {
-[UIView transitionWithView:targetWindow duration:0.25
-options:UIViewAnimationOptionTransitionCrossDissolve
-animations:^{
-BOOL oldState = [UIView areAnimationsEnabled];
-[UIView setAnimationsEnabled:NO];
-targetWindow.rootViewController = newRootVC;
-[targetWindow makeKeyAndVisible];
-[UIView setAnimationsEnabled:oldState];
-} completion:^(BOOL finished) {
-ACLog(@"[热重载] ✅ 宿主主界面已热重建，账号 %@ 的对话列表/主页/IM 由原生链路自动接管", acc.userId);
-// 宿主重建主界面后立即触发一次飞行圈流量，重新嗅探新会话签名对
-ACTriggerMomentsBackgroundRefresh();
-// 0.6s 后（等宿主完成 [80]~[87] IM 握手）重挂插件 IM 监听并刷新数据
+// 4. 【HAR 192037 白屏根治】绝不替换 window.rootViewController——飞机的 Main.storyboard 只是空白模板，
+//    真正主界面 ESTabBarController 由纯代码构建，替换即白屏！改为：
+//    a) 离屏驱动官方 airchat.AirAccountChangeViewController 切官方槽位第 0 行（槽位 0 已写入新账号），
+//       宿主自动执行官方 [17]~[28] 完整切号链路（validateToken→detail→209 IM 握手→V2TIMManager login）；
+//    b) 兜底 2s 后插件自跑 209 三步链重连新账号 IM；
+//    c) 原地刷新 TabBar 下所有子页面（主界面绝不白屏）。
+[self ac_triggerOfficialAccountChangeOffscreen];
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+__strong typeof(acWSelf) acSelfIM = acWSelf;
+if (!acSelfIM) return;
+[acSelfIM ac_reconnectTencentIMForAccount:acc]; // 兜底：官方切号未覆盖 IM 时插件自连 UserSig
+});
+ACTriggerMomentsBackgroundRefresh(); // 触发一次飞行圈流量，重新嗅探新会话签名对
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 __strong typeof(acWSelf) acSelfLate = acWSelf;
 if (!acSelfLate) return;
 [acSelfLate setupIMGroupWelcomeListener];
 [acSelfLate reloadAllDataWithProgress:nil completion:nil];
 });
-}];
-} else {
-// 兜底：无法热重建根控制器时退回强制刷新所有页面
 __strong typeof(acWSelf) acSelfFB = acWSelf;
-if (acSelfFB) [acSelfFB ac_forceRefreshHostAppUI];
-}
+if (acSelfFB) [acSelfFB ac_forceRefreshHostAppUI]; // 原地刷新所有 Tab 子页面，绝不白屏
 });
 };
 SEL logoutSel = NSSelectorFromString(@"logout:fail:");
@@ -1177,6 +1176,33 @@ return;
 }
 performUIReload();
 });
+}
+// 离屏驱动官方切号控制器执行第 0 行切换（官方槽位 0 已由 ac_syncAccountToHostUserDefaults 写入新账号）：
+// 宿主将自动执行 [17]~[28] 官方完整链路（validateToken → userinfo/detail → 209 IM 握手 → V2TIMManager login）
+- (void)ac_triggerOfficialAccountChangeOffscreen {
+@try {
+Class changeVCCls = NSClassFromString(@"airchat.AirAccountChangeViewController");
+if (!changeVCCls) changeVCCls = NSClassFromString(@"AirAccountChangeViewController");
+if (!changeVCCls) { ACLog(@"[切号] 未找到官方 AirAccountChangeViewController，走插件兜底重连"); return; }
+UIViewController *changeVC = [[changeVCCls alloc] init];
+[changeVC loadViewIfNeeded];
+UITableView *foundTable = nil;
+for (UIView *sub in changeVC.view.subviews) {
+if ([sub isKindOfClass:[UITableView class]]) { foundTable = (UITableView *)sub; break; }
+}
+if (!foundTable) { ACLog(@"[切号] 官方切号VC无表格视图，走插件兜底重连"); return; }
+NSInteger rows = 0;
+@try { rows = [foundTable numberOfRowsInSection:0]; } @catch (NSException *e) {}
+if (rows <= 0 || ![changeVC respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
+ACLog(@"[切号] 官方切号VC槽位为空(rows=%ld)或不响应选择，走插件兜底重连", (long)rows);
+return;
+}
+NSIndexPath *firstRow = [NSIndexPath indexPathForRow:0 inSection:0];
+((void (*)(id, SEL, id, id))objc_msgSend)(changeVC, @selector(tableView:didSelectRowAtIndexPath:), foundTable, firstRow);
+ACLog(@"[切号] ✅ 已离屏触发官方 AirAccountChangeViewController 切换至槽位 0（宿主原生链路接管）");
+} @catch (NSException *e) {
+ACLog(@"[切号] 离屏触发官方切号VC异常（走插件兜底重连）: %@", e.reason);
+}
 }
 // 将目标账号同步写入宿主 NSUserDefaults 的登录态键 + 官方「最多3个账号」槽位数组（突破官方限制的软方案）
 - (void)ac_syncAccountToHostUserDefaults:(ACAccountItem *)acc {
@@ -1562,9 +1588,8 @@ ACTriggerMomentsBackgroundRefresh(); // 触发一次原生流量，重新嗅探�
 [self saveAllCustomSettings];
 [self setupIMGroupWelcomeListener];
 [self reloadAllDataWithProgress:nil completion:nil];
-// 根治「会话断连」+「对话列表不切换」+「需重启才切换」（HAR 183315 [40]~[42] vs [80]~[87]）：
-// 免重启热重载宿主 Main.storyboard 根控制器，让宿主原生执行 [80]~[87] 加密 IM 握手，
-// 对话列表/主页/IM 长连接当场全部切换到新账号（热重载内部已含 V2TIMManager logout）
+// 根治「会话断连」+「对话列表不切换」+「切换后白屏」（HAR 192037 + 183315 [40]~[42] vs [80]~[87]）：
+// 免重启无白屏切号：离屏驱动官方切号 VC 切槽位 0 + 原地刷新 TabBar 子页面 + 209 链路重连 IM（绝不替换根控制器）
 [self ac_hotReloadHostRootViewControllerForAccount:targetAccount];
 NSString *tip = [NSString stringWithFormat:@"✅ 已切换到账号：【%@】（主页与全局接口已同步接管）", targetAccount.remark];
 ACLog(@"%@", tip);
@@ -6520,7 +6545,10 @@ completionHandler(okData, response, error);
 return %orig(request, cleanHandler);
 }
 }
-if ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] || [urlStr containsString:@"validate"]) {
+// 【HAR 192037 [81] 实锤修复】validateToken 含子串 "validate" 曾被本拦截误杀——响应被篡改成 data:@YES，
+// 插件拿不到 data.userId、官方切号 VC 校验失败直接中断！必须精确排除 validateToken
+if ([urlStr containsString:@"checkPhoneRegister"] || [urlStr containsString:@"updateMyPhoneNumber"] ||
+([urlStr containsString:@"validate"] && ![urlStr containsString:@"validateToken"])) {
 if (completionHandler) {
 void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
 NSDictionary *successDict = @{@"code": @200, @"msg": @"操作成功", @"data": @YES};
@@ -6624,25 +6652,44 @@ return %orig;
 %end
 %hook NSMutableURLRequest
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString * _Nullable)field {
-%orig;
-if (acInternalRequest) return;
-if (field && value && [field isKindOfClass:[NSString class]] && [value isKindOfClass:[NSString class]]) {
+// 【HAR 192037 [83]/[84] 回退根治】热切换锁定期间，宿主定时器/旧会话在“构造阶段”就用旧 Token/UID
+// 填充请求（如 updateOnlineTime 心跳），必须在写入请求前强制替换为锁定账号，
+// 否则出现“新 UID + 旧 Token”混搭 → 服务端 401「登录已过期」；真实宿主凭证仍记入 ACNativeAuthStore 副本
+if (!acInternalRequest && field && value && [field isKindOfClass:[NSString class]] && [value isKindOfClass:[NSString class]]) {
 NSString *lowerField = field.lowercaseString;
-// 热切换锁定：身份类 Header（token/x-userid/channel）不被原生流量冲回 App 登录账号
+ACForwardHelperManager *acMgrSetValue = [ACForwardHelperManager shared];
 BOOL acIdentityKey2 = ([lowerField isEqualToString:@"token"] || [lowerField isEqualToString:@"x-userid"] || [lowerField isEqualToString:@"channel"]);
-if (acIdentityKey2) ACNativeAuthStore()[lowerField] = value;
-BOOL acBlockIdentity = NO;
 if (sHotSwitchUserId.length > 3) {
 // 官方账号管理/登录页出现新身份流量 = 用户正在官方切号：自动解除锁定
 if ([lowerField isEqualToString:@"x-userid"] && ![value isEqualToString:sHotSwitchUserId] && ACIsInNativeAccountOrLoginScreen()) {
 sHotSwitchUserId = nil;
-[ACForwardHelperManager shared].forcedAccountOverride = NO;
+acMgrSetValue.forcedAccountOverride = NO;
 ACLog(@"[多账号] 检测到官方切号流量，已自动解除插件锁定");
 }
 if (sHotSwitchUserId.length > 3) {
+if (acIdentityKey2) ACNativeAuthStore()[lowerField] = value; // 真实宿主凭证入副本
+NSString *acLockedTok = ACHeaderValue(acMgrSetValue.latestHTTPHeaders, @"token");
+if ([lowerField isEqualToString:@"token"] && ACIsValidAuthToken(acLockedTok) && ![value isEqualToString:acLockedTok]) {
+value = acLockedTok; // 强制替换为当前锁定账号的 Token
+} else if ([lowerField isEqualToString:@"x-userid"] && ![value isEqualToString:sHotSwitchUserId]) {
+value = sHotSwitchUserId; // 强制替换为当前锁定账号的 UID
+} else if ([lowerField isEqualToString:@"channel"]) {
+NSString *acLockedCh = ACHeaderValue(acMgrSetValue.latestHTTPHeaders, @"channel");
+if (acLockedCh.length > 0 && ![value isEqualToString:acLockedCh]) value = acLockedCh;
+}
+}
+} else if (acIdentityKey2) {
+ACNativeAuthStore()[lowerField] = value;
+}
+}
+%orig;
+if (acInternalRequest) return;
+if (field && value && [field isKindOfClass:[NSString class]] && [value isKindOfClass:[NSString class]]) {
+NSString *lowerField = field.lowercaseString;
+BOOL acBlockIdentity = NO;
+if (sHotSwitchUserId.length > 3) {
 if ([lowerField isEqualToString:@"x-userid"]) acBlockIdentity = ![value isEqualToString:sHotSwitchUserId];
 else if ([lowerField isEqualToString:@"token"] || [lowerField isEqualToString:@"channel"]) acBlockIdentity = YES;
-}
 }
 BOOL stable = ([lowerField isEqualToString:@"token"] ||
 [lowerField isEqualToString:@"x-userid"] ||
@@ -6663,6 +6710,17 @@ if ([lowerField isEqualToString:@"x-userid"] && value.length > 5) {
 %end
 %hook NSMutableURLRequest
 - (void)addValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+// 锁定期间 addValue 同样强制替换 token/x-userid（与 setValue 同规）
+if (!acInternalRequest && field && value && [field isKindOfClass:[NSString class]] && [value isKindOfClass:[NSString class]] && sHotSwitchUserId.length > 3) {
+NSString *lf = field.lowercaseString;
+ACForwardHelperManager *acMgrAdd = [ACForwardHelperManager shared];
+if ([lf isEqualToString:@"token"]) {
+NSString *acLockedTok = ACHeaderValue(acMgrAdd.latestHTTPHeaders, @"token");
+if (ACIsValidAuthToken(acLockedTok) && ![value isEqualToString:acLockedTok]) value = acLockedTok;
+} else if ([lf isEqualToString:@"x-userid"] && ![value isEqualToString:sHotSwitchUserId]) {
+value = sHotSwitchUserId;
+}
+}
 %orig;
 if (acInternalRequest) return;
 if (![field isKindOfClass:[NSString class]] || ![value isKindOfClass:[NSString class]]) return;
@@ -6681,7 +6739,38 @@ mgr2.latestHTTPHeaders[lf] = value;
 }
 }
 - (void)setAllHTTPHeaderFields:(NSDictionary<NSString *,NSString *> *)headers {
-%orig;
+// 【HAR 192037 [83]/[84] 回退根治】锁定期间批量设置 Header 时，写入前强制替换 token/x-userid/channel
+NSDictionary *acOutHeaders = headers;
+if (!acInternalRequest && headers.count > 0 && sHotSwitchUserId.length > 3) {
+ACForwardHelperManager *acMgrAll = [ACForwardHelperManager shared];
+NSString *acSniffUid = ACHeaderValue(headers, @"x-userid");
+if (acSniffUid.length > 3 && ![acSniffUid isEqualToString:sHotSwitchUserId] && ACIsInNativeAccountOrLoginScreen()) {
+sHotSwitchUserId = nil;
+acMgrAll.forcedAccountOverride = NO;
+ACLog(@"[多账号] 检测到官方切号流量，已自动解除插件锁定");
+}
+if (sHotSwitchUserId.length > 3) {
+NSMutableDictionary *acFixed = [acOutHeaders mutableCopy];
+[headers enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
+if (![k isKindOfClass:[NSString class]] || ![v isKindOfClass:[NSString class]]) return;
+NSString *lk = k.lowercaseString;
+if ([lk isEqualToString:@"token"]) {
+ACNativeAuthStore()[@"token"] = v;
+NSString *acLockedTok = ACHeaderValue(acMgrAll.latestHTTPHeaders, @"token");
+if (ACIsValidAuthToken(acLockedTok) && ![v isEqualToString:acLockedTok]) acFixed[k] = acLockedTok;
+} else if ([lk isEqualToString:@"x-userid"]) {
+ACNativeAuthStore()[@"x-userid"] = v;
+if (![v isEqualToString:sHotSwitchUserId]) acFixed[k] = sHotSwitchUserId;
+} else if ([lk isEqualToString:@"channel"]) {
+ACNativeAuthStore()[@"channel"] = v;
+NSString *acLockedCh = ACHeaderValue(acMgrAll.latestHTTPHeaders, @"channel");
+if (acLockedCh.length > 0 && ![v isEqualToString:acLockedCh]) acFixed[k] = acLockedCh;
+}
+}];
+acOutHeaders = acFixed;
+}
+}
+%orig(acOutHeaders);
 if (acInternalRequest || headers.count == 0) return;
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 [headers enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSString *v, BOOL *stop) {
