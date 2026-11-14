@@ -618,6 +618,19 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)onMomentTimerTick;
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion;
 - (BOOL)ac_tryNativeMomentPublish:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion;
+// 跨实现段调用前向声明（主实现被 COS category 分为两段，接口声明保证全部可见）
+- (void)ac_sendPublishPayload:(NSDictionary *)bodyDict
+                         task:(ACMomentTaskItem *)task
+                 hasLocalMedia:(BOOL)hasLocalMedia
+               allowWarmupTry:(BOOL)allowWarmupTry
+                   completion:(void(^)(BOOL ok, NSString *msg))completion;
+- (void)ac_publishMomentViaHTTP:(ACMomentTaskItem *)task
+                 allowWarmupTry:(BOOL)allowWarmupTry
+                     completion:(void(^)(BOOL ok, NSString *msg))completion;
+- (void)handleNewMembersJoinedGroup:(NSString *)groupID memberList:(NSArray *)memberList;
+- (void)addFriendWithId:(NSString *)uid name:(NSString *)nick tag:(NSString *)tag chatMeType:(NSInteger)chatMeType;
+- (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)nick groupId:(NSString *)gid role:(NSString *)role chatMeType:(NSInteger)chatMeType;
+- (void)addGroupWithId:(NSString *)gid name:(NSString *)gname ban:(BOOL)ban;
 - (void)triggerSingleVoiceCallForTarget:(NSString *)uid nick:(NSString *)nick completion:(void(^)(void))completion;
 // v2.1 新增：统一消息入口（TIM 监听代理与直接监听共用）、发动态节流/重试
 - (void)ac_handleIncomingMessage:(id)msg;
