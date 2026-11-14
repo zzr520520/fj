@@ -675,6 +675,254 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 @end
 // 前置声明：账号切换后触发飞行圈后台刷新，重新嗅探新会话的签名对（X-Lts-Id + X-Request-No）
 static void ACTriggerMomentsBackgroundRefresh(void);
+#pragma mark - 2.1.2a 腾讯云 COS 真实 STS 凭证拉取与本地素材上传（完全对齐 AirChat 2.1.8）
+@protocol ACQCloudSignatureProviderProtocol <NSObject>
+@end
+
+@interface ACQCloudCredentialStub : NSObject
+@property (nonatomic, copy) NSString *secretID;
+@property (nonatomic, copy) NSString *secretKey;
+@property (nonatomic, copy) NSString *token;
+@property (nonatomic, strong) NSDate *startDate;
+@property (nonatomic, strong) NSDate *expirationDate;
+@end
+
+@interface ACQCloudAuthentationV5CreatorStub : NSObject
+- (instancetype)initWithCredential:(id)credential;
+@end
+
+@interface ACQCloudCOSXMLEndPointStub : NSObject
+@property (nonatomic, copy) NSString *regionName;
+@end
+
+@interface ACQCloudServiceConfigurationStub : NSObject
+@property (nonatomic, strong) id endpoint;
+@property (nonatomic, strong) id signatureProvider;
+@end
+
+@interface ACQCloudUploadObjectResultStub : NSObject
+@property (nonatomic, copy) NSString *location;
+@property (nonatomic, copy) NSString *bucket;
+@property (nonatomic, copy) NSString *key;
+@end
+
+@interface ACQCloudCOSXMLUploadObjectRequestStub : NSObject
+@property (nonatomic, copy) NSString *bucket;
+@property (nonatomic, copy) NSString *regionName;
+@property (nonatomic, copy) NSString *object;
+@property (nonatomic, strong) id body;
+@property (nonatomic, copy) NSString *contentType;
+- (void)setFinishBlock:(void (^)(ACQCloudUploadObjectResultStub *result, NSError *error))finishBlock;
+@end
+
+@interface ACQCloudCOSTransferMangerServiceStub : NSObject
++ (void)registerCOSTransferMangerWithConfiguration:(id)config withKey:(NSString *)key;
++ (instancetype)costransfermangerServiceForKey:(NSString *)key;
++ (void)removeTransferMangerServiceWithKey:(NSString *)key;
+- (void)UploadObject:(id)req;
+@end
+
+static NSString *ACContentTypeForFilePath(NSString *path) {
+    NSString *ext = path.pathExtension.lowercaseString;
+    if ([ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] || [ext isEqualToString:@"m4v"]) {
+        return @"video/mp4";
+    }
+    if ([ext isEqualToString:@"png"]) return @"image/png";
+    if ([ext isEqualToString:@"gif"]) return @"image/gif";
+    return @"image/jpeg";
+}
+
+static CGSize ACImagePixelSizeAtPath(NSString *path) {
+    UIImage *img = [UIImage imageWithContentsOfFile:path];
+    if (!img) return CGSizeMake(720, 720);
+    CGFloat w = img.size.width * img.scale;
+    CGFloat h = img.size.height * img.scale;
+    if (w <= 0 || h <= 0) return CGSizeMake(720, 720);
+    return CGSizeMake(w, h);
+}
+
+static CGSize ACVideoPixelSizeAtPath(NSString *path) {
+    @try {
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+        AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        if (track) {
+            CGSize sz = CGSizeApplyAffineTransform(track.naturalSize, track.preferredTransform);
+            CGFloat w = fabs(sz.width);
+            CGFloat h = fabs(sz.height);
+            if (w > 0 && h > 0) return CGSizeMake(w, h);
+        }
+    } @catch (NSException *e) {}
+    return CGSizeMake(720, 1280);
+}
+
+@implementation ACForwardHelperManager (ACMomentUpload)
+
+- (void)ac_requestCOSSTSWithFileName:(NSString *)fileName
+                          completion:(void(^)(NSDictionary *stsData, NSString *errMsg))completion {
+    NSString *host = [self ac_activeBusinessHost];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/dev/file/cos/sts/credential", host]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 15.0;
+    [self ac_applyCapturedHeadersToRequest:req];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+
+    NSDictionary *reqBody = @{@"fileName": fileName ?: @"cos_upload_file.jpg"};
+    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:reqBody options:0 error:nil];
+    req.HTTPBody = bodyData;
+    if (bodyData.length > 0) {
+        [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
+    }
+
+    NSURLSession *session = ACDedicatedPluginSession();
+    if (!session) {
+        if (completion) completion(nil, @"网络会话未初始化");
+        return;
+    }
+
+    ACLog(@"[COS] POST /client/dev/file/cos/sts/credential fileName=%@", fileName);
+    acInternalRequest = YES;
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error || data.length == 0) {
+                if (completion) completion(nil, error.localizedDescription ?: @"STS 接口无响应");
+                return;
+            }
+            NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+            NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
+            NSDictionary *sts = ACSafeDict(json[@"data"]);
+            if (code != 200 || !sts) {
+                if (completion) completion(nil, [NSString stringWithFormat:@"STS 获取失败 code=%ld msg=%@", (long)code, ACSafeStr(json[@"msg"])]);
+                return;
+            }
+            if (completion) completion(sts, nil);
+        });
+    }];
+    acInternalRequest = NO;
+    [task resume];
+}
+
+- (void)ac_uploadLocalFileAtPath:(NSString *)filePath
+                      objectName:(NSString *)suggestedFileName
+                      completion:(void(^)(NSString *cdnURL, NSString *errMsg))completion {
+    if (filePath.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+        if (completion) completion(nil, @"本地素材文件不存在");
+        return;
+    }
+
+    NSString *ext = filePath.pathExtension.length > 0 ? filePath.pathExtension.lowercaseString : @"jpg";
+    NSString *finalName = suggestedFileName.length > 0
+        ? suggestedFileName
+        : [NSString stringWithFormat:@"cos_upload_%.0f.%@", [[NSDate date] timeIntervalSince1970] * 1000.0, ext];
+
+    [self ac_requestCOSSTSWithFileName:finalName completion:^(NSDictionary *sts, NSString *errMsg) {
+        if (!sts) {
+            if (completion) completion(nil, errMsg ?: @"STS 凭证为空");
+            return;
+        }
+
+        NSString *ak = ACSafeStr(sts[@"accessKeyId"]);
+        if (ak.length == 0) ak = ACSafeStr(sts[@"tmpSecretId"]);
+        NSString *sk = ACSafeStr(sts[@"accessKeySecret"]);
+        if (sk.length == 0) sk = ACSafeStr(sts[@"tmpSecretKey"]);
+        NSString *tok = ACSafeStr(sts[@"securityToken"]);
+        if (tok.length == 0) tok = ACSafeStr(sts[@"sessionToken"]);
+        NSString *bucket = ACSafeStr(sts[@"bucket"]);
+        NSString *region = ACSafeStr(sts[@"region"]);
+        NSString *uploadPath = ACSafeStr(sts[@"uploadPath"]);
+
+        if (ak.length == 0 || sk.length == 0 || bucket.length == 0 || region.length == 0) {
+            ACLog(@"[COS] STS 字段缺失: %@", sts);
+            if (completion) completion(nil, @"STS 返回凭证字段不完整");
+            return;
+        }
+
+        NSString *objectKey = nil;
+        if (uploadPath.length > 0) {
+            while ([uploadPath hasPrefix:@"/"]) uploadPath = [uploadPath substringFromIndex:1];
+            if ([uploadPath.lowercaseString hasSuffix:[@"." stringByAppendingString:ext]]) {
+                objectKey = uploadPath;
+            } else {
+                if (![uploadPath hasSuffix:@"/"]) uploadPath = [uploadPath stringByAppendingString:@"/"];
+                objectKey = [uploadPath stringByAppendingString:finalName];
+            }
+        } else {
+            NSDateFormatter *df = [[NSDateFormatter alloc] init];
+            df.dateFormat = @"yyyy/M/d";
+            objectKey = [NSString stringWithFormat:@"%@/%@", [df stringFromDate:[NSDate date]], finalName];
+        }
+
+        Class credCls = NSClassFromString(@"QCloudCredential");
+        Class sigCls  = NSClassFromString(@"QCloudAuthentationV5Creator");
+        Class epCls   = NSClassFromString(@"QCloudCOSXMLEndPoint");
+        Class cfgCls  = NSClassFromString(@"QCloudServiceConfiguration");
+        Class mgrCls  = NSClassFromString(@"QCloudCOSTransferMangerService");
+        Class reqCls  = NSClassFromString(@"QCloudCOSXMLUploadObjectRequest");
+
+        if (!credCls || !sigCls || !epCls || !cfgCls || !mgrCls || !reqCls) {
+            if (completion) completion(nil, @"宿主缺少 QCloudCOSXML 组件");
+            return;
+        }
+
+        @try {
+            ACQCloudCredentialStub *cred = [[credCls alloc] init];
+            cred.secretID = ak;
+            cred.secretKey = sk;
+            cred.token = tok;
+            cred.startDate = [NSDate dateWithTimeIntervalSinceNow:-60];
+            cred.expirationDate = [NSDate dateWithTimeIntervalSinceNow:1800];
+
+            id sigProvider = [[sigCls alloc] initWithCredential:cred];
+            ACQCloudCOSXMLEndPointStub *ep = [[epCls alloc] init];
+            ep.regionName = region;
+
+            ACQCloudServiceConfigurationStub *cfg = [[cfgCls alloc] init];
+            cfg.endpoint = ep;
+            cfg.signatureProvider = sigProvider;
+
+            NSString *serviceKey = [NSString stringWithFormat:@"ac_moment_cos_%@", [[NSUUID UUID] UUIDString]];
+            [mgrCls registerCOSTransferMangerWithConfiguration:cfg withKey:serviceKey];
+            ACQCloudCOSTransferMangerServiceStub *cosMgr = [mgrCls costransfermangerServiceForKey:serviceKey];
+
+            ACQCloudCOSXMLUploadObjectRequestStub *putReq = [[reqCls alloc] init];
+            putReq.bucket = bucket;
+            putReq.regionName = region;
+            putReq.object = objectKey;
+            putReq.body = [NSURL fileURLWithPath:filePath];
+            putReq.contentType = ACContentTypeForFilePath(filePath);
+
+            NSString *activeHost = [self ac_activeBusinessHost];
+            NSString *cdnPrefix = [activeHost containsString:@".cn"] ? @"https://static.airchat.cn/" : @"https://static.airchat.cc/";
+            NSString *stsDomain = ACSafeStr(sts[@"cdnDomain"]);
+            if (stsDomain.length == 0) stsDomain = ACSafeStr(sts[@"domain"]);
+            if ([stsDomain hasPrefix:@"http"]) {
+                cdnPrefix = [stsDomain hasSuffix:@"/"] ? stsDomain : [stsDomain stringByAppendingString:@"/"];
+            }
+
+            [putReq setFinishBlock:^(ACQCloudUploadObjectResultStub *result, NSError *error) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @try { [mgrCls removeTransferMangerServiceWithKey:serviceKey]; } @catch (NSException *e) {}
+                    if (error || !result) {
+                        ACLog(@"[COS] 上传失败: %@", error.localizedDescription ?: @"未知错误");
+                        if (completion) completion(nil, [NSString stringWithFormat:@"COS 上传失败: %@", error.localizedDescription ?: @"未知错误"]);
+                        return;
+                    }
+                    NSString *keyPath = result.key.length > 0 ? result.key : objectKey;
+                    while ([keyPath hasPrefix:@"/"]) keyPath = [keyPath substringFromIndex:1];
+                    NSString *finalURL = [cdnPrefix stringByAppendingString:keyPath];
+                    ACLog(@"[COS] 上传成功 -> %@", finalURL);
+                    if (completion) completion(finalURL, nil);
+                });
+            }];
+            [cosMgr UploadObject:putReq];
+        } @catch (NSException *e) {
+            if (completion) completion(nil, [NSString stringWithFormat:@"COS 初始化异常: %@", e.reason]);
+        }
+    }];
+}
+
+@end
+
 @implementation ACForwardHelperManager
 
 + (instancetype)shared {
@@ -2674,258 +2922,6 @@ if (completion) completion(YES, self.lastMomentLog);
 });
 }
 
-@end // 主实现 ACForwardHelperManager 在此闭合（上方 2.1.2 节全部方法归属主实现）
-
-#pragma mark - 2.1.2a 腾讯云 COS 真实 STS 凭证拉取与本地素材上传（完全对齐 AirChat 2.1.8）
-@protocol ACQCloudSignatureProviderProtocol <NSObject>
-@end
-
-@interface ACQCloudCredentialStub : NSObject
-@property (nonatomic, copy) NSString *secretID;
-@property (nonatomic, copy) NSString *secretKey;
-@property (nonatomic, copy) NSString *token;
-@property (nonatomic, strong) NSDate *startDate;
-@property (nonatomic, strong) NSDate *expirationDate;
-@end
-
-@interface ACQCloudAuthentationV5CreatorStub : NSObject
-- (instancetype)initWithCredential:(id)credential;
-@end
-
-@interface ACQCloudCOSXMLEndPointStub : NSObject
-@property (nonatomic, copy) NSString *regionName;
-@end
-
-@interface ACQCloudServiceConfigurationStub : NSObject
-@property (nonatomic, strong) id endpoint;
-@property (nonatomic, strong) id signatureProvider;
-@end
-
-@interface ACQCloudUploadObjectResultStub : NSObject
-@property (nonatomic, copy) NSString *location;
-@property (nonatomic, copy) NSString *bucket;
-@property (nonatomic, copy) NSString *key;
-@end
-
-@interface ACQCloudCOSXMLUploadObjectRequestStub : NSObject
-@property (nonatomic, copy) NSString *bucket;
-@property (nonatomic, copy) NSString *regionName;
-@property (nonatomic, copy) NSString *object;
-@property (nonatomic, strong) id body;
-@property (nonatomic, copy) NSString *contentType;
-- (void)setFinishBlock:(void (^)(ACQCloudUploadObjectResultStub *result, NSError *error))finishBlock;
-@end
-
-@interface ACQCloudCOSTransferMangerServiceStub : NSObject
-+ (void)registerCOSTransferMangerWithConfiguration:(id)config withKey:(NSString *)key;
-+ (instancetype)costransfermangerServiceForKey:(NSString *)key;
-+ (void)removeTransferMangerServiceWithKey:(NSString *)key;
-- (void)UploadObject:(id)req;
-@end
-
-static NSString *ACContentTypeForFilePath(NSString *path) {
-    NSString *ext = path.pathExtension.lowercaseString;
-    if ([ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] || [ext isEqualToString:@"m4v"]) {
-        return @"video/mp4";
-    }
-    if ([ext isEqualToString:@"png"]) return @"image/png";
-    if ([ext isEqualToString:@"gif"]) return @"image/gif";
-    return @"image/jpeg";
-}
-
-static CGSize ACImagePixelSizeAtPath(NSString *path) {
-    UIImage *img = [UIImage imageWithContentsOfFile:path];
-    if (!img) return CGSizeMake(720, 720);
-    CGFloat w = img.size.width * img.scale;
-    CGFloat h = img.size.height * img.scale;
-    if (w <= 0 || h <= 0) return CGSizeMake(720, 720);
-    return CGSizeMake(w, h);
-}
-
-static CGSize ACVideoPixelSizeAtPath(NSString *path) {
-    @try {
-        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-        AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-        if (track) {
-            CGSize sz = CGSizeApplyAffineTransform(track.naturalSize, track.preferredTransform);
-            CGFloat w = fabs(sz.width);
-            CGFloat h = fabs(sz.height);
-            if (w > 0 && h > 0) return CGSizeMake(w, h);
-        }
-    } @catch (NSException *e) {}
-    return CGSizeMake(720, 1280);
-}
-
-@implementation ACForwardHelperManager (ACMomentUpload)
-
-- (void)ac_requestCOSSTSWithFileName:(NSString *)fileName
-                          completion:(void(^)(NSDictionary *stsData, NSString *errMsg))completion {
-    NSString *host = [self ac_activeBusinessHost];
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/dev/file/cos/sts/credential", host]];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.HTTPMethod = @"POST";
-    req.timeoutInterval = 15.0;
-    [self ac_applyCapturedHeadersToRequest:req];
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-
-    NSDictionary *reqBody = @{@"fileName": fileName ?: @"cos_upload_file.jpg"};
-    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:reqBody options:0 error:nil];
-    req.HTTPBody = bodyData;
-    if (bodyData.length > 0) {
-        [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
-    }
-
-    NSURLSession *session = ACDedicatedPluginSession();
-    if (!session) {
-        if (completion) completion(nil, @"网络会话未初始化");
-        return;
-    }
-
-    ACLog(@"[COS] POST /client/dev/file/cos/sts/credential fileName=%@", fileName);
-    acInternalRequest = YES;
-    NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (error || data.length == 0) {
-                if (completion) completion(nil, error.localizedDescription ?: @"STS 接口无响应");
-                return;
-            }
-            NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
-            NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
-            NSDictionary *sts = ACSafeDict(json[@"data"]);
-            if (code != 200 || !sts) {
-                if (completion) completion(nil, [NSString stringWithFormat:@"STS 获取失败 code=%ld msg=%@", (long)code, ACSafeStr(json[@"msg"])]);
-                return;
-            }
-            if (completion) completion(sts, nil);
-        });
-    }];
-    acInternalRequest = NO;
-    [task resume];
-}
-
-- (void)ac_uploadLocalFileAtPath:(NSString *)filePath
-                      objectName:(NSString *)suggestedFileName
-                      completion:(void(^)(NSString *cdnURL, NSString *errMsg))completion {
-    if (filePath.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
-        if (completion) completion(nil, @"本地素材文件不存在");
-        return;
-    }
-
-    NSString *ext = filePath.pathExtension.length > 0 ? filePath.pathExtension.lowercaseString : @"jpg";
-    NSString *finalName = suggestedFileName.length > 0
-        ? suggestedFileName
-        : [NSString stringWithFormat:@"cos_upload_%.0f.%@", [[NSDate date] timeIntervalSince1970] * 1000.0, ext];
-
-    [self ac_requestCOSSTSWithFileName:finalName completion:^(NSDictionary *sts, NSString *errMsg) {
-        if (!sts) {
-            if (completion) completion(nil, errMsg ?: @"STS 凭证为空");
-            return;
-        }
-
-        NSString *ak = ACSafeStr(sts[@"accessKeyId"]);
-        if (ak.length == 0) ak = ACSafeStr(sts[@"tmpSecretId"]);
-        NSString *sk = ACSafeStr(sts[@"accessKeySecret"]);
-        if (sk.length == 0) sk = ACSafeStr(sts[@"tmpSecretKey"]);
-        NSString *tok = ACSafeStr(sts[@"securityToken"]);
-        if (tok.length == 0) tok = ACSafeStr(sts[@"sessionToken"]);
-        NSString *bucket = ACSafeStr(sts[@"bucket"]);
-        NSString *region = ACSafeStr(sts[@"region"]);
-        NSString *uploadPath = ACSafeStr(sts[@"uploadPath"]);
-
-        if (ak.length == 0 || sk.length == 0 || bucket.length == 0 || region.length == 0) {
-            ACLog(@"[COS] STS 字段缺失: %@", sts);
-            if (completion) completion(nil, @"STS 返回凭证字段不完整");
-            return;
-        }
-
-        NSString *objectKey = nil;
-        if (uploadPath.length > 0) {
-            while ([uploadPath hasPrefix:@"/"]) uploadPath = [uploadPath substringFromIndex:1];
-            if ([uploadPath.lowercaseString hasSuffix:[@"." stringByAppendingString:ext]]) {
-                objectKey = uploadPath;
-            } else {
-                if (![uploadPath hasSuffix:@"/"]) uploadPath = [uploadPath stringByAppendingString:@"/"];
-                objectKey = [uploadPath stringByAppendingString:finalName];
-            }
-        } else {
-            NSDateFormatter *df = [[NSDateFormatter alloc] init];
-            df.dateFormat = @"yyyy/M/d";
-            objectKey = [NSString stringWithFormat:@"%@/%@", [df stringFromDate:[NSDate date]], finalName];
-        }
-
-        Class credCls = NSClassFromString(@"QCloudCredential");
-        Class sigCls  = NSClassFromString(@"QCloudAuthentationV5Creator");
-        Class epCls   = NSClassFromString(@"QCloudCOSXMLEndPoint");
-        Class cfgCls  = NSClassFromString(@"QCloudServiceConfiguration");
-        Class mgrCls  = NSClassFromString(@"QCloudCOSTransferMangerService");
-        Class reqCls  = NSClassFromString(@"QCloudCOSXMLUploadObjectRequest");
-
-        if (!credCls || !sigCls || !epCls || !cfgCls || !mgrCls || !reqCls) {
-            if (completion) completion(nil, @"宿主缺少 QCloudCOSXML 组件");
-            return;
-        }
-
-        @try {
-            ACQCloudCredentialStub *cred = [[credCls alloc] init];
-            cred.secretID = ak;
-            cred.secretKey = sk;
-            cred.token = tok;
-            cred.startDate = [NSDate dateWithTimeIntervalSinceNow:-60];
-            cred.expirationDate = [NSDate dateWithTimeIntervalSinceNow:1800];
-
-            id sigProvider = [[sigCls alloc] initWithCredential:cred];
-            ACQCloudCOSXMLEndPointStub *ep = [[epCls alloc] init];
-            ep.regionName = region;
-
-            ACQCloudServiceConfigurationStub *cfg = [[cfgCls alloc] init];
-            cfg.endpoint = ep;
-            cfg.signatureProvider = sigProvider;
-
-            NSString *serviceKey = [NSString stringWithFormat:@"ac_moment_cos_%@", [[NSUUID UUID] UUIDString]];
-            [mgrCls registerCOSTransferMangerWithConfiguration:cfg withKey:serviceKey];
-            ACQCloudCOSTransferMangerServiceStub *cosMgr = [mgrCls costransfermangerServiceForKey:serviceKey];
-
-            ACQCloudCOSXMLUploadObjectRequestStub *putReq = [[reqCls alloc] init];
-            putReq.bucket = bucket;
-            putReq.regionName = region;
-            putReq.object = objectKey;
-            putReq.body = [NSURL fileURLWithPath:filePath];
-            putReq.contentType = ACContentTypeForFilePath(filePath);
-
-            NSString *activeHost = [self ac_activeBusinessHost];
-            NSString *cdnPrefix = [activeHost containsString:@".cn"] ? @"https://static.airchat.cn/" : @"https://static.airchat.cc/";
-            NSString *stsDomain = ACSafeStr(sts[@"cdnDomain"]);
-            if (stsDomain.length == 0) stsDomain = ACSafeStr(sts[@"domain"]);
-            if ([stsDomain hasPrefix:@"http"]) {
-                cdnPrefix = [stsDomain hasSuffix:@"/"] ? stsDomain : [stsDomain stringByAppendingString:@"/"];
-            }
-
-            [putReq setFinishBlock:^(ACQCloudUploadObjectResultStub *result, NSError *error) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    @try { [mgrCls removeTransferMangerServiceWithKey:serviceKey]; } @catch (NSException *e) {}
-                    if (error || !result) {
-                        ACLog(@"[COS] 上传失败: %@", error.localizedDescription ?: @"未知错误");
-                        if (completion) completion(nil, [NSString stringWithFormat:@"COS 上传失败: %@", error.localizedDescription ?: @"未知错误"]);
-                        return;
-                    }
-                    NSString *keyPath = result.key.length > 0 ? result.key : objectKey;
-                    while ([keyPath hasPrefix:@"/"]) keyPath = [keyPath substringFromIndex:1];
-                    NSString *finalURL = [cdnPrefix stringByAppendingString:keyPath];
-                    ACLog(@"[COS] 上传成功 -> %@", finalURL);
-                    if (completion) completion(finalURL, nil);
-                });
-            }];
-            [cosMgr UploadObject:putReq];
-        } @catch (NSException *e) {
-            if (completion) completion(nil, [NSString stringWithFormat:@"COS 初始化异常: %@", e.reason]);
-        }
-    }];
-}
-
-@end
-
-// 重开主实现：后续动态 HTTP 发布三函数继续挂在 ACForwardHelperManager 上
-@implementation ACForwardHelperManager
 
 // HTTP 静默直发动态：HAR 实证签名对 (X-Lts-Id + X-Request-No) 成对携带即可通过验签（不校验 URL/Body）
 // 报文结构严格还原 HAR 第[11]条实测成功样例 {"contentText":...,"contentType":1,"commentPermission":1}
