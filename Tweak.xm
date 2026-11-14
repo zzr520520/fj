@@ -128,6 +128,25 @@ return dic;
 }
 return nil;
 }
+// 媒体列表自愈：官方协议 sortOrder 从 1 开始；旧版落盘的缓存（sortOrder=0 / mediaType 异常）加载与发布前统一归一化为 1..N
+static NSArray *ACNormalizeMomentMediaList(NSArray *rawList) {
+    NSArray *arr = ACSafeArray(rawList);
+    if (arr.count == 0) return nil;
+    NSMutableArray *outArr = [NSMutableArray array];
+    NSInteger idx = 1;
+    for (NSDictionary *item in arr) {
+        NSDictionary *d = ACSafeDict(item);
+        if (!d || ACSafeStr(d[@"mediaUrl"]).length == 0) continue;
+        NSMutableDictionary *m = [NSMutableDictionary dictionaryWithDictionary:d];
+        NSInteger mType = [ACSafeStr(m[@"mediaType"]) integerValue];
+        if (mType != 1 && mType != 2) mType = 1;
+        m[@"mediaType"] = @(mType);
+        m[@"sortOrder"] = @(idx++);
+        id safe = ACJSONSafeObject(m, 0);
+        if (safe) [outArr addObject:safe];
+    }
+    return (outArr.count > 0) ? [outArr copy] : nil;
+}
 // 插件自身发出的请求（发布动态）不参与 Header 嗅探，避免自我污染
 static BOOL acInternalRequest = NO;
 // 原生会话凭证副本：持续记录宿主 App 当前真实登录态（token/x-userid/channel），供插件自主请求取用
@@ -476,8 +495,8 @@ t.localVideoDuration = [ACSafeStr(dict[@"localVideoDuration"]) intValue];
 t.isOwnMedia = [ACSafeStr(dict[@"isOwnMedia"]) boolValue];
 // 兼容/清洗：凡是旧版没标记 isOwnMedia 的任务，一律丢弃其 capturedMediaList（那些都是抓到的别人动态图片）
 if (t.isOwnMedia) {
-NSArray *mArr = ACSafeArray(dict[@"capturedMediaList"]);
-t.capturedMediaList = (mArr && mArr.count > 0) ? mArr : nil;
+// 历史任务缓存自愈：旧版落盘的 sortOrder=0 等脏字段，加载时统一归一化为 1..N
+t.capturedMediaList = ACNormalizeMomentMediaList(dict[@"capturedMediaList"]);
 } else {
 t.capturedMediaList = nil;
 }
@@ -2924,6 +2943,15 @@ if (completion) completion(YES, self.lastMomentLog);
                 return;
             }
 
+            // 视频 contentType 2/3 自动兼容：部分服务端版本视频动态按 contentType=2（老协议）校验，降级重试一次
+            if ([ACSafeStr(bodyDict[@"contentType"]) integerValue] == 3) {
+                NSMutableDictionary *fallbackBody = [NSMutableDictionary dictionaryWithDictionary:bodyDict];
+                fallbackBody[@"contentType"] = @(2);
+                ACLog(@"[HTTP发布] contentType=3 未通过(%@)，自动降级 contentType=2 兼容重试...", srvMsg);
+                [self ac_sendPublishPayload:fallbackBody task:task hasLocalMedia:hasLocalMedia allowWarmupTry:NO completion:completion];
+                return;
+            }
+
             // 仅纯文字任务才允许用原生编辑页兜底；带自己图/视频的任务绝不走无图原生页兜底，避免漏图！
             if (!hasLocalMedia) {
                 ACLog(@"[HTTP发布] 纯文字直发未通过(%@)，启动原生 UI 引擎兜底...", srvMsg);
@@ -2958,17 +2986,25 @@ if (completion) completion(YES, self.lastMomentLog);
         return;
     }
 
-    // 1. 如果已经缓存过本任务自己上传的远程 COS URL，直接复用
+    // 1. 如果已经缓存过本任务自己上传的远程 COS URL，直接复用（先自愈归一化；缓存脏到不可用则清掉回落本地素材重传）
     if (task.isOwnMedia && task.capturedMediaList.count > 0) {
-        NSDictionary *firstItem = ACSafeDict(task.capturedMediaList.firstObject);
-        NSInteger mType = [ACSafeStr(firstItem[@"mediaType"]) integerValue];
-        NSMutableDictionary *body = [NSMutableDictionary dictionary];
-        body[@"contentText"] = task.contentText ?: @"";
-        body[@"commentPermission"] = @(1);
-        body[@"contentType"] = (mType == 2) ? @(3) : @(2);
-        body[@"mediaList"] = ACJSONSafeObject(task.capturedMediaList, 0) ?: @[];
-        [self ac_sendPublishPayload:body task:task hasLocalMedia:YES allowWarmupTry:allowWarmupTry completion:completion];
-        return;
+        NSArray *mediaList = ACNormalizeMomentMediaList(task.capturedMediaList);
+        if (mediaList.count > 0) {
+            task.capturedMediaList = mediaList;
+            BOOL hasVideo = NO;
+            for (NSDictionary *item in mediaList) {
+                if ([ACSafeStr(item[@"mediaType"]) integerValue] == 2) { hasVideo = YES; break; }
+            }
+            NSMutableDictionary *body = [NSMutableDictionary dictionary];
+            body[@"contentText"] = task.contentText ?: @"";
+            body[@"commentPermission"] = @(1);
+            body[@"contentType"] = hasVideo ? @(3) : @(2);
+            body[@"mediaList"] = mediaList;
+            [self ac_sendPublishPayload:body task:task hasLocalMedia:YES allowWarmupTry:allowWarmupTry completion:completion];
+            return;
+        }
+        task.capturedMediaList = nil;
+        [self saveAllCustomSettings];
     }
 
     // 2. 若本任务绑定了本地图片（localMediaType == 1），先上传 COS
@@ -2997,7 +3033,7 @@ if (completion) completion(YES, self.lastMomentLog);
                 @"mediaType": @(1),
                 @"mediaUrl": cdnURL,
                 @"thumbnailUrl": cdnURL,
-                @"sortOrder": @(0),
+                @"sortOrder": @(1),
                 @"width": @((NSInteger)px.width),
                 @"height": @((NSInteger)px.height)
             }];
@@ -3031,7 +3067,7 @@ if (completion) completion(YES, self.lastMomentLog);
                 NSMutableDictionary *mItem = [NSMutableDictionary dictionary];
                 mItem[@"mediaType"] = @(2);
                 mItem[@"mediaUrl"] = videoURL;
-                mItem[@"sortOrder"] = @(0);
+                mItem[@"sortOrder"] = @(1);
                 mItem[@"width"] = @((NSInteger)vpx.width);
                 mItem[@"height"] = @((NSInteger)vpx.height);
                 if (thumbURL.length > 0) mItem[@"thumbnailUrl"] = thumbURL;
