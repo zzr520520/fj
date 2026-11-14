@@ -428,19 +428,23 @@ r.customVideoDuration = [ACSafeStr(dict[@"customVideoDuration"]) intValue];
 return r;
 }
 @end
-// 定时发动态任务模型（每条动态任务拥有独立的文案与媒体列表）
+// 定时发动态任务模型（每条任务独立固化自己的本地图片/视频/缩略图，绝不串用或抓别人动态）
 @interface ACMomentTaskItem : NSObject
 @property (nonatomic, copy) NSString *taskId;
 @property (nonatomic, copy) NSString *contentText;
-@property (nonatomic, strong) NSArray *capturedMediaList; // 远程 COS 媒体列表
-@property (nonatomic, assign) NSInteger localMediaType;   // 0: 无本地图, 1: 本地图, 2: 本地视频
+@property (nonatomic, strong) NSArray *capturedMediaList;   // 仅保留本任务自己上传后缓存的 COS 媒体信息
+@property (nonatomic, assign) NSInteger localMediaType;     // 0: 纯文字, 1: 本地图, 2: 本地视频
 @property (nonatomic, copy) NSString *localMediaPath;
+@property (nonatomic, copy) NSString *localThumbPath;
+@property (nonatomic, assign) int localVideoDuration;
+@property (nonatomic, assign) BOOL isOwnMedia;            // 标记是否为用户自己选择/上传的媒体，防旧版脏数据混入
 @property (nonatomic, assign) BOOL enabled;
 @property (nonatomic, assign) NSInteger sentCount;
 @property (nonatomic, copy) NSString *lastSentTimeStr;
 - (NSDictionary *)toDict;
 + (instancetype)fromDict:(NSDictionary *)dict;
 @end
+
 @implementation ACMomentTaskItem
 - (NSDictionary *)toDict {
 NSMutableDictionary *md = [NSMutableDictionary dictionary];
@@ -450,8 +454,11 @@ md[@"enabled"] = @(self.enabled);
 md[@"sentCount"] = @(self.sentCount);
 md[@"lastSentTimeStr"] = self.lastSentTimeStr ?: @"待发布";
 md[@"localMediaType"] = @(self.localMediaType);
-md[@"localMediaPath"] = self.localMediaPath ?: @"",
-md[@"capturedMediaList"] = ACSafeArray(self.capturedMediaList) ?: @[];
+md[@"localMediaPath"] = self.localMediaPath ?: @"";
+md[@"localThumbPath"] = self.localThumbPath ?: @"";
+md[@"localVideoDuration"] = @(self.localVideoDuration);
+md[@"isOwnMedia"] = @(self.isOwnMedia);
+md[@"capturedMediaList"] = self.isOwnMedia ? (ACSafeArray(self.capturedMediaList) ?: @[]) : @[];
 return md;
 }
 + (instancetype)fromDict:(NSDictionary *)d {
@@ -460,10 +467,18 @@ if (!dict) return nil;
 ACMomentTaskItem *t = [[ACMomentTaskItem alloc] init];
 t.taskId = ACSafeStr(dict[@"taskId"]);
 t.contentText = ACSafeStr(dict[@"contentText"]);
-NSArray *mArr = ACSafeArray(dict[@"capturedMediaList"]);
-t.capturedMediaList = (mArr && mArr.count > 0) ? mArr : nil;
 t.localMediaType = [ACSafeStr(dict[@"localMediaType"]) integerValue];
 t.localMediaPath = ACSafeStr(dict[@"localMediaPath"]);
+t.localThumbPath = ACSafeStr(dict[@"localThumbPath"]);
+t.localVideoDuration = [ACSafeStr(dict[@"localVideoDuration"]) intValue];
+t.isOwnMedia = [ACSafeStr(dict[@"isOwnMedia"]) boolValue];
+// 兼容/清洗：凡是旧版没标记 isOwnMedia 的任务，一律丢弃其 capturedMediaList（那些都是抓到的别人动态图片）
+if (t.isOwnMedia) {
+NSArray *mArr = ACSafeArray(dict[@"capturedMediaList"]);
+t.capturedMediaList = (mArr && mArr.count > 0) ? mArr : nil;
+} else {
+t.capturedMediaList = nil;
+}
 t.enabled = dict[@"enabled"] ? [ACSafeStr(dict[@"enabled"]) boolValue] : YES;
 t.sentCount = [ACSafeStr(dict[@"sentCount"]) integerValue];
 t.lastSentTimeStr = ACSafeStr(dict[@"lastSentTimeStr"]);
@@ -513,6 +528,7 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, strong) NSTimer *momentTimer;
 @property (nonatomic, strong) NSArray *latestCapturedMomentMediaList;
 @property (nonatomic, copy) NSString *lastMomentLog;
+@property (nonatomic, copy) NSString *momentDraftText;
 @property (nonatomic, assign) BOOL listenerRegistered;
 @property (nonatomic, assign) BOOL groupListenerRegistered;
 @property (nonatomic, assign) BOOL msgListenerRegistered;
@@ -999,20 +1015,8 @@ ACMomentTaskItem *t = [ACMomentTaskItem fromDict:d];
 if (t) [self.momentTasks addObject:t];
 }
 }
-if (self.momentTasks.count == 0) {
-ACMomentTaskItem *t1 = [[ACMomentTaskItem alloc] init];
-t1.taskId = @"m_1";
-t1.contentText = @"✨欢迎各位宝子来到飞机大家庭\n一起努力、一起交流❤️\n有问题随时私信咨询，一直在线哦~";
-t1.enabled = YES;
-t1.lastSentTimeStr = @"待发布";
-[self.momentTasks addObject:t1];
-ACMomentTaskItem *t2 = [[ACMomentTaskItem alloc] init];
-t2.taskId = @"m_2";
-t2.contentText = @"☀️新的一天，机会总是留给有准备的人！\n长期稳定靠谱，欢迎新老朋友交流合作🔥";
-t2.enabled = YES;
-t2.lastSentTimeStr = @"待发布";
-[self.momentTasks addObject:t2];
-}
+// 不再自动插入写死的 m_1/m_2 假任务；同时清空全局抓图模板，彻底杜绝串发别人动态媒体
+self.latestCapturedMomentMediaList = nil;
 } @catch (NSException *e) {}
 }
 - (void)saveLocalPermanentCache {
@@ -1279,7 +1283,7 @@ self.nextMomentFireTimestamp = 0;
 if (!self.autoMomentEnabled || self.momentTasks.count == 0) return;
 NSMutableArray<ACMomentTaskItem *> *activeTasks = [NSMutableArray array];
 for (ACMomentTaskItem *t in self.momentTasks) {
-if (t.enabled && t.contentText.length > 0) {
+if (t.enabled && (t.contentText.length > 0 || t.localMediaType > 0)) {
 [activeTasks addObject:t];
 }
 }
@@ -2657,136 +2661,507 @@ if (completion) completion(YES, self.lastMomentLog);
 });
 }
 
+@end // 主实现 ACForwardHelperManager 在此闭合（上方 2.1.2 节全部方法归属主实现）
+
+#pragma mark - 2.1.2a 腾讯云 COS 真实 STS 凭证拉取与本地素材上传（完全对齐 AirChat 2.1.8）
+@protocol ACQCloudSignatureProviderProtocol <NSObject>
+@end
+
+@interface ACQCloudCredentialStub : NSObject
+@property (nonatomic, copy) NSString *secretID;
+@property (nonatomic, copy) NSString *secretKey;
+@property (nonatomic, copy) NSString *token;
+@property (nonatomic, strong) NSDate *startDate;
+@property (nonatomic, strong) NSDate *expirationDate;
+@end
+
+@interface ACQCloudAuthentationV5CreatorStub : NSObject
+- (instancetype)initWithCredential:(id)credential;
+@end
+
+@interface ACQCloudCOSXMLEndPointStub : NSObject
+@property (nonatomic, copy) NSString *regionName;
+@end
+
+@interface ACQCloudServiceConfigurationStub : NSObject
+@property (nonatomic, strong) id endpoint;
+@property (nonatomic, strong) id signatureProvider;
+@end
+
+@interface ACQCloudUploadObjectResultStub : NSObject
+@property (nonatomic, copy) NSString *location;
+@property (nonatomic, copy) NSString *bucket;
+@property (nonatomic, copy) NSString *key;
+@end
+
+@interface ACQCloudCOSXMLUploadObjectRequestStub : NSObject
+@property (nonatomic, copy) NSString *bucket;
+@property (nonatomic, copy) NSString *regionName;
+@property (nonatomic, copy) NSString *object;
+@property (nonatomic, strong) id body;
+@property (nonatomic, copy) NSString *contentType;
+- (void)setFinishBlock:(void (^)(ACQCloudUploadObjectResultStub *result, NSError *error))finishBlock;
+@end
+
+@interface ACQCloudCOSTransferMangerServiceStub : NSObject
++ (void)registerCOSTransferMangerWithConfiguration:(id)config withKey:(NSString *)key;
++ (instancetype)costransfermangerServiceForKey:(NSString *)key;
++ (void)removeTransferMangerServiceWithKey:(NSString *)key;
+- (void)UploadObject:(id)req;
+@end
+
+static NSString *ACContentTypeForFilePath(NSString *path) {
+    NSString *ext = path.pathExtension.lowercaseString;
+    if ([ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] || [ext isEqualToString:@"m4v"]) {
+        return @"video/mp4";
+    }
+    if ([ext isEqualToString:@"png"]) return @"image/png";
+    if ([ext isEqualToString:@"gif"]) return @"image/gif";
+    return @"image/jpeg";
+}
+
+static CGSize ACImagePixelSizeAtPath(NSString *path) {
+    UIImage *img = [UIImage imageWithContentsOfFile:path];
+    if (!img) return CGSizeMake(720, 720);
+    CGFloat w = img.size.width * img.scale;
+    CGFloat h = img.size.height * img.scale;
+    if (w <= 0 || h <= 0) return CGSizeMake(720, 720);
+    return CGSizeMake(w, h);
+}
+
+static CGSize ACVideoPixelSizeAtPath(NSString *path) {
+    @try {
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+        AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        if (track) {
+            CGSize sz = CGSizeApplyAffineTransform(track.naturalSize, track.preferredTransform);
+            CGFloat w = fabs(sz.width);
+            CGFloat h = fabs(sz.height);
+            if (w > 0 && h > 0) return CGSizeMake(w, h);
+        }
+    } @catch (NSException *e) {}
+    return CGSizeMake(720, 1280);
+}
+
+@implementation ACForwardHelperManager (ACMomentUpload)
+
+- (void)ac_requestCOSSTSWithFileName:(NSString *)fileName
+                          completion:(void(^)(NSDictionary *stsData, NSString *errMsg))completion {
+    NSString *host = [self ac_activeBusinessHost];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/dev/file/cos/sts/credential", host]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 15.0;
+    [self ac_applyCapturedHeadersToRequest:req];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+
+    NSDictionary *reqBody = @{@"fileName": fileName ?: @"cos_upload_file.jpg"};
+    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:reqBody options:0 error:nil];
+    req.HTTPBody = bodyData;
+    if (bodyData.length > 0) {
+        [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
+    }
+
+    NSURLSession *session = ACDedicatedPluginSession();
+    if (!session) {
+        if (completion) completion(nil, @"网络会话未初始化");
+        return;
+    }
+
+    ACLog(@"[COS] POST /client/dev/file/cos/sts/credential fileName=%@", fileName);
+    acInternalRequest = YES;
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error || data.length == 0) {
+                if (completion) completion(nil, error.localizedDescription ?: @"STS 接口无响应");
+                return;
+            }
+            NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+            NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
+            NSDictionary *sts = ACSafeDict(json[@"data"]);
+            if (code != 200 || !sts) {
+                if (completion) completion(nil, [NSString stringWithFormat:@"STS 获取失败 code=%ld msg=%@", (long)code, ACSafeStr(json[@"msg"])]);
+                return;
+            }
+            if (completion) completion(sts, nil);
+        });
+    }];
+    acInternalRequest = NO;
+    [task resume];
+}
+
+- (void)ac_uploadLocalFileAtPath:(NSString *)filePath
+                      objectName:(NSString *)suggestedFileName
+                      completion:(void(^)(NSString *cdnURL, NSString *errMsg))completion {
+    if (filePath.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+        if (completion) completion(nil, @"本地素材文件不存在");
+        return;
+    }
+
+    NSString *ext = filePath.pathExtension.length > 0 ? filePath.pathExtension.lowercaseString : @"jpg";
+    NSString *finalName = suggestedFileName.length > 0
+        ? suggestedFileName
+        : [NSString stringWithFormat:@"cos_upload_%.0f.%@", [[NSDate date] timeIntervalSince1970] * 1000.0, ext];
+
+    [self ac_requestCOSSTSWithFileName:finalName completion:^(NSDictionary *sts, NSString *errMsg) {
+        if (!sts) {
+            if (completion) completion(nil, errMsg ?: @"STS 凭证为空");
+            return;
+        }
+
+        NSString *ak = ACSafeStr(sts[@"accessKeyId"]);
+        if (ak.length == 0) ak = ACSafeStr(sts[@"tmpSecretId"]);
+        NSString *sk = ACSafeStr(sts[@"accessKeySecret"]);
+        if (sk.length == 0) sk = ACSafeStr(sts[@"tmpSecretKey"]);
+        NSString *tok = ACSafeStr(sts[@"securityToken"]);
+        if (tok.length == 0) tok = ACSafeStr(sts[@"sessionToken"]);
+        NSString *bucket = ACSafeStr(sts[@"bucket"]);
+        NSString *region = ACSafeStr(sts[@"region"]);
+        NSString *uploadPath = ACSafeStr(sts[@"uploadPath"]);
+
+        if (ak.length == 0 || sk.length == 0 || bucket.length == 0 || region.length == 0) {
+            ACLog(@"[COS] STS 字段缺失: %@", sts);
+            if (completion) completion(nil, @"STS 返回凭证字段不完整");
+            return;
+        }
+
+        NSString *objectKey = nil;
+        if (uploadPath.length > 0) {
+            while ([uploadPath hasPrefix:@"/"]) uploadPath = [uploadPath substringFromIndex:1];
+            if ([uploadPath.lowercaseString hasSuffix:[@"." stringByAppendingString:ext]]) {
+                objectKey = uploadPath;
+            } else {
+                if (![uploadPath hasSuffix:@"/"]) uploadPath = [uploadPath stringByAppendingString:@"/"];
+                objectKey = [uploadPath stringByAppendingString:finalName];
+            }
+        } else {
+            NSDateFormatter *df = [[NSDateFormatter alloc] init];
+            df.dateFormat = @"yyyy/M/d";
+            objectKey = [NSString stringWithFormat:@"%@/%@", [df stringFromDate:[NSDate date]], finalName];
+        }
+
+        Class credCls = NSClassFromString(@"QCloudCredential");
+        Class sigCls  = NSClassFromString(@"QCloudAuthentationV5Creator");
+        Class epCls   = NSClassFromString(@"QCloudCOSXMLEndPoint");
+        Class cfgCls  = NSClassFromString(@"QCloudServiceConfiguration");
+        Class mgrCls  = NSClassFromString(@"QCloudCOSTransferMangerService");
+        Class reqCls  = NSClassFromString(@"QCloudCOSXMLUploadObjectRequest");
+
+        if (!credCls || !sigCls || !epCls || !cfgCls || !mgrCls || !reqCls) {
+            if (completion) completion(nil, @"宿主缺少 QCloudCOSXML 组件");
+            return;
+        }
+
+        @try {
+            ACQCloudCredentialStub *cred = [[credCls alloc] init];
+            cred.secretID = ak;
+            cred.secretKey = sk;
+            cred.token = tok;
+            cred.startDate = [NSDate dateWithTimeIntervalSinceNow:-60];
+            cred.expirationDate = [NSDate dateWithTimeIntervalSinceNow:1800];
+
+            id sigProvider = [[sigCls alloc] initWithCredential:cred];
+            ACQCloudCOSXMLEndPointStub *ep = [[epCls alloc] init];
+            ep.regionName = region;
+
+            ACQCloudServiceConfigurationStub *cfg = [[cfgCls alloc] init];
+            cfg.endpoint = ep;
+            cfg.signatureProvider = sigProvider;
+
+            NSString *serviceKey = [NSString stringWithFormat:@"ac_moment_cos_%@", [[NSUUID UUID] UUIDString]];
+            [mgrCls registerCOSTransferMangerWithConfiguration:cfg withKey:serviceKey];
+            ACQCloudCOSTransferMangerServiceStub *cosMgr = [mgrCls costransfermangerServiceForKey:serviceKey];
+
+            ACQCloudCOSXMLUploadObjectRequestStub *putReq = [[reqCls alloc] init];
+            putReq.bucket = bucket;
+            putReq.regionName = region;
+            putReq.object = objectKey;
+            putReq.body = [NSURL fileURLWithPath:filePath];
+            putReq.contentType = ACContentTypeForFilePath(filePath);
+
+            NSString *activeHost = [self ac_activeBusinessHost];
+            NSString *cdnPrefix = [activeHost containsString:@".cn"] ? @"https://static.airchat.cn/" : @"https://static.airchat.cc/";
+            NSString *stsDomain = ACSafeStr(sts[@"cdnDomain"]);
+            if (stsDomain.length == 0) stsDomain = ACSafeStr(sts[@"domain"]);
+            if ([stsDomain hasPrefix:@"http"]) {
+                cdnPrefix = [stsDomain hasSuffix:@"/"] ? stsDomain : [stsDomain stringByAppendingString:@"/"];
+            }
+
+            [putReq setFinishBlock:^(ACQCloudUploadObjectResultStub *result, NSError *error) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @try { [mgrCls removeTransferMangerServiceWithKey:serviceKey]; } @catch (NSException *e) {}
+                    if (error || !result) {
+                        ACLog(@"[COS] 上传失败: %@", error.localizedDescription ?: @"未知错误");
+                        if (completion) completion(nil, [NSString stringWithFormat:@"COS 上传失败: %@", error.localizedDescription ?: @"未知错误"]);
+                        return;
+                    }
+                    NSString *keyPath = result.key.length > 0 ? result.key : objectKey;
+                    while ([keyPath hasPrefix:@"/"]) keyPath = [keyPath substringFromIndex:1];
+                    NSString *finalURL = [cdnPrefix stringByAppendingString:keyPath];
+                    ACLog(@"[COS] 上传成功 -> %@", finalURL);
+                    if (completion) completion(finalURL, nil);
+                });
+            }];
+            [cosMgr UploadObject:putReq];
+        } @catch (NSException *e) {
+            if (completion) completion(nil, [NSString stringWithFormat:@"COS 初始化异常: %@", e.reason]);
+        }
+    }];
+}
+
+@end
+
+// 重开主实现：后续动态 HTTP 发布三函数继续挂在 ACForwardHelperManager 上
+@implementation ACForwardHelperManager
+
 // HTTP 静默直发动态：HAR 实证签名对 (X-Lts-Id + X-Request-No) 成对携带即可通过验签（不校验 URL/Body）
 // 报文结构严格还原 HAR 第[11]条实测成功样例 {"contentText":...,"contentType":1,"commentPermission":1}
+- (void)ac_sendPublishPayload:(NSDictionary *)bodyDict
+                         task:(ACMomentTaskItem *)task
+                 hasLocalMedia:(BOOL)hasLocalMedia
+               allowWarmupTry:(BOOL)allowWarmupTry
+                   completion:(void(^)(BOOL ok, NSString *msg))completion {
+    NSString *host = [self ac_activeBusinessHost];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/publish", host]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 15.0;
+    [self ac_applyCapturedHeadersToRequest:req];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+
+    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
+    req.HTTPBody = bodyData;
+    if (bodyData.length > 0) {
+        [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
+    }
+
+    NSURLSession *session = ACDedicatedPluginSession();
+    if (!session) {
+        self.momentPublishing = NO;
+        if (completion) completion(NO, @"网络会话未初始化");
+        return;
+    }
+
+    NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+    NSString *reqNo = ACHeaderValue(self.latestHTTPHeaders, @"X-Request-No");
+    ACLog(@"[HTTP发布] POST /client/biz/v2/post/app/publish contentType=%@ mediaCount=%lu (ltsLen=%lu reqNo=%@)",
+          bodyDict[@"contentType"], (unsigned long)[ACSafeArray(bodyDict[@"mediaList"]) count],
+          (unsigned long)ltsId.length, reqNo);
+
+    acInternalRequest = YES;
+    NSURLSessionDataTask *dataTask = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error || data.length == 0) {
+                ACLog(@"[HTTP发布] 网络错误: %@", error.localizedDescription ?: @"空响应");
+                if (allowWarmupTry && !hasLocalMedia) {
+                    self.momentPublishing = YES;
+                    [self ac_runMomentPublishFlow:task keyWin:nil completion:completion];
+                } else {
+                    self.momentPublishing = NO;
+                    NSString *errMsg = [NSString stringWithFormat:@"⚠️ 发布失败: %@", error.localizedDescription ?: @"空响应"];
+                    self.lastMomentLog = errMsg;
+                    [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+                    if (completion) completion(NO, errMsg);
+                }
+                return;
+            }
+
+            NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+            NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
+            NSString *srvMsg = ACSafeStr(json[@"msg"]);
+            ACLog(@"[HTTP发布] 响应 code=%ld msg=%@ data=%@", (long)code, srvMsg, json[@"data"]);
+
+            if (code == 200) {
+                task.sentCount++;
+                NSDateFormatter *df = [[NSDateFormatter alloc] init];
+                df.dateFormat = @"HH:mm:ss";
+                task.lastSentTimeStr = [df stringFromDate:[NSDate date]];
+                self.lastMomentLog = [NSString stringWithFormat:@"✅ 动态发布成功 (%@) | 累计%ld次", task.lastSentTimeStr, (long)task.sentCount];
+                ACLog(@"%@", self.lastMomentLog);
+                [self saveAllCustomSettings];
+                [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+                self.momentPublishing = NO;
+                if (completion) completion(YES, self.lastMomentLog);
+                return;
+            }
+
+            if ([srvMsg containsString:@"频繁"] || [srvMsg containsString:@"分钟"]) {
+                NSInteger waitMins = ACParseRetryMinutes(srvMsg);
+                self.lastMomentLog = [NSString stringWithFormat:@"⏳ 服务端限频：%@（%ld 分钟后自动重试）", srvMsg, (long)waitMins];
+                ACLog(@"%@", self.lastMomentLog);
+                self.momentPublishing = NO;
+                [self ac_scheduleMomentRetryAfter:(waitMins * 60.0 + 5.0)];
+                [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+                if (completion) completion(NO, self.lastMomentLog);
+                return;
+            }
+
+            if (allowWarmupTry) {
+                ACLog(@"[HTTP发布] 首发未通过(%@)，刷新签名对后重试一次...", srvMsg);
+                ACTriggerMomentsBackgroundRefresh();
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [self ac_sendPublishPayload:bodyDict task:task hasLocalMedia:hasLocalMedia allowWarmupTry:NO completion:completion];
+                });
+                return;
+            }
+
+            // 仅纯文字任务才允许用原生编辑页兜底；带自己图/视频的任务绝不走无图原生页兜底，避免漏图！
+            if (!hasLocalMedia) {
+                ACLog(@"[HTTP发布] 纯文字直发未通过(%@)，启动原生 UI 引擎兜底...", srvMsg);
+                self.momentPublishing = YES;
+                [self ac_runMomentPublishFlow:task keyWin:nil completion:completion];
+            } else {
+                self.momentPublishing = NO;
+                NSString *errMsg = [NSString stringWithFormat:@"❌ 发布失败(%@)", srvMsg.length > 0 ? srvMsg : @"请先浏览一次飞行圈刷新凭证"];
+                self.lastMomentLog = errMsg;
+                [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+                if (completion) completion(NO, errMsg);
+            }
+        });
+    }];
+    acInternalRequest = NO;
+    [dataTask resume];
+}
+
 - (void)ac_publishMomentViaHTTP:(ACMomentTaskItem *)task
-allowWarmupTry:(BOOL)allowWarmupTry
-completion:(void(^)(BOOL ok, NSString *msg))completion {
-NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
-NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
-NSString *reqNo = ACHeaderValue(self.latestHTTPHeaders, @"X-Request-No");
-if ((token.length == 0 || ltsId.length == 0 || reqNo.length == 0) && allowWarmupTry) {
-ACLog(@"[HTTP发布] 签名对未就绪 (token=%lu lts=%lu reqNo=%lu)，触发一次原生刷新热身...",
-(unsigned long)token.length, (unsigned long)ltsId.length, (unsigned long)reqNo.length);
-ACTriggerMomentsBackgroundRefresh();
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.85 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[self ac_publishMomentViaHTTP:task allowWarmupTry:NO completion:completion];
-});
-return;
-}
-NSString *host = [self ac_activeBusinessHost];
-NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/post/app/publish", host]];
-NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-req.HTTPMethod = @"POST";
-req.timeoutInterval = 15.0;
-[self ac_applyCapturedHeadersToRequest:req];
-[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-NSMutableDictionary *body = [NSMutableDictionary dictionary];
-body[@"contentText"] = task.contentText ?: @"";
-body[@"commentPermission"] = @(1);
-NSArray *mediaList = (task.capturedMediaList.count > 0) ? task.capturedMediaList : self.latestCapturedMomentMediaList;
-if (mediaList.count > 0) {
-body[@"contentType"] = @(2);
-body[@"mediaList"] = ACJSONSafeObject(mediaList, 0) ?: @[];
-} else {
-body[@"contentType"] = @(1);
-}
-NSData *bodyData = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-req.HTTPBody = bodyData;
-if (bodyData.length > 0) {
-[req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
-}
-NSURLSession *session = ACDedicatedPluginSession();
-if (!session) {
-self.momentPublishing = NO;
-if (completion) completion(NO, @"网络会话未初始化");
-return;
-}
-ACLog(@"[HTTP发布] POST /client/biz/v2/post/app/publish (ltsLen=%lu reqNo=%@)", (unsigned long)ltsId.length, reqNo);
-acInternalRequest = YES;
-NSURLSessionDataTask *dataTask = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-dispatch_async(dispatch_get_main_queue(), ^{
-if (error || data.length == 0) {
-ACLog(@"[HTTP发布] 网络错误: %@", error.localizedDescription ?: @"空响应");
-if (allowWarmupTry) {
-self.momentPublishing = YES;
-[self ac_runMomentPublishFlow:task keyWin:nil completion:completion];
-} else {
-self.momentPublishing = NO;
-NSString *errMsg = [NSString stringWithFormat:@"⚠️ 发布失败: %@", error.localizedDescription ?: @"空响应"];
-self.lastMomentLog = errMsg;
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, errMsg);
-}
-return;
-}
-NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
-NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
-NSString *srvMsg = ACSafeStr(json[@"msg"]);
-ACLog(@"[HTTP发布] 响应 code=%ld msg=%@ data=%@", (long)code, srvMsg, json[@"data"]);
-if (code == 200) {
-task.sentCount++;
-NSDateFormatter *df = [[NSDateFormatter alloc] init];
-df.dateFormat = @"HH:mm:ss";
-task.lastSentTimeStr = [df stringFromDate:[NSDate date]];
-self.lastMomentLog = [NSString stringWithFormat:@"✅ 动态发布成功 (%@) | 累计%ld次", task.lastSentTimeStr, (long)task.sentCount];
-ACLog(@"%@", self.lastMomentLog);
-[self saveAllCustomSettings];
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-self.momentPublishing = NO;
-if (completion) completion(YES, self.lastMomentLog);
-return;
-}
-// 服务端 5 分钟频控（HAR 第[61]条：发布过于频繁，请5分钟后再次尝试。#SVIP）
-if ([srvMsg containsString:@"频繁"] || [srvMsg containsString:@"分钟"]) {
-NSInteger waitMins = ACParseRetryMinutes(srvMsg);
-self.lastMomentLog = [NSString stringWithFormat:@"⏳ 服务端限频：%@（%ld 分钟后自动重试）", srvMsg, (long)waitMins];
-ACLog(@"%@", self.lastMomentLog);
-self.momentPublishing = NO;
-[self ac_scheduleMomentRetryAfter:(waitMins * 60.0 + 5.0)];
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, self.lastMomentLog);
-return;
-}
-// 签名对可能过期（500 请求失败）且允许热身：刷新飞行圈拿最新配对签名重试一次
-if (allowWarmupTry) {
-ACLog(@"[HTTP发布] 首发未通过(%@)，刷新签名对后重试一次...", srvMsg);
-ACTriggerMomentsBackgroundRefresh();
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[self ac_publishMomentViaHTTP:task allowWarmupTry:NO completion:completion];
-});
-return;
-}
-// 终极兜底：原生 UI 全自动链（发动态→下一步→确认发布）
-ACLog(@"[HTTP发布] 直发未通过(%@)，启动原生 UI 引擎兜底...", srvMsg);
-self.momentPublishing = YES;
-[self ac_runMomentPublishFlow:task keyWin:nil completion:completion];
-});
-}];
-acInternalRequest = NO;
-[dataTask resume];
+                 allowWarmupTry:(BOOL)allowWarmupTry
+                     completion:(void(^)(BOOL ok, NSString *msg))completion {
+    NSString *token = ACHeaderValue(self.latestHTTPHeaders, @"token");
+    NSString *ltsId = ACHeaderValue(self.latestHTTPHeaders, @"X-Lts-Id");
+    NSString *reqNo = ACHeaderValue(self.latestHTTPHeaders, @"X-Request-No");
+    if ((token.length == 0 || ltsId.length == 0 || reqNo.length == 0) && allowWarmupTry) {
+        ACLog(@"[HTTP发布] 签名对未就绪 (token=%lu lts=%lu reqNo=%lu)，触发一次原生刷新热身...",
+              (unsigned long)token.length, (unsigned long)ltsId.length, (unsigned long)reqNo.length);
+        ACTriggerMomentsBackgroundRefresh();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.85 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self ac_publishMomentViaHTTP:task allowWarmupTry:NO completion:completion];
+        });
+        return;
+    }
+
+    // 1. 如果已经缓存过本任务自己上传的远程 COS URL，直接复用
+    if (task.isOwnMedia && task.capturedMediaList.count > 0) {
+        NSDictionary *firstItem = ACSafeDict(task.capturedMediaList.firstObject);
+        NSInteger mType = [ACSafeStr(firstItem[@"mediaType"]) integerValue];
+        NSMutableDictionary *body = [NSMutableDictionary dictionary];
+        body[@"contentText"] = task.contentText ?: @"";
+        body[@"commentPermission"] = @(1);
+        body[@"contentType"] = (mType == 2) ? @(3) : @(2);
+        body[@"mediaList"] = ACJSONSafeObject(task.capturedMediaList, 0) ?: @[];
+        [self ac_sendPublishPayload:body task:task hasLocalMedia:YES allowWarmupTry:allowWarmupTry completion:completion];
+        return;
+    }
+
+    // 2. 若本任务绑定了本地图片（localMediaType == 1），先上传 COS
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (task.localMediaType == 1 && task.localMediaPath.length > 0 && [fm fileExistsAtPath:task.localMediaPath]) {
+        CGSize px = ACImagePixelSizeAtPath(task.localMediaPath);
+        NSString *fileName = [NSString stringWithFormat:@"cos_upload_%.0f.jpg", [[NSDate date] timeIntervalSince1970] * 1000.0];
+        [self ac_uploadLocalFileAtPath:task.localMediaPath objectName:fileName completion:^(NSString *cdnURL, NSString *errMsg) {
+            if (cdnURL.length == 0) {
+                self.momentPublishing = NO;
+                self.lastMomentLog = [NSString stringWithFormat:@"❌ 图片上传失败：%@", errMsg ?: @"未知错误"];
+                [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+                if (completion) completion(NO, self.lastMomentLog);
+                return;
+            }
+            NSArray *mediaList = @[@{
+                @"mediaType": @(1),
+                @"mediaUrl": cdnURL,
+                @"sortOrder": @(0),
+                @"width": @((NSInteger)px.width),
+                @"height": @((NSInteger)px.height)
+            }];
+            task.isOwnMedia = YES;
+            task.capturedMediaList = mediaList;
+            [self saveAllCustomSettings];
+
+            NSMutableDictionary *body = [NSMutableDictionary dictionary];
+            body[@"contentText"] = task.contentText ?: @"";
+            body[@"commentPermission"] = @(1);
+            body[@"contentType"] = @(2);
+            body[@"mediaList"] = mediaList;
+            [self ac_sendPublishPayload:body task:task hasLocalMedia:YES allowWarmupTry:allowWarmupTry completion:completion];
+        }];
+        return;
+    }
+
+    // 3. 若本任务绑定了本地视频（localMediaType == 2），先上传缩略图，再上传视频，最后 contentType=3 发布
+    if (task.localMediaType == 2 && task.localMediaPath.length > 0 && [fm fileExistsAtPath:task.localMediaPath]) {
+        CGSize vpx = ACVideoPixelSizeAtPath(task.localMediaPath);
+        NSString *vidName = [NSString stringWithFormat:@"cos_upload_%.0f.mp4", [[NSDate date] timeIntervalSince1970] * 1000.0];
+        void (^uploadVideoAndPublish)(NSString *) = ^(NSString *thumbURL) {
+            [self ac_uploadLocalFileAtPath:task.localMediaPath objectName:vidName completion:^(NSString *videoURL, NSString *vErr) {
+                if (videoURL.length == 0) {
+                    self.momentPublishing = NO;
+                    self.lastMomentLog = [NSString stringWithFormat:@"❌ 视频上传失败：%@", vErr ?: @"未知错误"];
+                    [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+                    if (completion) completion(NO, self.lastMomentLog);
+                    return;
+                }
+                NSMutableDictionary *mItem = [NSMutableDictionary dictionary];
+                mItem[@"mediaType"] = @(2);
+                mItem[@"mediaUrl"] = videoURL;
+                mItem[@"sortOrder"] = @(0);
+                mItem[@"width"] = @((NSInteger)vpx.width);
+                mItem[@"height"] = @((NSInteger)vpx.height);
+                if (thumbURL.length > 0) mItem[@"thumbnailUrl"] = thumbURL;
+
+                NSArray *mediaList = @[mItem];
+                task.isOwnMedia = YES;
+                task.capturedMediaList = mediaList;
+                [self saveAllCustomSettings];
+
+                NSMutableDictionary *body = [NSMutableDictionary dictionary];
+                body[@"contentText"] = task.contentText ?: @"";
+                body[@"commentPermission"] = @(1);
+                body[@"contentType"] = @(3);
+                body[@"mediaList"] = mediaList;
+                [self ac_sendPublishPayload:body task:task hasLocalMedia:YES allowWarmupTry:allowWarmupTry completion:completion];
+            }];
+        };
+
+        if (task.localThumbPath.length > 0 && [fm fileExistsAtPath:task.localThumbPath]) {
+            NSString *thumbName = [NSString stringWithFormat:@"video_thumbnail_%@.jpg", [[NSUUID UUID] UUIDString]];
+            [self ac_uploadLocalFileAtPath:task.localThumbPath objectName:thumbName completion:^(NSString *thumbURL, NSString *tErr) {
+                if (tErr) ACLog(@"[COS] 视频缩略图上传告警: %@", tErr);
+                uploadVideoAndPublish(thumbURL);
+            }];
+        } else {
+            uploadVideoAndPublish(nil);
+        }
+        return;
+    }
+
+    // 4. 无本地图/视频 → 纯文字发布（绝不再回落到 latestCapturedMomentMediaList）
+    NSMutableDictionary *body = [NSMutableDictionary dictionary];
+    body[@"contentText"] = task.contentText ?: @"";
+    body[@"commentPermission"] = @(1);
+    body[@"contentType"] = @(1);
+    [self ac_sendPublishPayload:body task:task hasLocalMedia:NO allowWarmupTry:allowWarmupTry completion:completion];
 }
 
 - (void)publishMomentTask:(ACMomentTaskItem *)task completion:(void(^)(BOOL ok, NSString *msg))completion {
-ACLog(@"[发布] 启动发动态流程（HTTP签名对直发优先，原生UI兜底）: %@", task.contentText ?: @"");
-if (!task || task.contentText.length == 0) {
-self.momentPublishing = NO;
-if (completion) completion(NO, @"文案为空");
-return;
-}
-if (self.momentPublishing && self.momentPublishingSince > 0 &&
-[[NSDate date] timeIntervalSince1970] - self.momentPublishingSince > 60.0) {
-self.momentPublishing = NO;
-}
-if (self.momentPublishing) {
-self.lastMomentLog = @"⏳ 上一条动态仍在发布中，请稍后再试";
-[[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
-if (completion) completion(NO, self.lastMomentLog);
-return;
-}
-self.momentPublishing = YES;
-self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
-[self ac_publishMomentViaHTTP:task allowWarmupTry:YES completion:completion];
+    ACLog(@"[发布] 启动发动态流程 (mediaType=%ld): %@", (long)task.localMediaType, task.contentText ?: @"");
+    BOOL hasLocalMedia = (task.localMediaType == 1 || task.localMediaType == 2 || (task.isOwnMedia && task.capturedMediaList.count > 0));
+    if (!task || (task.contentText.length == 0 && !hasLocalMedia)) {
+        self.momentPublishing = NO;
+        if (completion) completion(NO, @"文案和媒体均为空");
+        return;
+    }
+    if (self.momentPublishing && self.momentPublishingSince > 0 &&
+        [[NSDate date] timeIntervalSince1970] - self.momentPublishingSince > 90.0) {
+        self.momentPublishing = NO;
+    }
+    if (self.momentPublishing) {
+        self.lastMomentLog = @"⏳ 上一条动态仍在发布中，请稍后再试";
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
+        if (completion) completion(NO, self.lastMomentLog);
+        return;
+    }
+    self.momentPublishing = YES;
+    self.momentPublishingSince = [[NSDate date] timeIntervalSince1970];
+    [self ac_publishMomentViaHTTP:task allowWarmupTry:YES completion:completion];
 }
 
 // （旧版 HTTP 直发入口已删除，由上方原生全自动引擎接管）
@@ -3000,11 +3375,8 @@ NSString *objStr = ACSafeStr(dict[@"objectId"]);
 if ([objStr hasPrefix:@"会话："] && objStr.length > 3) {
 __currentChatPeerId = [objStr substringFromIndex:3];
 }
-// 如果抓到用户自己的动态记录且包含 mediaList，自动更新捕获的动态图片模板
-NSArray *mList = ACSafeArray(dict[@"mediaList"]);
-if (mList && mList.count > 0 && dict[@"contentText"] && dict[@"commentPermission"]) {
-self.latestCapturedMomentMediaList = mList;
-}
+// 【已删除】原来这里不判断 userId 就把信息流里别人的 mediaList 存进 self.latestCapturedMomentMediaList，
+// 导致纯文字/旧任务误发陌生人图片；现在动态媒体一律走任务自己的本地素材 COS 上传
 NSString *cNick = ACSafeStr(dict[@"clientUserNickName"]);
 NSString *cId = ACSafeStr(dict[@"id"]);
 NSString *cmStr = ACSafeStr(dict[@"chatMeType"]);
@@ -4268,6 +4640,9 @@ btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translatio
 if (self.ac_selectedTabIndex == 3) {
 [ACForwardHelperManager shared].welcomeMessageText = textView.text;
 [[ACForwardHelperManager shared] saveAllCustomSettings];
+} else if (self.ac_selectedTabIndex == 5) {
+// 📝动态 Tab：实时记住草稿，切走再切回不丢内容
+[ACForwardHelperManager shared].momentDraftText = textView.text;
 }
 }
 #pragma mark - 5.1 迎新 / 自动回复 / 定时发动态 按钮事件
@@ -4500,28 +4875,60 @@ self.statusLabel.text = [NSString stringWithFormat:@"✅ 已设置每 %ld 分钟
 [self presentViewController:alert animated:YES completion:nil];
 }
 - (void)addMomentTaskFromInput {
-[self.view endEditing:YES];
-NSString *raw = [self.contentTextView.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-if (raw.length == 0) {
-self.statusLabel.textColor = [UIColor systemRedColor];
-self.statusLabel.text = @"❌ 请先在上方输入框填写要定时发布的动态文案！";
-return;
-}
-ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
-ACMomentTaskItem *task = [[ACMomentTaskItem alloc] init];
-task.taskId = [[NSUUID UUID] UUIDString];
-task.contentText = raw;
-task.capturedMediaList = mgr.latestCapturedMomentMediaList;
-task.enabled = YES;
-task.sentCount = 0;
-task.lastSentTimeStr = @"待发布";
-[mgr.momentTasks insertObject:task atIndex:0];
-[mgr saveAllCustomSettings];
-self.contentTextView.text = @"";
-self.statusLabel.textColor = [UIColor systemGreenColor];
-self.statusLabel.text = [NSString stringWithFormat:@"✅ 已添加第 %lu 条动态任务（点击任务右侧「立即发」可直接测试）", (unsigned long)mgr.momentTasks.count];
-[self updateUI];
-[self.tableView reloadData];
+    [self.view endEditing:YES];
+    NSString *raw = [self.contentTextView.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+    NSInteger slotType = [mgr mediaTypeForSlot:ACMediaSlotMoment];
+    if (raw.length == 0 && slotType != 1 && slotType != 2) {
+        self.statusLabel.textColor = [UIColor systemRedColor];
+        self.statusLabel.text = @"❌ 请先输入动态文案，或在右上角【动态专属】选择图片/视频！";
+        return;
+    }
+
+    ACMomentTaskItem *task = [[ACMomentTaskItem alloc] init];
+    task.taskId = [[NSUUID UUID] UUIDString];
+    task.contentText = raw ?: @"";
+    task.enabled = YES;
+    task.sentCount = 0;
+    task.lastSentTimeStr = @"待发布";
+
+    // 关键：把槽位3的图片/视频/缩略图复制固化为本条任务专属文件，绝不与其他任务共用 AC_Slot_3_*，
+    // 也不抓取任何别人动态的 mediaList
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (slotType == 1) {
+        NSString *dstImg = [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Moment_%@.jpg", task.taskId]];
+        [fm removeItemAtPath:dstImg error:nil];
+        if ([fm copyItemAtPath:[mgr imagePathForSlot:ACMediaSlotMoment] toPath:dstImg error:nil]) {
+            task.localMediaType = 1;
+            task.localMediaPath = dstImg;
+            task.isOwnMedia = YES;
+        }
+    } else if (slotType == 2) {
+        NSString *dstVid = [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Moment_%@.mp4", task.taskId]];
+        NSString *dstThumb = [docDir stringByAppendingPathComponent:[NSString stringWithFormat:@"AC_Moment_%@_thumb.jpg", task.taskId]];
+        [fm removeItemAtPath:dstVid error:nil];
+        [fm removeItemAtPath:dstThumb error:nil];
+        if ([fm copyItemAtPath:[mgr videoPathForSlot:ACMediaSlotMoment] toPath:dstVid error:nil]) {
+            [fm copyItemAtPath:[mgr videoThumbPathForSlot:ACMediaSlotMoment] toPath:dstThumb error:nil];
+            task.localMediaType = 2;
+            task.localMediaPath = dstVid;
+            task.localThumbPath = dstThumb;
+            task.localVideoDuration = [mgr videoDurationForSlot:ACMediaSlotMoment];
+            task.isOwnMedia = YES;
+        }
+    }
+    task.capturedMediaList = nil;
+
+    [mgr.momentTasks insertObject:task atIndex:0];
+    mgr.momentDraftText = @"";
+    [mgr saveAllCustomSettings];
+    self.contentTextView.text = @"";
+    self.statusLabel.textColor = [UIColor systemGreenColor];
+    NSString *mediaDesc = (task.localMediaType == 1) ? @"已绑定本地图片" : ((task.localMediaType == 2) ? @"已绑定本地视频" : @"纯文字");
+    self.statusLabel.text = [NSString stringWithFormat:@"✅ 已添加第 %lu 条动态任务（%@，点右侧「立即发」可直接测试）", (unsigned long)mgr.momentTasks.count, mediaDesc];
+    [self updateUI];
+    [self.tableView reloadData];
 }
 - (void)selectAllWelcomeGroups {
 [self.view endEditing:YES];
@@ -4803,9 +5210,10 @@ self.contentTextView.text = @"价格=您好 {name}，具体介绍请看我发您
 self.statusLabel.textColor = mgr.autoReplyEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
 self.statusLabel.text = @"💡 右上角选【回复专属图/视频】，点➕添加规则即绑定给该条规则";
 } else if (idx == 5) {
-self.contentTextView.text = @"✨欢迎各位新朋友，长期稳定靠谱，有问题随时咨询我❤️";
+// 恢复用户正在编辑的动态草稿，不再用写死文案覆盖
+self.contentTextView.text = mgr.momentDraftText ?: @"";
 self.statusLabel.textColor = mgr.autoMomentEnabled ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-self.statusLabel.text = @"💡 输入动态文案点➕添加任务，点任务右侧「立即发」可马上发布测试";
+self.statusLabel.text = @"💡 右上角【动态专属】选好图/视频 + 输入文案后点「➕添加任务」；点任务右侧「立即发」测试";
 } else if (idx == 6) {
 self.contentTextView.text = @"⚙️ 自动点赞 / 批量语音打招呼 / 后台保活 / 群机器人伪装";
 self.statusLabel.textColor = [UIColor secondaryLabelColor];
@@ -4914,7 +5322,8 @@ return cell;
 }
 if (idx == 5) {
 ACMomentTaskItem *task = mgr.momentTasks[indexPath.row];
-cell.textLabel.text = [NSString stringWithFormat:@"📝 [任务%ld] %@", (long)(indexPath.row + 1), task.contentText];
+NSString *mTag = (task.localMediaType == 1) ? @"🖼️图" : ((task.localMediaType == 2) ? [NSString stringWithFormat:@"🎬视频(%ds)", task.localVideoDuration] : @"📝纯文字");
+cell.textLabel.text = [NSString stringWithFormat:@"[%@ %ld] %@", mTag, (long)(indexPath.row + 1), task.contentText.length > 0 ? task.contentText : @"(仅媒体动态)"];
 cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ | 已发 %ld 次 | 上次: %@ (左滑删除)",
 task.enabled ? @"🟢参与轮播" : @"⚪暂停",
 (long)task.sentCount,
@@ -5331,15 +5740,7 @@ mgr.latestHTTPHeaders[lk] = v;
 if ([lk isEqualToString:@"x-userid"] && v.length > 5) mgr.selfUserId = v;
 }];
 }
-if ([urlStr containsString:@"/post/app/publish"] && request.HTTPBody) {
-@try {
-NSDictionary *sentBody = ACSafeDict([NSJSONSerialization JSONObjectWithData:request.HTTPBody options:0 error:nil]);
-NSArray *mList = ACSafeArray(sentBody[@"mediaList"]);
-if (mList && mList.count > 0) {
-[ACForwardHelperManager shared].latestCapturedMomentMediaList = mList;
-}
-} @catch (NSException *e) {}
-}
+// 【已删除】拦截 /post/app/publish 请求体存 mediaList 的逻辑：插件发动态媒体一律走本地素材 COS 上传
 // 风控自检软着陆：客户端聊天记录自检永远返回“未违规”，避免批量打招呼被客户端上报风控中心
 // （保持请求照常走 %orig 并只包装响应，返回 nil 会让 Alamofire 的 task.resume() 崩溃）
 if ([urlStr containsString:@"/immessage/check-chat-record"] || [urlStr containsString:@"/biz/chat/check"]) {
