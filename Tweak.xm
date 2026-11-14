@@ -5,6 +5,8 @@
 #import <objc/message.h>
 #import <sqlite3.h>
 #import <string.h>
+#import <CommonCrypto/CommonHMAC.h>
+#import <CommonCrypto/CommonDigest.h>
 #pragma mark - 0. 防闪退安全转换工具函数（彻底杜绝 NSNull 崩溃）
 static inline NSDictionary *ACSafeDict(id obj) {
 if (obj && [obj isKindOfClass:[NSDictionary class]]) {
@@ -675,52 +677,26 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 @end
 // 前置声明：账号切换后触发飞行圈后台刷新，重新嗅探新会话的签名对（X-Lts-Id + X-Request-No）
 static void ACTriggerMomentsBackgroundRefresh(void);
-#pragma mark - 2.1.2a 腾讯云 COS 真实 STS 凭证拉取与本地素材上传（完全对齐 AirChat 2.1.8）
-@protocol ACQCloudSignatureProviderProtocol <NSObject>
-@end
-
-@interface ACQCloudCredentialStub : NSObject
-@property (nonatomic, copy) NSString *secretID;
-@property (nonatomic, copy) NSString *secretKey;
-@property (nonatomic, copy) NSString *token;
-@property (nonatomic, strong) NSDate *startDate;
-@property (nonatomic, strong) NSDate *expirationDate;
-@end
-
-@interface ACQCloudAuthentationV5CreatorStub : NSObject
-- (instancetype)initWithCredential:(id)credential;
-@end
-
-@interface ACQCloudCOSXMLEndPointStub : NSObject
-@property (nonatomic, copy) NSString *regionName;
-@end
-
-@interface ACQCloudServiceConfigurationStub : NSObject
-@property (nonatomic, strong) id endpoint;
-@property (nonatomic, strong) id signatureProvider;
-@end
-
-@interface ACQCloudUploadObjectResultStub : NSObject
-@property (nonatomic, copy) NSString *location;
-@property (nonatomic, copy) NSString *bucket;
-@property (nonatomic, copy) NSString *key;
-@end
-
-@interface ACQCloudCOSXMLUploadObjectRequestStub : NSObject
-@property (nonatomic, copy) NSString *bucket;
-@property (nonatomic, copy) NSString *regionName;
-@property (nonatomic, copy) NSString *object;
-@property (nonatomic, strong) id body;
-@property (nonatomic, copy) NSString *contentType;
-- (void)setFinishBlock:(void (^)(ACQCloudUploadObjectResultStub *result, NSError *error))finishBlock;
-@end
-
-@interface ACQCloudCOSTransferMangerServiceStub : NSObject
-+ (void)registerCOSTransferMangerWithConfiguration:(id)config withKey:(NSString *)key;
-+ (instancetype)costransfermangerServiceForKey:(NSString *)key;
-+ (void)removeTransferMangerServiceWithKey:(NSString *)key;
-- (void)UploadObject:(id)req;
-@end
+#pragma mark - 2.1.2a 腾讯云 COS STS 凭证拉取与本地素材直传（纯系统库 CommonCrypto V5 签名 + NSURLSession PUT，零 QCloud SDK 依赖，杜绝宿主 QCloud NSAssert 闪退）
+// —— COS V5 签名工具（CommonCrypto，系统库零依赖） ——
+static NSString *ACLowerHexString(const unsigned char *bytes, NSUInteger len) {
+    NSMutableString *hex = [NSMutableString stringWithCapacity:len * 2];
+    for (NSUInteger i = 0; i < len; i++) [hex appendFormat:@"%02x", bytes[i]];
+    return hex;
+}
+static NSString *ACSHA1Hex(NSString *str) {
+    NSData *d = [str dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+    unsigned char digest[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1(d.bytes, (CC_LONG)d.length, digest);
+    return ACLowerHexString(digest, CC_SHA1_DIGEST_LENGTH);
+}
+static NSString *ACHMACSHA1Hex(NSString *key, NSString *dataStr) {
+    NSData *kData = [key dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+    NSData *dData = [dataStr dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+    unsigned char mac[CC_SHA1_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA1, kData.bytes, kData.length, dData.bytes, dData.length, mac);
+    return ACLowerHexString(mac, CC_SHA1_DIGEST_LENGTH);
+}
 
 static NSString *ACContentTypeForFilePath(NSString *path) {
     NSString *ext = path.pathExtension.lowercaseString;
@@ -757,168 +733,102 @@ static CGSize ACVideoPixelSizeAtPath(NSString *path) {
 
 @implementation ACForwardHelperManager (ACMomentUpload)
 
-- (void)ac_requestCOSSTSWithFileName:(NSString *)fileName
-                          completion:(void(^)(NSDictionary *stsData, NSString *errMsg))completion {
-    NSString *host = [self ac_activeBusinessHost];
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/dev/file/cos/sts/credential", host]];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.HTTPMethod = @"POST";
-    req.timeoutInterval = 15.0;
-    [self ac_applyCapturedHeadersToRequest:req];
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-
-    NSDictionary *reqBody = @{@"fileName": fileName ?: @"cos_upload_file.jpg"};
-    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:reqBody options:0 error:nil];
-    req.HTTPBody = bodyData;
-    if (bodyData.length > 0) {
-        [req setValue:[NSString stringWithFormat:@"%lu", (unsigned long)bodyData.length] forHTTPHeaderField:@"Content-Length"];
-    }
-
-    NSURLSession *session = ACDedicatedPluginSession();
-    if (!session) {
-        if (completion) completion(nil, @"网络会话未初始化");
-        return;
-    }
-
-    ACLog(@"[COS] POST /client/dev/file/cos/sts/credential fileName=%@", fileName);
-    acInternalRequest = YES;
-    NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+// 纯系统库直传：POST STS 拿临时凭证 → 本地 CommonCrypto 算 COS V5 签名 → NSURLSession PUT 直传 → 拼 CDN URL
+// 全程不触碰宿主 QCloud SDK（其内部 NSAssert 对 credential 类型/endpoint 校验极严，临时凭证时间戳是 ISO8601 字符串时直接 SIGABRT）
+- (void)ac_uploadFileDataToCOS:(NSData *)fileData
+                           ext:(NSString *)ext
+                   contentType:(NSString *)contentType
+                    completion:(void(^)(NSString *cdnURL, NSString *errMsg))completion {
+    void (^finishMain)(NSString *, NSString *) = ^(NSString *url, NSString *err) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (error || data.length == 0) {
-                if (completion) completion(nil, error.localizedDescription ?: @"STS 接口无响应");
-                return;
-            }
-            NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
-            NSInteger code = [ACSafeStr(json[@"code"]) integerValue];
-            NSDictionary *sts = ACSafeDict(json[@"data"]);
-            if (code != 200 || !sts) {
-                if (completion) completion(nil, [NSString stringWithFormat:@"STS 获取失败 code=%ld msg=%@", (long)code, ACSafeStr(json[@"msg"])]);
-                return;
-            }
-            if (completion) completion(sts, nil);
+            if (completion) completion(url, err);
         });
-    }];
-    acInternalRequest = NO;
-    [task resume];
-}
+    };
+    if (!fileData || fileData.length == 0) { finishMain(nil, @"待上传文件数据为空"); return; }
 
-- (void)ac_uploadLocalFileAtPath:(NSString *)filePath
-                      objectName:(NSString *)suggestedFileName
-                      completion:(void(^)(NSString *cdnURL, NSString *errMsg))completion {
-    if (filePath.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
-        if (completion) completion(nil, @"本地素材文件不存在");
-        return;
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSURLSession *session = ACDedicatedPluginSession();
+        if (!session) { finishMain(nil, @"网络会话未初始化"); return; }
+        long long ms = (long long)([[NSDate date] timeIntervalSince1970] * 1000.0);
+        NSString *fileName = [NSString stringWithFormat:@"cos_upload_%lld.%@", ms, (ext.length > 0 ? ext : @"jpg")];
+        NSString *host = [self ac_activeBusinessHost];
+        NSURL *stsURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/dev/file/cos/sts/credential", host]];
+        NSMutableURLRequest *stsReq = [NSMutableURLRequest requestWithURL:stsURL];
+        stsReq.HTTPMethod = @"POST";
+        stsReq.timeoutInterval = 15.0;
+        [self ac_applyCapturedHeadersToRequest:stsReq];
+        [stsReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        stsReq.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"fileName": fileName} options:0 error:nil];
 
-    NSString *ext = filePath.pathExtension.length > 0 ? filePath.pathExtension.lowercaseString : @"jpg";
-    NSString *finalName = suggestedFileName.length > 0
-        ? suggestedFileName
-        : [NSString stringWithFormat:@"cos_upload_%.0f.%@", [[NSDate date] timeIntervalSince1970] * 1000.0, ext];
-
-    [self ac_requestCOSSTSWithFileName:finalName completion:^(NSDictionary *sts, NSString *errMsg) {
-        if (!sts) {
-            if (completion) completion(nil, errMsg ?: @"STS 凭证为空");
-            return;
-        }
-
-        NSString *ak = ACSafeStr(sts[@"accessKeyId"]);
-        if (ak.length == 0) ak = ACSafeStr(sts[@"tmpSecretId"]);
-        NSString *sk = ACSafeStr(sts[@"accessKeySecret"]);
-        if (sk.length == 0) sk = ACSafeStr(sts[@"tmpSecretKey"]);
-        NSString *tok = ACSafeStr(sts[@"securityToken"]);
-        if (tok.length == 0) tok = ACSafeStr(sts[@"sessionToken"]);
-        NSString *bucket = ACSafeStr(sts[@"bucket"]);
-        NSString *region = ACSafeStr(sts[@"region"]);
-        NSString *uploadPath = ACSafeStr(sts[@"uploadPath"]);
-
-        if (ak.length == 0 || sk.length == 0 || bucket.length == 0 || region.length == 0) {
-            ACLog(@"[COS] STS 字段缺失: %@", sts);
-            if (completion) completion(nil, @"STS 返回凭证字段不完整");
-            return;
-        }
-
-        NSString *objectKey = nil;
-        if (uploadPath.length > 0) {
-            while ([uploadPath hasPrefix:@"/"]) uploadPath = [uploadPath substringFromIndex:1];
-            if ([uploadPath.lowercaseString hasSuffix:[@"." stringByAppendingString:ext]]) {
-                objectKey = uploadPath;
-            } else {
-                if (![uploadPath hasSuffix:@"/"]) uploadPath = [uploadPath stringByAppendingString:@"/"];
-                objectKey = [uploadPath stringByAppendingString:finalName];
-            }
-        } else {
-            NSDateFormatter *df = [[NSDateFormatter alloc] init];
-            df.dateFormat = @"yyyy/M/d";
-            objectKey = [NSString stringWithFormat:@"%@/%@", [df stringFromDate:[NSDate date]], finalName];
-        }
-
-        Class credCls = NSClassFromString(@"QCloudCredential");
-        Class sigCls  = NSClassFromString(@"QCloudAuthentationV5Creator");
-        Class epCls   = NSClassFromString(@"QCloudCOSXMLEndPoint");
-        Class cfgCls  = NSClassFromString(@"QCloudServiceConfiguration");
-        Class mgrCls  = NSClassFromString(@"QCloudCOSTransferMangerService");
-        Class reqCls  = NSClassFromString(@"QCloudCOSXMLUploadObjectRequest");
-
-        if (!credCls || !sigCls || !epCls || !cfgCls || !mgrCls || !reqCls) {
-            if (completion) completion(nil, @"宿主缺少 QCloudCOSXML 组件");
-            return;
-        }
-
-        @try {
-            ACQCloudCredentialStub *cred = [[credCls alloc] init];
-            cred.secretID = ak;
-            cred.secretKey = sk;
-            cred.token = tok;
-            cred.startDate = [NSDate dateWithTimeIntervalSinceNow:-60];
-            cred.expirationDate = [NSDate dateWithTimeIntervalSinceNow:1800];
-
-            id sigProvider = [[sigCls alloc] initWithCredential:cred];
-            ACQCloudCOSXMLEndPointStub *ep = [[epCls alloc] init];
-            ep.regionName = region;
-
-            ACQCloudServiceConfigurationStub *cfg = [[cfgCls alloc] init];
-            cfg.endpoint = ep;
-            cfg.signatureProvider = sigProvider;
-
-            NSString *serviceKey = [NSString stringWithFormat:@"ac_moment_cos_%@", [[NSUUID UUID] UUIDString]];
-            [mgrCls registerCOSTransferMangerWithConfiguration:cfg withKey:serviceKey];
-            ACQCloudCOSTransferMangerServiceStub *cosMgr = [mgrCls costransfermangerServiceForKey:serviceKey];
-
-            ACQCloudCOSXMLUploadObjectRequestStub *putReq = [[reqCls alloc] init];
-            putReq.bucket = bucket;
-            putReq.regionName = region;
-            putReq.object = objectKey;
-            putReq.body = [NSURL fileURLWithPath:filePath];
-            putReq.contentType = ACContentTypeForFilePath(filePath);
-
-            NSString *activeHost = [self ac_activeBusinessHost];
-            NSString *cdnPrefix = [activeHost containsString:@".cn"] ? @"https://static.airchat.cn/" : @"https://static.airchat.cc/";
-            NSString *stsDomain = ACSafeStr(sts[@"cdnDomain"]);
-            if (stsDomain.length == 0) stsDomain = ACSafeStr(sts[@"domain"]);
-            if ([stsDomain hasPrefix:@"http"]) {
-                cdnPrefix = [stsDomain hasSuffix:@"/"] ? stsDomain : [stsDomain stringByAppendingString:@"/"];
-            }
-
-            [putReq setFinishBlock:^(ACQCloudUploadObjectResultStub *result, NSError *error) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    @try { [mgrCls removeTransferMangerServiceWithKey:serviceKey]; } @catch (NSException *e) {}
-                    if (error || !result) {
-                        ACLog(@"[COS] 上传失败: %@", error.localizedDescription ?: @"未知错误");
-                        if (completion) completion(nil, [NSString stringWithFormat:@"COS 上传失败: %@", error.localizedDescription ?: @"未知错误"]);
+        acInternalRequest = YES;
+        NSURLSessionDataTask *stsTask = [session dataTaskWithRequest:stsReq completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    if (error || data.length == 0) {
+                        finishMain(nil, [NSString stringWithFormat:@"获取COS凭证失败: %@", error.localizedDescription ?: @"空响应"]);
                         return;
                     }
-                    NSString *keyPath = result.key.length > 0 ? result.key : objectKey;
-                    while ([keyPath hasPrefix:@"/"]) keyPath = [keyPath substringFromIndex:1];
-                    NSString *finalURL = [cdnPrefix stringByAppendingString:keyPath];
-                    ACLog(@"[COS] 上传成功 -> %@", finalURL);
-                    if (completion) completion(finalURL, nil);
-                });
-            }];
-            [cosMgr UploadObject:putReq];
-        } @catch (NSException *e) {
-            if (completion) completion(nil, [NSString stringWithFormat:@"COS 初始化异常: %@", e.reason]);
-        }
-    }];
+                    NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+                    NSDictionary *d = ACSafeDict(json[@"data"]);
+                    NSString *ak = ACSafeStr(d[@"accessKeyId"]);
+                    NSString *sk = ACSafeStr(d[@"accessKeySecret"]);
+                    NSString *secToken = ACSafeStr(d[@"securityToken"]);
+                    NSString *bucket = ACSafeStr(d[@"bucket"]);
+                    NSString *region = ACSafeStr(d[@"region"]);
+                    NSString *endpoint = ACSafeStr(d[@"endpoint"]);
+                    NSString *uploadPath = ACSafeStr(d[@"uploadPath"]);
+                    if (ak.length == 0 || sk.length == 0 || bucket.length == 0 || region.length == 0 || uploadPath.length == 0) {
+                        finishMain(nil, [NSString stringWithFormat:@"COS凭证字段缺失: %@", ACSafeStr(json[@"msg"])]);
+                        return;
+                    }
+                    if ([uploadPath hasPrefix:@"/"]) uploadPath = [uploadPath substringFromIndex:1];
+                    if (endpoint.length == 0) endpoint = @"https://static.airchat.cn";
+                    if ([endpoint hasSuffix:@"/"]) endpoint = [endpoint substringToIndex:endpoint.length - 1];
+
+                    NSString *cosHost = [NSString stringWithFormat:@"%@.cos.%@.myqcloud.com", bucket, region];
+                    NSURL *putURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://%@/%@", cosHost, uploadPath]];
+                    if (!putURL) { finishMain(nil, @"COS上传URL非法"); return; }
+
+                    long long nowSec = (long long)[[NSDate date] timeIntervalSince1970];
+                    NSString *qKeyTime = [NSString stringWithFormat:@"%lld;%lld", nowSec - 60, nowSec + 900];
+                    NSString *signKey = ACHMACSHA1Hex(sk, qKeyTime);
+                    NSString *httpString = [NSString stringWithFormat:@"put\n/%@\n\nhost=%@\n", uploadPath, cosHost];
+                    NSString *stringToSign = [NSString stringWithFormat:@"sha1\n%@\n%@\n", qKeyTime, ACSHA1Hex(httpString)];
+                    NSString *signature = ACHMACSHA1Hex(signKey, stringToSign);
+                    NSString *auth = [NSString stringWithFormat:
+                                      @"q-sign-algorithm=sha1&q-ak=%@&q-sign-time=%@&q-key-time=%@&q-header-list=host&q-url-param-list=&q-signature=%@",
+                                      ak, qKeyTime, qKeyTime, signature];
+
+                    NSMutableURLRequest *putReq = [NSMutableURLRequest requestWithURL:putURL];
+                    putReq.HTTPMethod = @"PUT";
+                    putReq.timeoutInterval = 30.0;
+                    putReq.HTTPBody = fileData;
+                    [putReq setValue:cosHost forHTTPHeaderField:@"Host"];
+                    [putReq setValue:(contentType.length > 0 ? contentType : @"image/jpeg") forHTTPHeaderField:@"Content-Type"];
+                    [putReq setValue:[NSString stringWithFormat:@"%lu", (unsigned long)fileData.length] forHTTPHeaderField:@"Content-Length"];
+                    [putReq setValue:auth forHTTPHeaderField:@"Authorization"];
+                    if (secToken.length > 0) [putReq setValue:secToken forHTTPHeaderField:@"x-cos-security-token"];
+
+                    acInternalRequest = YES;
+                    NSURLSessionDataTask *putTask = [session dataTaskWithRequest:putReq completionHandler:^(NSData *pData, NSURLResponse *pResp, NSError *pErr) {
+                        NSInteger sc = [pResp isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)pResp).statusCode : 0;
+                        if (pErr || sc < 200 || sc >= 300) {
+                            NSString *bodyStr = pData.length > 0 ? [[NSString alloc] initWithData:pData encoding:NSUTF8StringEncoding] : @"";
+                            finishMain(nil, [NSString stringWithFormat:@"COS上传失败 HTTP=%ld %@", (long)sc, pErr.localizedDescription ?: ACSafeStr(bodyStr)]);
+                            return;
+                        }
+                        finishMain([NSString stringWithFormat:@"%@/%@", endpoint, uploadPath], nil);
+                    }];
+                    acInternalRequest = NO;
+                    [putTask resume];
+                } @catch (NSException *ex) {
+                    finishMain(nil, [NSString stringWithFormat:@"COS处理异常: %@", ex.reason ?: @"unknown"]);
+                }
+            });
+        }];
+        acInternalRequest = NO;
+        [stsTask resume];
+    });
 }
 
 @end
@@ -3065,8 +2975,17 @@ if (completion) completion(YES, self.lastMomentLog);
     NSFileManager *fm = [NSFileManager defaultManager];
     if (task.localMediaType == 1 && task.localMediaPath.length > 0 && [fm fileExistsAtPath:task.localMediaPath]) {
         CGSize px = ACImagePixelSizeAtPath(task.localMediaPath);
-        NSString *fileName = [NSString stringWithFormat:@"cos_upload_%.0f.jpg", [[NSDate date] timeIntervalSince1970] * 1000.0];
-        [self ac_uploadLocalFileAtPath:task.localMediaPath objectName:fileName completion:^(NSString *cdnURL, NSString *errMsg) {
+        // 读出图片压缩为 JPEG 直传（GIF 保留原始数据防丢帧）
+        NSData *upData = [NSData dataWithContentsOfFile:task.localMediaPath];
+        NSString *upExt = task.localMediaPath.pathExtension.lowercaseString;
+        if (upExt.length == 0) upExt = @"jpg";
+        NSString *upCT = ACContentTypeForFilePath(task.localMediaPath);
+        UIImage *upImg = [UIImage imageWithData:upData];
+        if (upImg && ![upExt isEqualToString:@"gif"]) {
+            NSData *jpegData = UIImageJPEGRepresentation(upImg, 0.9);
+            if (jpegData.length > 1024) { upData = jpegData; upExt = @"jpg"; upCT = @"image/jpeg"; }
+        }
+        [self ac_uploadFileDataToCOS:upData ext:upExt contentType:upCT completion:^(NSString *cdnURL, NSString *errMsg) {
             if (cdnURL.length == 0) {
                 self.momentPublishing = NO;
                 self.lastMomentLog = [NSString stringWithFormat:@"❌ 图片上传失败：%@", errMsg ?: @"未知错误"];
@@ -3077,6 +2996,7 @@ if (completion) completion(YES, self.lastMomentLog);
             NSArray *mediaList = @[@{
                 @"mediaType": @(1),
                 @"mediaUrl": cdnURL,
+                @"thumbnailUrl": cdnURL,
                 @"sortOrder": @(0),
                 @"width": @((NSInteger)px.width),
                 @"height": @((NSInteger)px.height)
@@ -3098,9 +3018,9 @@ if (completion) completion(YES, self.lastMomentLog);
     // 3. 若本任务绑定了本地视频（localMediaType == 2），先上传缩略图，再上传视频，最后 contentType=3 发布
     if (task.localMediaType == 2 && task.localMediaPath.length > 0 && [fm fileExistsAtPath:task.localMediaPath]) {
         CGSize vpx = ACVideoPixelSizeAtPath(task.localMediaPath);
-        NSString *vidName = [NSString stringWithFormat:@"cos_upload_%.0f.mp4", [[NSDate date] timeIntervalSince1970] * 1000.0];
+        NSData *vidData = [NSData dataWithContentsOfFile:task.localMediaPath];
         void (^uploadVideoAndPublish)(NSString *) = ^(NSString *thumbURL) {
-            [self ac_uploadLocalFileAtPath:task.localMediaPath objectName:vidName completion:^(NSString *videoURL, NSString *vErr) {
+            [self ac_uploadFileDataToCOS:vidData ext:@"mp4" contentType:@"video/mp4" completion:^(NSString *videoURL, NSString *vErr) {
                 if (videoURL.length == 0) {
                     self.momentPublishing = NO;
                     self.lastMomentLog = [NSString stringWithFormat:@"❌ 视频上传失败：%@", vErr ?: @"未知错误"];
@@ -3131,8 +3051,8 @@ if (completion) completion(YES, self.lastMomentLog);
         };
 
         if (task.localThumbPath.length > 0 && [fm fileExistsAtPath:task.localThumbPath]) {
-            NSString *thumbName = [NSString stringWithFormat:@"video_thumbnail_%@.jpg", [[NSUUID UUID] UUIDString]];
-            [self ac_uploadLocalFileAtPath:task.localThumbPath objectName:thumbName completion:^(NSString *thumbURL, NSString *tErr) {
+            NSData *thumbData = [NSData dataWithContentsOfFile:task.localThumbPath];
+            [self ac_uploadFileDataToCOS:thumbData ext:@"jpg" contentType:@"image/jpeg" completion:^(NSString *thumbURL, NSString *tErr) {
                 if (tErr) ACLog(@"[COS] 视频缩略图上传告警: %@", tErr);
                 uploadVideoAndPublish(thumbURL);
             }];
@@ -5379,13 +5299,20 @@ self.statusLabel.textColor = [UIColor systemBlueColor];
 self.statusLabel.text = @"⏳ 正在立即发布该条动态任务...（若未捕获登录凭证最多等待20秒）";
 __weak typeof(self) weakSelfVC = self;
 [mgr publishMomentTask:task completion:^(BOOL ok, NSString *msg) {
-weakSelfVC.statusLabel.textColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
-weakSelfVC.statusLabel.text = msg ?: (ok ? @"发布成功" : @"发布失败");
+dispatch_async(dispatch_get_main_queue(), ^{
+__strong typeof(weakSelfVC) sVC = weakSelfVC;
+if (!sVC) return;
+sVC.statusLabel.textColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+sVC.statusLabel.text = msg ?: (ok ? @"发布成功" : @"发布失败");
+[sVC.tableView reloadData];
+if (sVC.view.window && !sVC.presentedViewController) {
 UIAlertController *a = [UIAlertController alertControllerWithTitle:(ok ? @"✅ 发布成功" : @"❌ 发布失败")
 message:(msg ?: @"")
 preferredStyle:UIAlertControllerStyleAlert];
 [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
-[weakSelfVC presentViewController:a animated:YES completion:nil];
+[sVC presentViewController:a animated:YES completion:nil];
+}
+});
 }];
 }
 - (void)tableView:(UITableView * _Nonnull)tableView didSelectRowAtIndexPath:(NSIndexPath * _Nonnull)indexPath {
@@ -5642,24 +5569,116 @@ if (found) return found;
 }
 return nil;
 }
+// iOS 13–18 Scene 兼容的活动 keyWindow 获取
+static UIWindow *ACActiveKeyWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow && !w.hidden && w.alpha > 0.01) return w;
+            }
+            for (UIWindow *w in ws.windows) {
+                if (!w.hidden && w.alpha > 0.01 && w.windowLevel == UIWindowLevelNormal) return w;
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+    if (kw && !kw.hidden) return kw;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow && !w.hidden) return w;
+    }
+    return [UIApplication sharedApplication].windows.firstObject;
+#pragma clang diagnostic pop
+}
+
 static void ACPresentForwardAssistantFromTopVC(void) {
-@try {
-UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
-if (!keyWin) {
-for (UIWindow *w in [UIApplication sharedApplication].windows) {
-if (w.isKeyWindow) { keyWin = w; break; }
+    @try {
+        UIWindow *keyWin = ACActiveKeyWindow();
+        UIViewController *topVC = keyWin.rootViewController;
+        while (topVC.presentedViewController) {
+            topVC = topVC.presentedViewController;
+        }
+        if (!topVC) return;
+
+        // 如果当前顶层已经是功能板，再次双指双击直接收起，体验更顺手
+        if ([topVC isKindOfClass:[ACForwardAssistantVC class]]) {
+            [topVC dismissViewControllerAnimated:YES completion:nil];
+            return;
+        }
+        if ([topVC isKindOfClass:[UINavigationController class]]) {
+            UINavigationController *curNav = (UINavigationController *)topVC;
+            if ([curNav.topViewController isKindOfClass:[ACForwardAssistantVC class]] ||
+                [curNav.viewControllers.firstObject isKindOfClass:[ACForwardAssistantVC class]]) {
+                [curNav dismissViewControllerAnimated:YES completion:nil];
+                return;
+            }
+        }
+
+        __pendingForwardText = nil;
+        ACForwardAssistantVC *vc = [[ACForwardAssistantVC alloc] init];
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+        nav.modalPresentationStyle = UIModalPresentationPageSheet;
+        [topVC presentViewController:nav animated:YES completion:nil];
+    } @catch (NSException *e) {}
 }
+
+// 任意地方双指双击手势代理（允许与宿主滚动、点击、长按手势同时识别，绝不冲突）
+@interface ACTwoFingerGestureDelegate : NSObject <UIGestureRecognizerDelegate>
++ (instancetype)shared;
+@end
+
+@implementation ACTwoFingerGestureDelegate
++ (instancetype)shared {
+    static ACTwoFingerGestureDelegate *inst = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ inst = [[ACTwoFingerGestureDelegate alloc] init]; });
+    return inst;
 }
-UIViewController *topVC = keyWin.rootViewController;
-while (topVC.presentedViewController) {
-topVC = topVC.presentedViewController;
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    return YES;
 }
-if (!topVC || [NSStringFromClass([topVC class]) containsString:@"ACForwardAssistantVC"]) return;
-ACForwardAssistantVC *vc = [[ACForwardAssistantVC alloc] init];
-UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-nav.modalPresentationStyle = UIModalPresentationPageSheet;
-[topVC presentViewController:nav animated:YES completion:nil];
-} @catch (NSException *e) {}
+@end
+
+static const void *kACTwoFingerTapInstalledKey = &kACTwoFingerTapInstalledKey;
+
+static void ACAttachTwoFingerDoubleTapToWindow(UIWindow *win) {
+    if (!win || ![win isKindOfClass:[UIWindow class]]) return;
+    NSString *cls = NSStringFromClass([win class]);
+    // 跳过键盘与系统文本特效浮窗，避免重复触发或遮挡问题
+    if ([cls containsString:@"Keyboard"] || [cls containsString:@"TextEffects"] || [cls containsString:@"StatusBar"]) return;
+    if (objc_getAssociatedObject(win, kACTwoFingerTapInstalledKey)) return;
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:win action:@selector(ac_onTwoFingerDoubleTap:)];
+    tap.numberOfTouchesRequired = 2; // 双指
+    tap.numberOfTapsRequired = 2;    // 双击
+    tap.cancelsTouchesInView = NO;
+    tap.delaysTouchesBegan = NO;
+    tap.delaysTouchesEnded = NO;
+    tap.delegate = [ACTwoFingerGestureDelegate shared];
+    [win addGestureRecognizer:tap];
+    objc_setAssociatedObject(win, kACTwoFingerTapInstalledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ACAttachTwoFingerDoubleTapToAllWindows(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                ACAttachTwoFingerDoubleTapToWindow(w);
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        ACAttachTwoFingerDoubleTapToWindow(w);
+    }
+#pragma clang diagnostic pop
 }
 #pragma mark - 7. 换绑突破与全局请求头嗅探钩子
 // 多账号全局接管：热切换后把 App 原生请求 Header/URL 参数/POST Body 里的旧账号 UID 实时替换为新账号，
@@ -6115,10 +6134,24 @@ if (quickForwardPill.superview) [quickForwardPill removeFromSuperview];
 }
 %end
 %hook UIWindow
+- (void)makeKeyAndVisible {
+%orig;
+ACAttachTwoFingerDoubleTapToWindow(self);
+}
+- (void)didMoveToSuperview {
+%orig;
+ACAttachTwoFingerDoubleTapToWindow(self);
+}
 %new
 - (void)ac_onQuickPillTap:(UIButton * _Nonnull)sender {
 [sender removeFromSuperview];
 ACPresentForwardAssistantFromTopVC();
+}
+%new
+- (void)ac_onTwoFingerDoubleTap:(UITapGestureRecognizer * _Nonnull)gesture {
+if (gesture.state == UIGestureRecognizerStateEnded) {
+ACPresentForwardAssistantFromTopVC();
+}
 }
 %end
 %hook UIViewController
@@ -6546,6 +6579,7 @@ ACSwizzleIMP(c, @"addGroupListener:", (IMP)ac_addGroupListenerHook, &ac_orig_add
 if (objc_getClass("__NSURLSessionLocal")) %init(ACiOS17SessionHooks);
 // 延迟到 App 完成基础初始化后再安装钩子/注册监听，失败则多次重试
 void (^install)(void) = ^{
+ACAttachTwoFingerDoubleTapToAllWindows(); // 冷启动已有窗口立即挂载双指双击手势
 ACInstallTIMHooks();
 [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
 };
