@@ -5618,11 +5618,13 @@ static void ACEnableTableViewScrollingInView(UIView *view) {
 %hook _TtC7airchat30AirAccountChangeViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig(animated);
-    ACEnableTableViewScrollingInView(self.view);
+    UIViewController *acChangeVC = (UIViewController *)self;
+    ACEnableTableViewScrollingInView(acChangeVC.view);
 }
 - (void)viewDidLayoutSubviews {
     %orig;
-    ACEnableTableViewScrollingInView(self.view);
+    UIViewController *acChangeVC = (UIViewController *)self;
+    ACEnableTableViewScrollingInView(acChangeVC.view);
 }
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == 1) {
