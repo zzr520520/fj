@@ -657,6 +657,7 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)triggerSingleVoiceCallForTarget:(NSString *)uid nick:(NSString *)nick completion:(void(^)(void))completion;
 // v2.3 群内@兜底与好友申请路径的前向声明
 - (NSString *)ac_sharedGroupIdForUser:(ACContactItem *)item;
+- (void)ac_tryGroupContextC2C:(ACContactItem *)item text:(NSString *)text media:(id)mediaMsg groupId:(NSString *)gid completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)ac_fallbackAfterC2CRejected:(ACContactItem *)item text:(NSString *)text media:(id)mediaMsg completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(BOOL ok))completion;
 - (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion;
@@ -4015,6 +4016,58 @@ SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
 if (!manager || ![manager respondsToSelector:createImgSel]) return nil;
 return ((id (*)(id, SEL, id))objc_msgSend)(manager, createImgSel, path);
 }
+// 实验通道：在 C2C 的 cloudCustomData 里补上同群来源，验证服务端回调是否按同群关系放行
+- (void)ac_tryGroupContextC2C:(ACContactItem *)item
+text:(NSString *)text
+media:(id)mediaMsg
+groupId:(NSString *)gid
+completion:(void(^)(BOOL ok, NSString *detail))completion {
+@try {
+NSMutableDictionary *j = nil;
+id parsed = [NSJSONSerialization JSONObjectWithData:self.capturedCloudCustomData options:NSJSONReadingMutableContainers error:nil];
+if ([parsed isKindOfClass:[NSMutableDictionary class]]) j = parsed;
+if (!j) {
+if (completion) completion(NO, @"无可用签名");
+return;
+}
+j[@"fromGroupId"] = gid;
+j[@"source"] = @"group_member";
+NSData *merged = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
+if (merged.length <= 10) {
+if (completion) completion(NO, @"同群包构造失败");
+return;
+}
+Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+id manager = [v2MgrCls respondsToSelector:@selector(sharedInstance)] ? ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance)) : nil;
+if (!manager) {
+if (completion) completion(NO, @"IM未初始化");
+return;
+}
+id msg = mediaMsg;
+if (!msg) {
+SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
+if (text.length == 0 || ![manager respondsToSelector:createTextSel]) {
+if (completion) completion(NO, @"内容为空");
+return;
+}
+msg = ((id (*)(id, SEL, id))objc_msgSend)(manager, createTextSel, text);
+}
+[msg setValue:merged forKey:@"cloudCustomData"];
+ACLog(@"[群上下文试验] 携带 fromGroupId=%@ keys=%@ 发送 C2C", gid, [j.allKeys componentsJoinedByString:@","]);
+[self rawSendV2Message:msg toItem:item completion:^(BOOL ok, int code, NSString *desc) {
+if (ok) {
+item.chatMeType = 0;
+ACLog(@"[群上下文试验] 送达");
+if (completion) completion(YES, @"🎫同群上下文送达");
+return;
+}
+ACLog(@"[群上下文试验] 仍被拒 code=%d desc=%@", code, desc ?: @"");
+if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @""]);
+}];
+} @catch (NSException *e) {
+if (completion) completion(NO, @"同群试验异常");
+}
+}
 // C2C 被拒后的降级链：可用的共同群 @ > 好友申请（附言带文案，对方通过前不算送达）
 - (void)ac_fallbackAfterC2CRejected:(ACContactItem *)item
 text:(NSString *)text
@@ -4254,7 +4307,12 @@ NSData *robotData = [NSJSONSerialization dataWithJSONObject:robotJson options:0 
 if (robotData) [v2Msg setValue:robotData forKey:@"cloudCustomData"];
 } else if (!isGroupChat && self.capturedCloudCustomData.length > 10) {
 // C2C 必须携带本机真实云端签名（仅 isSelf 采集，已在升级1中隔离他人签名），与原生 C2CSessionStrategy 保持一致
+// 若调用方已显式写入 cloudCustomData（如带 fromGroupId 的同群试验包），不再覆盖
+id existingCCD = nil;
+@try { existingCCD = [v2Msg valueForKey:@"cloudCustomData"]; } @catch (NSException *e) {}
+if (![existingCCD isKindOfClass:[NSData class]] || [(NSData *)existingCCD length] <= 10) {
 [v2Msg setValue:self.capturedCloudCustomData forKey:@"cloudCustomData"];
+}
 }
 } @catch (NSException *ignore) {}
 BOOL isGroup = (item.sourceType == 2);
@@ -4422,6 +4480,19 @@ BOOL effectiveFriend = isFriend || relation == 1 || relation == 3;
 // allowType 只决定“别人能否加我为好友”，不代表可以发起私聊；
 // 非好友且 chatMeType=1 时 C2C 必报 120001，直接走降级链，不再浪费一次发送
 if (!effectiveFriend && chatMeType == 1) {
+NSString *gid = [self ac_sharedGroupIdForUser:item];
+if (gid.length > 0 && self.capturedCloudCustomData.length > 10) {
+ACLog(@"[发送引擎] 非好友且仅好友可聊，先试同群上下文 C2C (群:%@)", gid);
+[self ac_tryGroupContextC2C:item text:cleanText media:buildMediaMsg() groupId:gid completion:^(BOOL okG, NSString *detailG) {
+if (okG) {
+if (completion) completion(YES, detailG);
+return;
+}
+ACLog(@"[发送引擎] 同群上下文试验失败(%@)，进入降级链", detailG ?: @"");
+[self ac_fallbackAfterC2CRejected:item text:cleanText media:buildMediaMsg() completion:completion];
+}];
+return;
+}
 ACLog(@"[发送引擎] 非好友且目标仅好友可聊(chatMeType=1, allowType=%ld)，跳过 C2C", (long)allowType);
 [self ac_fallbackAfterC2CRejected:item text:cleanText media:buildMediaMsg() completion:completion];
 return;
@@ -6897,6 +6968,8 @@ NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 [ud setObject:d forKey:@"AC_Captured_CloudCustomData"];
 [ud setObject:v2 forKey:@"AC_Captured_ClientTypeV2"];
 ACLog(@"[原生发送捕获] 已同步真实签名 cloudCustomData=%luB v2=%lu chars", (unsigned long)d.length, (unsigned long)v2.length);
+NSString *ccdJson = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+if (ccdJson.length > 0) ACLog(@"[原生发送捕获] ccd=%@", ccdJson);
 } @catch (NSException *e) {}
 }
 static void ac_hookV2SendFull(id self, SEL _cmd, id msg, id receiver, id groupID, NSInteger priority, BOOL onlineOnly, id offlinePushInfo, id progress, id succ, id fail) {
