@@ -4132,9 +4132,11 @@ int dur = vDur > 0 ? vDur : 5;
 NSString *sPath = (tPath.length > 0 && [fm fileExistsAtPath:tPath]) ? tPath : @"";
 NSMethodSignature *sig = [manager methodSignatureForSelector:createVidSel];
 NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+// 注意：mPath 被 block 捕获后是 const __strong，&mPath 无法隐式转 void*，必须用局部变量取址
+NSString *videoFilePath = mPath;
 [inv setTarget:manager];
 [inv setSelector:createVidSel];
-[inv setArgument:&mPath atIndex:2];
+[inv setArgument:&videoFilePath atIndex:2];
 [inv setArgument:&vType atIndex:3];
 [inv setArgument:&dur atIndex:4];
 [inv setArgument:&sPath atIndex:5];
