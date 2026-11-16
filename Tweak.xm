@@ -658,7 +658,7 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 // v2.3 群内@兜底与好友申请路径的前向声明
 - (NSString *)ac_sharedGroupIdForUser:(ACContactItem *)item;
 - (void)ac_fallbackAfterC2CRejected:(ACContactItem *)item text:(NSString *)text media:(id)mediaMsg completion:(void(^)(BOOL ok, NSString *detail))completion;
-- (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(void))completion;
+- (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(BOOL ok))completion;
 - (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion;
 - (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion;
 // v2.1 新增：统一消息入口（TIM 监听代理与直接监听共用）、发动态节流/重试
@@ -4015,21 +4015,35 @@ SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
 if (!manager || ![manager respondsToSelector:createImgSel]) return nil;
 return ((id (*)(id, SEL, id))objc_msgSend)(manager, createImgSel, path);
 }
-// C2C 被 IM 服务端拒绝后的降级链：图片破冰 > 共同群 @ > 带文案好友申请（绝不伪造本地消息）
+// C2C 被拒后的降级链：可用的共同群 @ > 好友申请（附言带文案，对方通过前不算送达）
 - (void)ac_fallbackAfterC2CRejected:(ACContactItem *)item
 text:(NSString *)text
 media:(id)mediaMsg
 completion:(void(^)(BOOL ok, NSString *detail))completion {
+void (^toFriendRequest)(void) = ^{
+ACLog(@"[发送引擎] 转好友申请（附言携带文案）");
+[self autoAddIMFriend:item.targetId wording:text completion:^(BOOL ok) {
+if (!completion) return;
+if (ok) completion(YES, @"(好友申请)附言已携带文案，待对方通过");
+else completion(NO, @"(120001)好友申请发送失败");
+}];
+};
 void (^toGroupOrFriend)(void) = ^{
 NSString *gid = [self ac_sharedGroupIdForUser:item];
-if (gid.length > 0) {
-ACLog(@"[发送引擎] 改走共同群 @ 兜底 (群:%@)", gid);
-[self ac_sendGroupFallbackToGroup:gid target:item text:text media:mediaMsg completion:completion];
+BOOL banned = gid.length > 0 ? [self.groupBanStatusMap[gid] boolValue] : NO;
+if (gid.length == 0 || banned) {
+if (gid.length > 0) ACLog(@"[发送引擎] 共同群 %@ 已标记禁言，跳过群通道", gid);
+toFriendRequest();
 return;
 }
-ACLog(@"[发送引擎] 无共同群，转好友申请（带文案）");
-[self autoAddIMFriend:item.targetId wording:text completion:^{
-if (completion) completion(NO, @"(120001)对方仅好友可聊，已发好友申请，通过后可送达");
+ACLog(@"[发送引擎] 改走共同群 @ 兜底 (群:%@)", gid);
+[self ac_sendGroupFallbackToGroup:gid target:item text:text media:mediaMsg completion:^(BOOL ok, NSString *detail) {
+if (ok) {
+if (completion) completion(YES, detail);
+return;
+}
+ACLog(@"[发送引擎] 群内@失败(%@)，继续回落到好友申请", detail ?: @"");
+toFriendRequest();
 }];
 };
 BOOL alreadyImage = NO;
@@ -4180,7 +4194,7 @@ return;
 } @catch (NSException *e) {}
 if (completion) completion(-1);
 }
-- (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(void))completion {
+- (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(BOOL ok))completion {
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
 Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
@@ -4195,17 +4209,22 @@ if (cleanWording.length == 0) cleanWording = @"你好，认识一下~";
 if (cleanWording.length > 90) cleanWording = [cleanWording substringToIndex:90];
 [req setValue:cleanWording forKey:@"addWording"];
 [req setValue:@(2) forKey:@"addType"];
-void (^succ)(id) = ^(id res) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-void (^fail)(int, NSString *) = ^(int c,  NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
+void (^succ)(id) = ^(id res) { if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES); }); };
+void (^fail)(int, NSString *) = ^(int c,  NSString *d) {
+ACLog(@"[好友申请] %@ 失败 code=%d desc=%@", userId, c, d ?: @"");
+if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
+};
 ((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, addFriendSel, req, succ, fail);
 return;
 }
 }
 } @catch (NSException *e) {}
-if (completion) completion();
+if (completion) completion(NO);
 }
 - (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
-[self autoAddIMFriend:userId wording:nil completion:completion];
+[self autoAddIMFriend:userId wording:nil completion:^(BOOL ok) {
+if (completion) completion();
+}];
 }
 - (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
 @try {
@@ -4400,20 +4419,13 @@ item.chatMeType = chatMeType;
 [self ac_probeIMFriendRelation:item.targetId completion:^(NSInteger relation) {
 BOOL effectiveFriend = isFriend || relation == 1 || relation == 3;
 [self ac_probeIMAllowType:item.targetId completion:^(NSInteger allowType) {
-BOOL imAllowsStranger = (allowType == 0);
-BOOL imBlocksStranger = (allowType == 1 || allowType == 2);
-if (!effectiveFriend && imBlocksStranger) {
-ACLog(@"[发送引擎] IM allowType=%ld 硬拦截，切换群@/好友申请", (long)allowType);
+// allowType 只决定“别人能否加我为好友”，不代表可以发起私聊；
+// 非好友且 chatMeType=1 时 C2C 必报 120001，直接走降级链，不再浪费一次发送
+if (!effectiveFriend && chatMeType == 1) {
+ACLog(@"[发送引擎] 非好友且目标仅好友可聊(chatMeType=1, allowType=%ld)，跳过 C2C", (long)allowType);
 [self ac_fallbackAfterC2CRejected:item text:cleanText media:buildMediaMsg() completion:completion];
 return;
 }
-if (!effectiveFriend && !imAllowsStranger && chatMeType == 1) {
-// allowType 查询失败时退回业务层判断
-ACLog(@"[发送引擎] 非好友且仅联系人可聊，IM 权限未知，跳过注定失败的 C2C");
-[self ac_fallbackAfterC2CRejected:item text:cleanText media:buildMediaMsg() completion:completion];
-return;
-}
-// allowType=0 或已是好友：即使 chatMeType=1 也直发（171312.har 实证 chatMeType 仅拦官方 UI）
 ACLog(@"[发送引擎] 放行 C2C (friend=%d relation=%ld allowType=%ld chatMeType=%ld)", isFriend, (long)relation, (long)allowType, (long)chatMeType);
 doSendFlow();
 }];
