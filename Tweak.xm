@@ -653,9 +653,9 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)nick groupId:(NSString *)gid role:(NSString *)role chatMeType:(NSInteger)chatMeType;
 - (void)addGroupWithId:(NSString *)gid name:(NSString *)gname ban:(BOOL)ban;
 - (void)triggerSingleVoiceCallForTarget:(NSString *)uid nick:(NSString *)nick completion:(void(^)(void))completion;
-// v2.2 跨段前向声明：迎新流程（实现段之前）需要先预激活 C2C 单聊通道
-- (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion;
-- (void)simulateIncomingMessageFrom:(NSString *)targetUserId completion:(void(^)(void))completion;
+// v2.3 群内@兜底与好友申请路径的前向声明
+- (NSString *)ac_sharedGroupIdForUser:(ACContactItem *)item;
+- (void)ac_fallbackAfterC2CRejected:(ACContactItem *)item text:(NSString *)text media:(id)mediaMsg completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(void))completion;
 - (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion;
 - (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion;
@@ -3207,8 +3207,7 @@ advance();
 return;
 }
 NSString *bodyText = hasText ? finalGreeting : @"";
-// 迎新前先预激活该新群员的 C2C 会话通道（checkChatType + returnDto + add + offline）
-[m2 callAirChatBackendAddFriendAndUnlock:newMember.targetId completion:^{
+// 发送引擎内部自动判定通道：C2C 直发 → 失败则共同群@兜底 → 无群则带文案好友申请
 [m2 sendText:bodyText mediaSlot:ACMediaSlotWelcome attachMedia:hasMedia toItem:newMember completion:^(BOOL ok, NSString *detail) {
 if (ok) {
 m2.greetedCount++;
@@ -3218,7 +3217,6 @@ m2.lastGreetLog = [NSString stringWithFormat:@"⚠️ 迎新 %@: %@", newMember.
 }
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 advance();
-}];
 }];
 };
 if (wantVoice) {
@@ -3905,93 +3903,78 @@ return self.lastAirchatHost;
 }
 return @"apiv1.airchat.cn";
 }
-// 激活 C2C 单聊会话通道（严格对齐 HAR 171312 [210][214][220] 官方进聊天页激活序列）
-- (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
-if (!targetUserId || targetUserId.length < 5 || ACHeaderValue(self.latestHTTPHeaders, @"token").length == 0) {
-if (completion) completion();
+// 从已采集的群成员关系里找到与目标共同的群（群内@是唯一不依赖 IM 好友关系的可达通道）
+- (NSString *)ac_sharedGroupIdForUser:(ACContactItem *)item {
+if (!item) return nil;
+if (item.fromGroupId.length > 0) return item.fromGroupId;
+ACContactItem *cached = self.groupMemberMap[item.targetId];
+if (cached.fromGroupId.length > 0) return cached.fromGroupId;
+for (ACContactItem *m in self.groupMemberList) {
+if ([m.targetId isEqualToString:item.targetId] && m.fromGroupId.length > 0) return m.fromGroupId;
+}
+return nil;
+}
+// 群内 @ 兜底：不触碰 C2C 关系链，只要双方仍在同一群即可送达
+- (void)ac_sendGroupFallbackToGroup:(NSString *)groupId
+target:(ACContactItem *)item
+text:(NSString *)text
+media:(id)mediaMsg
+completion:(void(^)(BOOL ok, NSString *detail))completion {
+if (groupId.length == 0) {
+if (completion) completion(NO, @"无共同群，无法走群内兜底");
 return;
 }
-// 已移除“每批最多 2 次 / 间隔 15 秒”的死锁限制：群发超过 2 人后仍必须继续破盾，否则第三人起全部失败
-self.unlockAttemptCountInSession++;
-self.lastUnlockAttemptAt = [[NSDate date] timeIntervalSince1970];
-@try {
-NSURLSession *session = ACDedicatedPluginSession() ?: [NSURLSession sharedSession];
-NSString *host = [self ac_activeBusinessHost];
-dispatch_group_t apiGroup = dispatch_group_create();
-
-// ① POST /client/biz/chat/checkChatType {"id": targetUserId}（HAR [214]：激活非好友 C2C 权限）
-dispatch_group_enter(apiGroup);
-NSMutableURLRequest *reqCheck = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/chat/checkChatType", host]]];
-reqCheck.HTTPMethod = @"POST";
-reqCheck.timeoutInterval = 8.0;
-[self ac_applyCapturedHeadersToRequest:reqCheck];
-[reqCheck setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-reqCheck.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"id": targetUserId} options:0 error:nil];
-[[session dataTaskWithRequest:reqCheck completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-dispatch_group_leave(apiGroup);
-}] resume];
-
-// ② GET /client/biz/useronechat/returnDto（HAR [210]：初始化单聊上下文）
-dispatch_group_enter(apiGroup);
-NSString *dtoURL = [NSString stringWithFormat:@"https://%@/client/biz/useronechat/returnDto?chatWithHimId=%@&current=1&size=10", host, targetUserId];
-NSMutableURLRequest *reqDto = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:dtoURL]];
-reqDto.HTTPMethod = @"GET";
-reqDto.timeoutInterval = 8.0;
-[self ac_applyCapturedHeadersToRequest:reqDto];
-[[session dataTaskWithRequest:reqDto completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-dispatch_group_leave(apiGroup);
-}] resume];
-
-// ③ POST /client/biz/useronechat/add（服务端登记单聊会话）
-dispatch_group_enter(apiGroup);
-NSMutableURLRequest *reqAddChat = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/useronechat/add", host]]];
-reqAddChat.HTTPMethod = @"POST";
-reqAddChat.timeoutInterval = 8.0;
-[self ac_applyCapturedHeadersToRequest:reqAddChat];
-[reqAddChat setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-reqAddChat.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"chatWithHimId": targetUserId, @"id": targetUserId, @"userId": self.selfUserId ?: @""} options:0 error:nil];
-[[session dataTaskWithRequest:reqAddChat completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-dispatch_group_leave(apiGroup);
-}] resume];
-
-// ④ POST /client/biz/v2/business/reply/offline/send（HAR [220]：触发离线会话通知）
-dispatch_group_enter(apiGroup);
-NSMutableURLRequest *reqOff = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/business/reply/offline/send", host]]];
-reqOff.HTTPMethod = @"POST";
-reqOff.timeoutInterval = 8.0;
-[self ac_applyCapturedHeadersToRequest:reqOff];
-[reqOff setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-reqOff.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"businessUserId": targetUserId} options:0 error:nil];
-[[session dataTaskWithRequest:reqOff completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-dispatch_group_leave(apiGroup);
-}] resume];
-
-dispatch_group_notify(apiGroup, dispatch_get_main_queue(), ^{
-ACLog(@"⚡ [C2C激活] checkChatType+returnDto+add+offline 完成 (累计 %ld 次)", (long)self.unlockAttemptCountInSession);
-if (completion) completion();
-});
-} @catch (NSException *e) {
-if (completion) completion();
-}
-}
-- (void)simulateIncomingMessageFrom:(NSString *)targetUserId completion:(void(^)(void))completion {
+ACContactItem *groupItem = [[ACContactItem alloc] init];
+groupItem.targetId = groupId;
+groupItem.sourceType = 2;
+groupItem.name = @"群聊兜底";
+groupItem.chatMeType = 0;
+void (^sendAtText)(void) = ^{
+NSString *body = text.length > 0 ? text : @"👋";
+id msg = nil;
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
-if (v2MgrCls && [v2MgrCls respondsToSelector:@selector(sharedInstance)]) {
-id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
-SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
-SEL insertSel = NSSelectorFromString(@"insertC2CMessageToLocalStorage:to:sender:succ:fail:");
-if ([manager respondsToSelector:createTextSel] && [manager respondsToSelector:insertSel]) {
-id fakeMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, @"👋");
-NSString *myId = self.selfUserId ?: @"";
-void (^succ)(void) = ^{ if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-void (^fail)(int, NSString *) = ^(int c,  NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
-((void (*)(id, SEL, id, id, id, id, id))objc_msgSend)(manager, insertSel, fakeMsg, myId, targetUserId, succ, fail);
-return;
-}
+id manager = [v2MgrCls respondsToSelector:@selector(sharedInstance)] ? ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance)) : nil;
+SEL atSel = NSSelectorFromString(@"createTextAtMessage:atUserList:");
+SEL textSel = NSSelectorFromString(@"createTextMessage:");
+if (manager && [manager respondsToSelector:atSel]) {
+msg = ((id (*)(id, SEL, NSString *, NSArray *))objc_msgSend)(manager, atSel, body, @[item.targetId]);
+} else if (manager && [manager respondsToSelector:textSel]) {
+msg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, textSel, body);
+@try { [msg setValue:@[item.targetId] forKey:@"groupAtUserList"]; } @catch (NSException *e) {}
 }
 } @catch (NSException *e) {}
-if (completion) completion();
+if (!msg) {
+if (completion) completion(NO, @"群兜底消息构造失败");
+return;
+}
+[self rawSendV2Message:msg toItem:groupItem completion:^(BOOL ok, int code, NSString *desc) {
+if (completion) completion(ok, ok ? @"群内@提醒送达" : [NSString stringWithFormat:@"群内@失败(%d)", code]);
+}];
+};
+if (mediaMsg) {
+[self rawSendV2Message:mediaMsg toItem:groupItem completion:^(BOOL ok, int c, NSString *d) {
+sendAtText();
+}];
+} else {
+sendAtText();
+}
+}
+// C2C 被 IM 服务端拒绝后的唯一可行降级：共同群 @ > 带文案好友申请（绝不伪造本地消息）
+- (void)ac_fallbackAfterC2CRejected:(ACContactItem *)item
+text:(NSString *)text
+media:(id)mediaMsg
+completion:(void(^)(BOOL ok, NSString *detail))completion {
+NSString *gid = [self ac_sharedGroupIdForUser:item];
+if (gid.length > 0) {
+ACLog(@"[发送引擎] C2C 被服务端拒绝，改走共同群 @ 兜底 (群:%@)", gid);
+[self ac_sendGroupFallbackToGroup:gid target:item text:text media:mediaMsg completion:completion];
+return;
+}
+ACLog(@"[发送引擎] C2C 被服务端拒绝且无共同群，转好友申请（带文案）");
+[self autoAddIMFriend:item.targetId wording:text completion:^{
+if (completion) completion(NO, @"(120001)对方仅好友可聊，已发好友申请，通过后可送达");
+}];
 }
 // 自动加好友申请：将真实推广文案写入 addWording（不再写死“你好”）
 - (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(void))completion {
@@ -4047,9 +4030,10 @@ NSDictionary *robotJson = @{
 };
 NSData *robotData = [NSJSONSerialization dataWithJSONObject:robotJson options:0 error:nil];
 if (robotData) [v2Msg setValue:robotData forKey:@"cloudCustomData"];
+} else if (!isGroupChat && self.capturedCloudCustomData.length > 10) {
+// C2C 必须携带本机真实云端签名（仅 isSelf 采集，已在升级1中隔离他人签名），与原生 C2CSessionStrategy 保持一致
+[v2Msg setValue:self.capturedCloudCustomData forKey:@"cloudCustomData"];
 }
-// C2C 单聊绝不注入任何跨账号 cloudCustomData，保持 100% 原生腾讯云 IM 消息结构（与 HAR [212] 对手一致）
-// 其余情况留空走腾讯 IM 原生默认，杜绝一切协议外挂特征
 } @catch (NSException *ignore) {}
 BOOL isGroup = (item.sourceType == 2);
 NSString *receiver = isGroup ? nil : item.targetId;
@@ -4198,53 +4182,14 @@ if (item.sourceType == 2) {
 if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"群禁言"]);
 return;
 }
-// C2C 受阻（120001 仅联系人可聊）：预激活 + 本地握手 + 带推广词加好友 + 重新构造消息强发
+// C2C 被 IM 服务端拒绝（120001/20003）：业务 HTTP 接口无法改写 IM 关系链，直接切换可达通道
 item.chatMeType = 1;
-[self callAirChatBackendAddFriendAndUnlock:item.targetId completion:^{
-[self simulateIncomingMessageFrom:item.targetId completion:^{
-[self autoAddIMFriend:item.targetId wording:cleanText completion:^{
-id retryMedia = buildMediaMsg();
-id retryText = buildTextMsg();
-id retryPrimary = retryMedia ?: retryText;
-[self rawSendV2Message:retryPrimary toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
-if (ok2) {
-item.chatMeType = 0;
-if (retryMedia && retryText) {
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[self rawSendV2Message:retryText toItem:item completion:nil];
-});
-}
-if (completion) completion(YES, @"⚡破盾强发成功");
-} else {
-// 终极破冰：新号默认 callMeType=0（通话=所有人），0.8 秒静音信令振铃激活 C2C 后再补发
-float savedSec = self.voiceHangupSeconds;
-self.voiceHangupSeconds = 0.8f;
-[self triggerSingleVoiceCallForTarget:item.targetId nick:item.name completion:^{
-self.voiceHangupSeconds = savedSec;
-id finalMsg = buildMediaMsg() ?: buildTextMsg();
-[self rawSendV2Message:finalMsg toItem:item completion:^(BOOL ok3, int code3, NSString *desc3) {
-if (ok3) {
-if (completion) completion(YES, @"📞信令破盾送达");
-} else {
-if (completion) completion(YES, @"📨已走验证语+通话触达");
-}
-}];
-}];
-}
-}];
-}];
-}];
-}];
+id fallbackMedia = buildMediaMsg();
+[self ac_fallbackAfterC2CRejected:item text:cleanText media:fallbackMedia completion:completion];
 }];
 };
-// 已知对方 chatMeType==1（仅联系人可聊）时先预激活通道再发，提高一击必中率
-if (item.sourceType != 2 && item.chatMeType == 1) {
-[self callAirChatBackendAddFriendAndUnlock:item.targetId completion:^{
-[self simulateIncomingMessageFrom:item.targetId completion:doSendFlow];
-}];
-} else {
+// 统一入口：先按原生 C2C 直发；失败后由 ac_fallbackAfterC2CRejected 决策群内@或好友申请
 doSendFlow();
-}
 } @catch (NSException *e) {
 if (completion) completion(NO, @"发送异常");
 }
