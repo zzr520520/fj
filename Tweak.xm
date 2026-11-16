@@ -3973,20 +3973,88 @@ sendAtText();
 sendAtText();
 }
 }
-// C2C 被 IM 服务端拒绝后的唯一可行降级：共同群 @ > 带文案好友申请（绝不伪造本地消息）
+// 把文字渲染成图片：171312.har 中首次触达正是图片消息，可绕开文本类发前过滤
+- (NSString *)ac_renderTextToImagePath:(NSString *)text {
+NSString *clean = [ACSafeStr(text) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+if (clean.length == 0) return nil;
+UIFont *font = [UIFont systemFontOfSize:30.0];
+NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+ps.lineBreakMode = NSLineBreakByCharWrapping;
+NSDictionary *attrs = @{NSFontAttributeName: font,
+NSForegroundColorAttributeName: [UIColor blackColor],
+NSParagraphStyleAttributeName: ps};
+CGFloat maxW = 660.0;
+CGRect r = [clean boundingRectWithSize:CGSizeMake(maxW, CGFLOAT_MAX)
+options:NSStringDrawingUsesLineFragmentOrigin
+attributes:attrs
+context:nil];
+CGFloat h = MIN(MAX(ceil(r.size.height) + 80.0, 240.0), 2200.0);
+CGSize size = CGSizeMake(720.0, h);
+UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
+[[UIColor whiteColor] setFill];
+UIRectFill((CGRect){CGPointZero, size});
+[clean drawInRect:CGRectMake(30.0, 40.0, maxW, h - 80.0) withAttributes:attrs];
+UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+UIGraphicsEndImageContext();
+if (!img) return nil;
+NSData *png = UIImagePNGRepresentation(img);
+if (!png) return nil;
+NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ac_icebreak_text.png"];
+if (![png writeToFile:path atomically:YES]) return nil;
+return path;
+}
+- (id)ac_buildIcebreakImageMessage:(NSString *)text {
+NSString *path = [self imagePathForSlot:ACMediaSlotBatchSend];
+if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+path = [self ac_renderTextToImagePath:text];
+}
+if (path.length == 0) return nil;
+Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+id manager = [v2MgrCls respondsToSelector:@selector(sharedInstance)] ? ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance)) : nil;
+SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
+if (!manager || ![manager respondsToSelector:createImgSel]) return nil;
+return ((id (*)(id, SEL, id))objc_msgSend)(manager, createImgSel, path);
+}
+// C2C 被 IM 服务端拒绝后的降级链：图片破冰 > 共同群 @ > 带文案好友申请（绝不伪造本地消息）
 - (void)ac_fallbackAfterC2CRejected:(ACContactItem *)item
 text:(NSString *)text
 media:(id)mediaMsg
 completion:(void(^)(BOOL ok, NSString *detail))completion {
+void (^toGroupOrFriend)(void) = ^{
 NSString *gid = [self ac_sharedGroupIdForUser:item];
 if (gid.length > 0) {
-ACLog(@"[发送引擎] C2C 被服务端拒绝，改走共同群 @ 兜底 (群:%@)", gid);
+ACLog(@"[发送引擎] 改走共同群 @ 兜底 (群:%@)", gid);
 [self ac_sendGroupFallbackToGroup:gid target:item text:text media:mediaMsg completion:completion];
 return;
 }
-ACLog(@"[发送引擎] C2C 被服务端拒绝且无共同群，转好友申请（带文案）");
+ACLog(@"[发送引擎] 无共同群，转好友申请（带文案）");
 [self autoAddIMFriend:item.targetId wording:text completion:^{
 if (completion) completion(NO, @"(120001)对方仅好友可聊，已发好友申请，通过后可送达");
+}];
+};
+BOOL alreadyImage = NO;
+@try {
+alreadyImage = [[ACSafeValue(mediaMsg, @"elemType") integerValue] == 3];
+} @catch (NSException *ignore) {}
+if (alreadyImage) {
+toGroupOrFriend();
+return;
+}
+id iceMsg = [self ac_buildIcebreakImageMessage:text];
+if (!iceMsg) {
+toGroupOrFriend();
+return;
+}
+ACLog(@"[发送引擎] 文本被拒，改用图片破冰重试");
+[self rawSendV2Message:iceMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
+if (ok2) {
+item.chatMeType = 0;
+ACLog(@"[发送引擎] 图片破冰送达");
+if (completion) completion(YES, @"🖼️图片破冰送达");
+return;
+}
+ACLog(@"[发送引擎] 图片破冰仍被拒 code=%d desc=%@", code2, desc2 ?: @"");
+toGroupOrFriend();
 }];
 }
 // 阶段2：发送前预检目标真实关系（GET /client/biz/v2/userinfo/getUserInfo?id=），10 分钟缓存
@@ -4177,6 +4245,7 @@ void (^succBlock)(void) = ^{
 if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, 0, nil); });
 };
 void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) {
+ACLog(@"[发送引擎] raw发送失败 code=%d desc=%@ elem=%ld", code, desc ?: @"", (long)[[ACSafeValue(v2Msg, @"elemType") integerValue]]);
 if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, code, desc); });
 };
 NSInteger priority = 1;
@@ -4319,6 +4388,7 @@ return;
 }
 // C2C 被 IM 服务端拒绝（120001/20003）：业务 HTTP 接口无法改写 IM 关系链，直接切换可达通道
 item.chatMeType = 1;
+ACLog(@"[发送引擎] C2C 失败 code=%d desc=%@ 媒体类型=%ld 文本长度=%lu", code, desc ?: @"", (long)mType, (unsigned long)cleanText.length);
 id fallbackMedia = buildMediaMsg();
 [self ac_fallbackAfterC2CRejected:item text:cleanText media:fallbackMedia completion:completion];
 }];
