@@ -4034,7 +4034,7 @@ if (completion) completion(NO, @"(120001)对方仅好友可聊，已发好友申
 };
 BOOL alreadyImage = NO;
 @try {
-alreadyImage = [[ACSafeValue(mediaMsg, @"elemType") integerValue] == 3];
+alreadyImage = ([ACSafeValue(mediaMsg, @"elemType") integerValue] == 3);
 } @catch (NSException *ignore) {}
 if (alreadyImage) {
 toGroupOrFriend();
@@ -4245,7 +4245,7 @@ void (^succBlock)(void) = ^{
 if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, 0, nil); });
 };
 void (^failBlock)(int, NSString *) = ^(int code, NSString *desc) {
-ACLog(@"[发送引擎] raw发送失败 code=%d desc=%@ elem=%ld", code, desc ?: @"", (long)[[ACSafeValue(v2Msg, @"elemType") integerValue]]);
+ACLog(@"[发送引擎] raw发送失败 code=%d desc=%@ elem=%ld", code, desc ?: @"", (long)[ACSafeValue(v2Msg, @"elemType") integerValue]);
 if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, code, desc); });
 };
 NSInteger priority = 1;
