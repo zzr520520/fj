@@ -4285,7 +4285,7 @@ if (item.sourceType != 2) {
 [self ac_probeRecipientState:item completion:^(BOOL isFriend, NSInteger chatMeType) {
 item.chatMeType = chatMeType;
 [self ac_probeIMFriendRelation:item.targetId completion:^(NSInteger relation) {
-BOOL effectiveFriend = isFriend || (relation == 1);
+BOOL effectiveFriend = isFriend || relation == 1 || relation == 3;
 if (!effectiveFriend && chatMeType == 1) {
 // 双重预检命中（业务层 friend=false + IM 层非好友 + 仅联系人可聊）：C2C 必被服务端拒绝
 ACLog(@"[发送引擎] 双重预检命中仅好友可聊，跳过 C2C 直发 (friend=%d imRelation=%ld)", isFriend, (long)relation);
