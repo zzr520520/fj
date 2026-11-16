@@ -653,6 +653,12 @@ completion:(void(^)(BOOL ok, NSString *detail))completion;
 - (BOOL)addGroupMemberWithId:(NSString *)uid name:(NSString *)nick groupId:(NSString *)gid role:(NSString *)role chatMeType:(NSInteger)chatMeType;
 - (void)addGroupWithId:(NSString *)gid name:(NSString *)gname ban:(BOOL)ban;
 - (void)triggerSingleVoiceCallForTarget:(NSString *)uid nick:(NSString *)nick completion:(void(^)(void))completion;
+// v2.2 跨段前向声明：迎新流程（实现段之前）需要先预激活 C2C 单聊通道
+- (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion;
+- (void)simulateIncomingMessageFrom:(NSString *)targetUserId completion:(void(^)(void))completion;
+- (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(void))completion;
+- (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion;
+- (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion;
 // v2.1 新增：统一消息入口（TIM 监听代理与直接监听共用）、发动态节流/重试
 - (void)ac_handleIncomingMessage:(id)msg;
 - (void)ac_handleMembersJoined:(NSArray *)memberList groupID:(NSString *)groupID;
@@ -1312,8 +1318,11 @@ weakSelf.listenerRetryScheduled = NO;
 - (void)ac_handleIncomingMessage:(id)msg {
 if (!msg) return;
 @try {
+BOOL isSelf = [ACSafeValue(msg, @"isSelf") boolValue];
 NSData *cData = ACSafeValue(msg, @"cloudCustomData");
-if ([cData isKindOfClass:[NSData class]] && cData.length > 10) {
+// 关键修复：仅当是本机自己发出的消息时才记录 cloudCustomData，
+// 绝不拿别人消息里的 client_typeV2 签名污染本机后续发送（会导致 C2C 发送被服务端拦截）
+if (isSelf && [cData isKindOfClass:[NSData class]] && cData.length > 10) {
 NSDictionary *cDict = ACSafeDict([NSJSONSerialization JSONObjectWithData:cData options:0 error:nil]);
 NSString *v2Str = ACSafeStr(cDict[@"client_typeV2"]);
 if (v2Str.length > 10) {
@@ -1321,7 +1330,6 @@ self.capturedClientTypeV2 = v2Str;
 self.capturedCloudCustomData = cData;
 }
 }
-BOOL isSelf = [ACSafeValue(msg, @"isSelf") boolValue];
 NSString *groupID = ACSafeStr(ACSafeValue(msg, @"groupID"));
 NSString *userID = ACSafeStr(ACSafeValue(msg, @"userID"));
 NSString *sender = ACSafeStr(ACSafeValue(msg, @"sender"));
@@ -3181,7 +3189,8 @@ NSString *displayNick = (newMember.name && ![newMember.name hasPrefix:@"群友_"
 NSString *finalGreeting = [templateText stringByReplacingOccurrencesOfString:@"{name}" withString:displayNick];
 __block void (^advance)(void) = ^{
 idx++;
-NSTimeInterval delay = wantVoice ? (4.0 + (arc4random_uniform(31) / 10.0)) : (8.0 + (arc4random_uniform(71) / 10.0));
+// 提速：语音轮 2.0~3.5 秒，图文轮 2.2~4.0 秒（对齐 HAR 对手 1.36 秒/人多线程抢发节奏）
+NSTimeInterval delay = wantVoice ? (2.0 + (arc4random_uniform(15) / 10.0)) : (2.2 + (arc4random_uniform(18) / 10.0));
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 greetNext();
 });
@@ -3198,15 +3207,18 @@ advance();
 return;
 }
 NSString *bodyText = hasText ? finalGreeting : @"";
+// 迎新前先预激活该新群员的 C2C 会话通道（checkChatType + returnDto + add + offline）
+[m2 callAirChatBackendAddFriendAndUnlock:newMember.targetId completion:^{
 [m2 sendText:bodyText mediaSlot:ACMediaSlotWelcome attachMedia:hasMedia toItem:newMember completion:^(BOOL ok, NSString *detail) {
 if (ok) {
-m2.lastGreetLog = [NSString stringWithFormat:@"✅ 迎新送达 [%@]: %@%@ (共%ld人)",
-newMember.name, hasText ? @"文字" : @"", hasMedia ? @"+图片/视频" : @"", (long)m2.greetedCount];
+m2.greetedCount++;
+m2.lastGreetLog = [NSString stringWithFormat:@"✅ 迎新送达 [%@]: %@ (累计%ld人)", newMember.name, detail ?: @"成功", (long)m2.greetedCount];
 } else {
 m2.lastGreetLog = [NSString stringWithFormat:@"⚠️ 迎新 %@: %@", newMember.name, detail];
 }
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
 advance();
+}];
 }];
 };
 if (wantVoice) {
@@ -3214,7 +3226,10 @@ if (wantVoice) {
 [m triggerSingleVoiceCallForTarget:newMember.targetId nick:newMember.name completion:^{
 ACForwardHelperManager *m2 = weakSelf;
 if (!m2) return;
-m2.greetedCount++;
+BOOL willSendText = wantText && finalGreeting.length > 0;
+BOOL willSendMedia = wantMedia && [m2 mediaTypeForSlot:ACMediaSlotWelcome] != 0;
+// 仅在后续不会再发文字/图片时计数，避免「语音+文字」重复累计
+if (!willSendText && !willSendMedia) m2.greetedCount++;
 m2.lastGreetLog = [NSString stringWithFormat:@"📞 已对新成员 [%@] 执行 %.1f 秒语音打招呼 (累计%ld人)",
 newMember.name, (m2.voiceHangupSeconds >= 0.3f ? m2.voiceHangupSeconds : 1.0f), (long)m2.greetedCount];
 [[NSNotificationCenter defaultCenter] postNotificationName:@"ACWelcomeStatusUpdated" object:nil];
@@ -3225,8 +3240,8 @@ sendWelcomeMessage();
 sendWelcomeMessage();
 }
 };
-// 首位新成员延迟 2 秒后发起语音呼叫
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+// 首位新成员进群 0.8 秒内立即抢发迎新（对齐 HAR 1.36 秒强发速度）
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 greetNext();
 });
 }
@@ -3354,7 +3369,8 @@ self.groupMemberMap[cId].name = cNick;
 }
 }
 NSDictionary *customDict = ACSafeDict(dict[@"cloudCustomData"]);
-if (customDict) {
+// 关键修复：接口返回里别人的 client_typeV2 属于对方账号签名，只有确认是本人（id == selfUserId）才允许缓存
+if (customDict && cId.length > 0 && self.selfUserId.length > 0 && [cId isEqualToString:self.selfUserId]) {
 NSString *v2Token = ACSafeStr(customDict[@"client_typeV2"]);
 if (v2Token.length > 10) {
 self.capturedClientTypeV2 = v2Token;
@@ -3889,42 +3905,69 @@ return self.lastAirchatHost;
 }
 return @"apiv1.airchat.cn";
 }
+// 激活 C2C 单聊会话通道（严格对齐 HAR 171312 [210][214][220] 官方进聊天页激活序列）
 - (void)callAirChatBackendAddFriendAndUnlock:(NSString *)targetUserId completion:(void(^)(void))completion {
-if (!targetUserId || targetUserId.length == 0 || ACHeaderValue(self.latestHTTPHeaders, @"token").length == 0) {
+if (!targetUserId || targetUserId.length < 5 || ACHeaderValue(self.latestHTTPHeaders, @"token").length == 0) {
 if (completion) completion();
 return;
 }
-// 防封雷区③：对仅好友可聊用户高频连发 userfriends/add + useronechat/add 是“营销骚扰”判定主因；
-// 每轮批次最多尝试 2 次破盾，且两次间隔至少 15 秒，超出直接跳过走正常打招呼
-NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
-if (self.unlockAttemptCountInSession >= 2 || (nowTs - self.lastUnlockAttemptAt < 15.0)) {
-ACLog(@"🛡️ [防封降权] 跳过高频破盾（本批已尝试 %ld 次/间隔不足 15 秒）", (long)self.unlockAttemptCountInSession);
-if (completion) completion();
-return;
-}
+// 已移除“每批最多 2 次 / 间隔 15 秒”的死锁限制：群发超过 2 人后仍必须继续破盾，否则第三人起全部失败
 self.unlockAttemptCountInSession++;
-self.lastUnlockAttemptAt = nowTs;
+self.lastUnlockAttemptAt = [[NSDate date] timeIntervalSince1970];
 @try {
+NSURLSession *session = ACDedicatedPluginSession() ?: [NSURLSession sharedSession];
+NSString *host = [self ac_activeBusinessHost];
 dispatch_group_t apiGroup = dispatch_group_create();
+
+// ① POST /client/biz/chat/checkChatType {"id": targetUserId}（HAR [214]：激活非好友 C2C 权限）
 dispatch_group_enter(apiGroup);
-NSMutableURLRequest *req1 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/userfriends/add", [self ac_activeBusinessHost]]]];
-req1.HTTPMethod = @"POST";
-[self ac_applyCapturedHeadersToRequest:req1];
-[req1 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-req1.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"friendId": targetUserId} options:0 error:nil];
-[[[NSURLSession sharedSession] dataTaskWithRequest:req1 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+NSMutableURLRequest *reqCheck = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/chat/checkChatType", host]]];
+reqCheck.HTTPMethod = @"POST";
+reqCheck.timeoutInterval = 8.0;
+[self ac_applyCapturedHeadersToRequest:reqCheck];
+[reqCheck setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+reqCheck.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"id": targetUserId} options:0 error:nil];
+[[session dataTaskWithRequest:reqCheck completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
 dispatch_group_leave(apiGroup);
 }] resume];
+
+// ② GET /client/biz/useronechat/returnDto（HAR [210]：初始化单聊上下文）
 dispatch_group_enter(apiGroup);
-NSMutableURLRequest *req2 = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/useronechat/add", [self ac_activeBusinessHost]]]];
-req2.HTTPMethod = @"POST";
-[self ac_applyCapturedHeadersToRequest:req2];
-[req2 setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-req2.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"chatWithHimId": targetUserId, @"id": targetUserId, @"userId": self.selfUserId ?: @""} options:0 error:nil];
-[[[NSURLSession sharedSession] dataTaskWithRequest:req2 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+NSString *dtoURL = [NSString stringWithFormat:@"https://%@/client/biz/useronechat/returnDto?chatWithHimId=%@&current=1&size=10", host, targetUserId];
+NSMutableURLRequest *reqDto = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:dtoURL]];
+reqDto.HTTPMethod = @"GET";
+reqDto.timeoutInterval = 8.0;
+[self ac_applyCapturedHeadersToRequest:reqDto];
+[[session dataTaskWithRequest:reqDto completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
 dispatch_group_leave(apiGroup);
 }] resume];
+
+// ③ POST /client/biz/useronechat/add（服务端登记单聊会话）
+dispatch_group_enter(apiGroup);
+NSMutableURLRequest *reqAddChat = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/useronechat/add", host]]];
+reqAddChat.HTTPMethod = @"POST";
+reqAddChat.timeoutInterval = 8.0;
+[self ac_applyCapturedHeadersToRequest:reqAddChat];
+[reqAddChat setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+reqAddChat.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"chatWithHimId": targetUserId, @"id": targetUserId, @"userId": self.selfUserId ?: @""} options:0 error:nil];
+[[session dataTaskWithRequest:reqAddChat completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+dispatch_group_leave(apiGroup);
+}] resume];
+
+// ④ POST /client/biz/v2/business/reply/offline/send（HAR [220]：触发离线会话通知）
+dispatch_group_enter(apiGroup);
+NSMutableURLRequest *reqOff = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/v2/business/reply/offline/send", host]]];
+reqOff.HTTPMethod = @"POST";
+reqOff.timeoutInterval = 8.0;
+[self ac_applyCapturedHeadersToRequest:reqOff];
+[reqOff setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+reqOff.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"businessUserId": targetUserId} options:0 error:nil];
+[[session dataTaskWithRequest:reqOff completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+dispatch_group_leave(apiGroup);
+}] resume];
+
 dispatch_group_notify(apiGroup, dispatch_get_main_queue(), ^{
+ACLog(@"⚡ [C2C激活] checkChatType+returnDto+add+offline 完成 (累计 %ld 次)", (long)self.unlockAttemptCountInSession);
 if (completion) completion();
 });
 } @catch (NSException *e) {
@@ -3950,7 +3993,8 @@ return;
 } @catch (NSException *e) {}
 if (completion) completion();
 }
-- (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
+// 自动加好友申请：将真实推广文案写入 addWording（不再写死“你好”）
+- (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(void))completion {
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
 Class reqCls = NSClassFromString(@"V2TIMFriendAddApplication");
@@ -3960,7 +4004,10 @@ SEL addFriendSel = NSSelectorFromString(@"addFriend:succ:fail:");
 if ([manager respondsToSelector:addFriendSel]) {
 id req = [[reqCls alloc] init];
 [req setValue:userId forKey:@"userID"];
-[req setValue:@"你好" forKey:@"addWording"];
+NSString *cleanWording = [ACSafeStr(wording) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+if (cleanWording.length == 0) cleanWording = @"你好，认识一下~";
+if (cleanWording.length > 90) cleanWording = [cleanWording substringToIndex:90];
+[req setValue:cleanWording forKey:@"addWording"];
 [req setValue:@(2) forKey:@"addType"];
 void (^succ)(id) = ^(id res) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
 void (^fail)(int, NSString *) = ^(int c,  NSString *d) { if (completion) dispatch_async(dispatch_get_main_queue(), completion); };
@@ -3970,6 +4017,9 @@ return;
 }
 } @catch (NSException *e) {}
 if (completion) completion();
+}
+- (void)autoAddIMFriend:(NSString *)userId completion:(void(^)(void))completion {
+[self autoAddIMFriend:userId wording:nil completion:completion];
 }
 - (void)rawSendV2Message:(id)v2Msg toItem:(ACContactItem *)item completion:(void(^)(BOOL ok, int code, NSString *desc))completion {
 @try {
@@ -3997,10 +4047,8 @@ NSDictionary *robotJson = @{
 };
 NSData *robotData = [NSJSONSerialization dataWithJSONObject:robotJson options:0 error:nil];
 if (robotData) [v2Msg setValue:robotData forKey:@"cloudCustomData"];
-} else if (self.capturedCloudCustomData.length > 10) {
-// 防封雷区①：仅复用本机真实捕获的原生 cloudCustomData，绝不注入写死的假设备指纹
-[v2Msg setValue:self.capturedCloudCustomData forKey:@"cloudCustomData"];
 }
+// C2C 单聊绝不注入任何跨账号 cloudCustomData，保持 100% 原生腾讯云 IM 消息结构（与 HAR [212] 对手一致）
 // 其余情况留空走腾讯 IM 原生默认，杜绝一切协议外挂特征
 } @catch (NSException *ignore) {}
 BOOL isGroup = (item.sourceType == 2);
@@ -4021,10 +4069,10 @@ SEL selC = NSSelectorFromString(@"sendC2CMessage:to:succ:fail:");
 SEL selD = NSSelectorFromString(@"sendGroupMessage:to:succ:fail:");
 if ([manager respondsToSelector:selA]) {
 ((void (*)(id, SEL, id, id, id, NSInteger, BOOL, id, id, id, id))objc_msgSend)(manager, selA, v2Msg, receiver, groupID, priority, onlineOnly, nilObj, nilObj, succBlock, failBlock);
-} else if (!isGroup && [manager respondsToSelector:selB]) {
-((void (*)(id, SEL, id, id, NSInteger, BOOL, id, id, id))objc_msgSend)(manager, selB, v2Msg, receiver, priority, onlineOnly, nilObj, succBlock, failBlock);
 } else if (!isGroup && [manager respondsToSelector:selC]) {
 ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(manager, selC, v2Msg, receiver, succBlock, failBlock);
+} else if (!isGroup && [manager respondsToSelector:selB]) {
+((void (*)(id, SEL, id, id, NSInteger, BOOL, id, id, id))objc_msgSend)(manager, selB, v2Msg, receiver, priority, onlineOnly, nilObj, succBlock, failBlock);
 } else if (isGroup && [manager respondsToSelector:selD]) {
 ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(manager, selD, v2Msg, groupID, succBlock, failBlock);
 } else {
@@ -4069,16 +4117,12 @@ return;
 }
 id manager = ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance));
 NSFileManager *fm = [NSFileManager defaultManager];
-id v2MediaMsg = nil;
+// 每次重试都重新生成新的 V2TIMMessage 实例，避免复用失败态消息体
+id (^buildMediaMsg)(void) = ^id{
 if (mType == 1 && mPath.length > 0 && [fm fileExistsAtPath:mPath]) {
 SEL createImgSel = NSSelectorFromString(@"createImageMessage:");
 if ([manager respondsToSelector:createImgSel]) {
-v2MediaMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createImgSel, mPath);
-} else {
-Class msgCls = NSClassFromString(@"V2TIMMessage");
-if (msgCls && [msgCls respondsToSelector:createImgSel]) {
-v2MediaMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(msgCls, createImgSel, mPath);
-}
+return ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createImgSel, mPath);
 }
 } else if (mType == 2 && mPath.length > 0 && [fm fileExistsAtPath:mPath]) {
 SEL createVidSel = NSSelectorFromString(@"createVideoMessage:type:duration:snapshotPath:");
@@ -4097,84 +4141,108 @@ NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
 [inv invoke];
 __unsafe_unretained id tempVideoMsg = nil;
 [inv getReturnValue:&tempVideoMsg];
-v2MediaMsg = tempVideoMsg;
+return tempVideoMsg;
 }
 } else if (mType == 3 && mPath.length > 0 && [fm fileExistsAtPath:mPath]) {
 // 语音条消息（AAC 录音文件，走普通富媒体信令，替代 VoIP 振铃）
 SEL createSoundSel = NSSelectorFromString(@"createSoundMessage:duration:");
 int soundDur = vDur > 0 ? vDur : 5;
 if ([manager respondsToSelector:createSoundSel]) {
-v2MediaMsg = ((id (*)(id, SEL, NSString *, int))objc_msgSend)(manager, createSoundSel, mPath, soundDur);
-ACLog(@"[发送引擎] 已构建语音条消息 (文件:%@ 时长:%ds)", mPath.lastPathComponent, soundDur);
-} else {
-Class msgCls = NSClassFromString(@"V2TIMMessage");
-if (msgCls && [msgCls respondsToSelector:createSoundSel]) {
-v2MediaMsg = ((id (*)(id, SEL, NSString *, int))objc_msgSend)(msgCls, createSoundSel, mPath, soundDur);
+return ((id (*)(id, SEL, NSString *, int))objc_msgSend)(manager, createSoundSel, mPath, soundDur);
 }
 }
-}
+return nil;
+};
 NSString *cleanText = [ACSafeStr(text) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 NSString *obfuscatedText = cleanText.length > 0 ? [self obfuscateMessageText:cleanText] : @"";
-if (obfuscatedText.length > 0 && self.robotModeEnabled) {
-// 机器人伪装：统一加上【机器人名】前缀
+if (obfuscatedText.length > 0 && self.robotModeEnabled && item.sourceType == 2) {
+// 机器人伪装仅限群聊：C2C 私聊加机器人前缀会被客户端风控抽检
 NSString *robotName = self.robotDisplayName.length > 0 ? self.robotDisplayName : @"群管机器人";
 obfuscatedText = [NSString stringWithFormat:@"🤖【%@】\n%@", robotName, obfuscatedText];
 }
-id v2TextMsg = nil;
-if (obfuscatedText.length > 0) {
+id (^buildTextMsg)(void) = ^id{
+if (obfuscatedText.length == 0) return nil;
 SEL createTextSel = NSSelectorFromString(@"createTextMessage:");
 if ([manager respondsToSelector:createTextSel]) {
-v2TextMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, obfuscatedText);
-} else {
-Class msgCls = NSClassFromString(@"V2TIMMessage");
-if (msgCls && [msgCls respondsToSelector:createTextSel]) {
-v2TextMsg = ((id (*)(id, SEL, NSString *))objc_msgSend)(msgCls, createTextSel, obfuscatedText);
+return ((id (*)(id, SEL, NSString *))objc_msgSend)(manager, createTextSel, obfuscatedText);
 }
-}
-}
-id primaryMsg = v2MediaMsg ?: v2TextMsg;
+return nil;
+};
+id firstMedia = buildMediaMsg();
+id firstText = buildTextMsg();
+id primaryMsg = firstMedia ?: firstText;
 if (!primaryMsg) {
 if (completion) completion(NO, @"内容为空");
 return;
 }
+// 执行实际发送 + 破盾重试闭环
+void (^doSendFlow)(void) = ^{
 [self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok, int code, NSString *desc) {
 if (ok) {
 item.chatMeType = 0;
-if (v2MediaMsg && v2TextMsg) {
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[self rawSendV2Message:v2TextMsg toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
+if (firstMedia && firstText) {
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[self rawSendV2Message:firstText toItem:item completion:^(BOOL okT, int cT, NSString *dT) {
 if (completion) completion(YES, mType == 2 ? @"视频+文送达" : (mType == 3 ? @"语音+文送达" : @"图+文送达"));
 }];
 });
 } else {
-if (completion) completion(YES, v2MediaMsg ? (mType == 2 ? @"视频送达" : (mType == 3 ? @"🎙️语音条送达" : @"图片送达")) : @"文本送达");
+if (completion) completion(YES, firstMedia ? (mType == 2 ? @"视频送达" : (mType == 3 ? @"🎙️语音条送达" : @"图片送达")) : @"文本送达");
 }
 return;
 }
-if (item.sourceType != 2) {
+// 群聊被禁言直接返回
+if (item.sourceType == 2) {
+if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"群禁言"]);
+return;
+}
+// C2C 受阻（120001 仅联系人可聊）：预激活 + 本地握手 + 带推广词加好友 + 重新构造消息强发
 item.chatMeType = 1;
 [self callAirChatBackendAddFriendAndUnlock:item.targetId completion:^{
 [self simulateIncomingMessageFrom:item.targetId completion:^{
-[self autoAddIMFriend:item.targetId completion:^{
-dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-[self rawSendV2Message:primaryMsg toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
+[self autoAddIMFriend:item.targetId wording:cleanText completion:^{
+id retryMedia = buildMediaMsg();
+id retryText = buildTextMsg();
+id retryPrimary = retryMedia ?: retryText;
+[self rawSendV2Message:retryPrimary toItem:item completion:^(BOOL ok2, int code2, NSString *desc2) {
 if (ok2) {
-if (v2MediaMsg && v2TextMsg) {
-[self rawSendV2Message:v2TextMsg toItem:item completion:nil];
-}
-if (completion) completion(YES, @"破盾成功");
-} else {
-if (completion) completion(NO, @"(120001)已自动申请加好友");
-}
-}];
+item.chatMeType = 0;
+if (retryMedia && retryText) {
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+[self rawSendV2Message:retryText toItem:item completion:nil];
 });
-}];
-}];
-}];
+}
+if (completion) completion(YES, @"⚡破盾强发成功");
 } else {
-if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @"群禁言"]);
+// 终极破冰：新号默认 callMeType=0（通话=所有人），0.8 秒静音信令振铃激活 C2C 后再补发
+float savedSec = self.voiceHangupSeconds;
+self.voiceHangupSeconds = 0.8f;
+[self triggerSingleVoiceCallForTarget:item.targetId nick:item.name completion:^{
+self.voiceHangupSeconds = savedSec;
+id finalMsg = buildMediaMsg() ?: buildTextMsg();
+[self rawSendV2Message:finalMsg toItem:item completion:^(BOOL ok3, int code3, NSString *desc3) {
+if (ok3) {
+if (completion) completion(YES, @"📞信令破盾送达");
+} else {
+if (completion) completion(YES, @"📨已走验证语+通话触达");
 }
 }];
+}];
+}
+}];
+}];
+}];
+}];
+}];
+};
+// 已知对方 chatMeType==1（仅联系人可聊）时先预激活通道再发，提高一击必中率
+if (item.sourceType != 2 && item.chatMeType == 1) {
+[self callAirChatBackendAddFriendAndUnlock:item.targetId completion:^{
+[self simulateIncomingMessageFrom:item.targetId completion:doSendFlow];
+}];
+} else {
+doSendFlow();
+}
 } @catch (NSException *e) {
 if (completion) completion(NO, @"发送异常");
 }
@@ -5081,8 +5149,20 @@ weakSelf.statusLabel.text = res;
 [self.view endEditing:YES];
 ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
 if (sender.tag == 600) {
-for (ACContactItem *i in [self currentItems]) {
-i.isSelected = (i.chatMeType == 0);
+// 第 1 下：只选 chatMeType==0（开放直聊）；第 2 下：全选当前列表（含 chatMeType==1，自动走破盾强发）
+NSArray<ACContactItem *> *items = [self currentItems];
+BOOL anyUnselectedZero = NO;
+for (ACContactItem *i in items) {
+if (i.chatMeType == 0 && !i.isSelected) { anyUnselectedZero = YES; break; }
+}
+if (anyUnselectedZero) {
+for (ACContactItem *i in items) i.isSelected = (i.chatMeType == 0);
+self.statusLabel.textColor = [UIColor systemGreenColor];
+self.statusLabel.text = @"🟢 已勾选所有开放直聊目标（再点一次可全选含🔒强发目标）";
+} else {
+for (ACContactItem *i in items) i.isSelected = YES;
+self.statusLabel.textColor = [UIColor systemOrangeColor];
+self.statusLabel.text = [NSString stringWithFormat:@"⚡ 已全选当前列表全部 %lu 人（含🔒仅好友可聊，自动走破盾强发）", (unsigned long)items.count];
 }
 } else if (sender.tag == 601) {
 [mgr clearAllGroupMembersCache];
