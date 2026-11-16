@@ -1073,6 +1073,9 @@ NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 if (self.capturedClientTypeV2) {
 [ud setObject:self.capturedClientTypeV2 forKey:@"AC_Captured_ClientTypeV2"];
 }
+if ([self.capturedCloudCustomData isKindOfClass:[NSData class]] && self.capturedCloudCustomData.length > 10) {
+[ud setObject:self.capturedCloudCustomData forKey:@"AC_Captured_CloudCustomData"];
+}
 if (self.latestHTTPHeaders.count > 0) {
 NSMutableDictionary *safeHeaders = [NSMutableDictionary dictionary];
 NSSet *allowed = [NSSet setWithObjects:@"token", @"x-userid", @"version", @"channel", @"x-lts-id", @"x-request-no", @"user-agent", @"accept-language", nil];
@@ -1137,6 +1140,10 @@ if (gs.length > 0) [self.welcomeGroupIds addObject:gs];
 NSString *savedV2 = ACSafeStr([ud objectForKey:@"AC_Captured_ClientTypeV2"]);
 if (savedV2.length > 10) {
 self.capturedClientTypeV2 = savedV2;
+}
+id savedCCD = [ud objectForKey:@"AC_Captured_CloudCustomData"];
+if ([savedCCD isKindOfClass:[NSData class]] && [(NSData *)savedCCD length] > 10) {
+self.capturedCloudCustomData = savedCCD;
 }
 self.autoCommentEnabled = [ud boolForKey:@"AC_AutoComment_Enabled"];
 NSString *savedComment = ACSafeStr([ud objectForKey:@"AC_AutoComment_Text"]);
@@ -1331,6 +1338,9 @@ NSString *v2Str = ACSafeStr(cDict[@"client_typeV2"]);
 if (v2Str.length > 10) {
 self.capturedClientTypeV2 = v2Str;
 self.capturedCloudCustomData = cData;
+// 持久化，避免冷启动后无自助发送记录时丢失真实签名
+[[NSUserDefaults standardUserDefaults] setObject:v2Str forKey:@"AC_Captured_ClientTypeV2"];
+[[NSUserDefaults standardUserDefaults] setObject:cData forKey:@"AC_Captured_CloudCustomData"];
 }
 }
 NSString *groupID = ACSafeStr(ACSafeValue(msg, @"groupID"));
@@ -4068,7 +4078,40 @@ return;
 } @catch (NSException *e) {}
 if (completion) completion(-1);
 }
-// 自动加好友申请：将真实推广文案写入 addWording（不再写死“你好”）
+// 阶段3：读取目标在腾讯云 IM 的 allowType（0=任何人可发 1=需验证 2=拒绝任何人）
+// 171312.har 实证：chatMeType=1 只拦官方 UI，IM 层 allowType=0 时消息仍可送达
+- (void)ac_probeIMAllowType:(NSString *)userId completion:(void(^)(NSInteger allowType))completion {
+if (userId.length < 5) {
+if (completion) completion(-1);
+return;
+}
+@try {
+Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+id v2Mgr = [v2MgrCls respondsToSelector:@selector(sharedInstance)] ? ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance)) : nil;
+SEL usersSel = NSSelectorFromString(@"getUsersInfo:succ:fail:");
+if (v2Mgr && [v2Mgr respondsToSelector:usersSel]) {
+void (^succ)(NSArray *) = ^(NSArray *infoList) {
+NSInteger allowType = -1;
+id first = [infoList isKindOfClass:[NSArray class]] && infoList.count > 0 ? infoList.firstObject : nil;
+id aObj = ACSafeValue(first, @"allowType");
+if ([aObj isKindOfClass:[NSNumber class]]) allowType = [(NSNumber *)aObj integerValue];
+ACLog(@"[IM权限预检] %@ allowType=%ld", userId, (long)allowType);
+dispatch_async(dispatch_get_main_queue(), ^{
+if (completion) completion(allowType);
+});
+};
+void (^fail)(int, NSString *) = ^(int code, NSString *desc) {
+ACLog(@"[IM权限预检] %@ 查询失败 code=%d %@", userId, code, desc ?: @"");
+dispatch_async(dispatch_get_main_queue(), ^{
+if (completion) completion(-1);
+});
+};
+((void (*)(id, SEL, id, id, id))objc_msgSend)(v2Mgr, usersSel, @[userId], succ, fail);
+return;
+}
+} @catch (NSException *e) {}
+if (completion) completion(-1);
+}
 - (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(void))completion {
 @try {
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
@@ -4280,19 +4323,30 @@ id fallbackMedia = buildMediaMsg();
 [self ac_fallbackAfterC2CRejected:item text:cleanText media:fallbackMedia completion:completion];
 }];
 };
-// 阶段2：先预检目标真实关系状态，再决定 C2C / 群@ / 好友申请
+// 阶段3：AirChat 业务层 + IM 关系链 + IM allowType 三重预检后决策
 if (item.sourceType != 2) {
 [self ac_probeRecipientState:item completion:^(BOOL isFriend, NSInteger chatMeType) {
 item.chatMeType = chatMeType;
 [self ac_probeIMFriendRelation:item.targetId completion:^(NSInteger relation) {
 BOOL effectiveFriend = isFriend || relation == 1 || relation == 3;
-if (!effectiveFriend && chatMeType == 1) {
-// 双重预检命中（业务层 friend=false + IM 层非好友 + 仅联系人可聊）：C2C 必被服务端拒绝
-ACLog(@"[发送引擎] 双重预检命中仅好友可聊，跳过 C2C 直发 (friend=%d imRelation=%ld)", isFriend, (long)relation);
+[self ac_probeIMAllowType:item.targetId completion:^(NSInteger allowType) {
+BOOL imAllowsStranger = (allowType == 0);
+BOOL imBlocksStranger = (allowType == 1 || allowType == 2);
+if (!effectiveFriend && imBlocksStranger) {
+ACLog(@"[发送引擎] IM allowType=%ld 硬拦截，切换群@/好友申请", (long)allowType);
 [self ac_fallbackAfterC2CRejected:item text:cleanText media:buildMediaMsg() completion:completion];
 return;
 }
+if (!effectiveFriend && !imAllowsStranger && chatMeType == 1) {
+// allowType 查询失败时退回业务层判断
+ACLog(@"[发送引擎] 非好友且仅联系人可聊，IM 权限未知，跳过注定失败的 C2C");
+[self ac_fallbackAfterC2CRejected:item text:cleanText media:buildMediaMsg() completion:completion];
+return;
+}
+// allowType=0 或已是好友：即使 chatMeType=1 也直发（171312.har 实证 chatMeType 仅拦官方 UI）
+ACLog(@"[发送引擎] 放行 C2C (friend=%d relation=%ld allowType=%ld chatMeType=%ld)", isFriend, (long)relation, (long)allowType, (long)chatMeType);
 doSendFlow();
+}];
 }];
 }];
 } else {
@@ -6743,6 +6797,54 @@ ACSwizzleIMP(c, @"addGroupListener:", (IMP)ac_addGroupListenerHook, &ac_orig_add
 %end
 %end
 
+// ========== 阶段3：捕获官方客户端 C2C 发送时使用的真实 cloudCustomData ==========
+static IMP ac_origV2SendFull = NULL;
+static IMP ac_origV2SendC2C = NULL;
+
+static void ac_captureNativeC2CCloudData(id msg) {
+@try {
+NSData *d = [msg valueForKey:@"cloudCustomData"];
+if (![d isKindOfClass:[NSData class]] || d.length <= 10) return;
+NSDictionary *j = ACSafeDict([NSJSONSerialization JSONObjectWithData:d options:0 error:nil]);
+NSString *v2 = ACSafeStr(j[@"client_typeV2"]);
+if (v2.length <= 10) return;
+ACForwardHelperManager *mgr = [ACForwardHelperManager shared];
+mgr.capturedCloudCustomData = d;
+mgr.capturedClientTypeV2 = v2;
+NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+[ud setObject:d forKey:@"AC_Captured_CloudCustomData"];
+[ud setObject:v2 forKey:@"AC_Captured_ClientTypeV2"];
+ACLog(@"[原生发送捕获] 已同步真实签名 cloudCustomData=%luB v2=%lu chars", (unsigned long)d.length, (unsigned long)v2.length);
+} @catch (NSException *e) {}
+}
+static void ac_hookV2SendFull(id self, SEL _cmd, id msg, id receiver, id groupID, NSInteger priority, BOOL onlineOnly, id offlinePushInfo, id progress, id succ, id fail) {
+if (receiver && !groupID) ac_captureNativeC2CCloudData(msg);
+if (ac_origV2SendFull) ((void (*)(id, SEL, id, id, id, NSInteger, BOOL, id, id, id, id))ac_origV2SendFull)(self, _cmd, msg, receiver, groupID, priority, onlineOnly, offlinePushInfo, progress, succ, fail);
+}
+static void ac_hookV2SendC2C(id self, SEL _cmd, id msg, id to, id succ, id fail) {
+ac_captureNativeC2CCloudData(msg);
+if (ac_origV2SendC2C) ((void (*)(id, SEL, id, id, id, id))ac_origV2SendC2C)(self, _cmd, msg, to, succ, fail);
+}
+static void ac_installNativeSendCapture(void) {
+static BOOL installed = NO;
+if (installed) return;
+Class cls = NSClassFromString(@"V2TIMManager");
+if (!cls) return;
+BOOL any = NO;
+Method mFull = class_getInstanceMethod(cls, NSSelectorFromString(@"sendMessage:receiver:groupID:priority:onlineUserOnly:offlinePushInfo:progress:succ:fail:"));
+if (mFull) {
+ac_origV2SendFull = method_setImplementation(mFull, (IMP)ac_hookV2SendFull);
+any = YES;
+}
+Method mC2C = class_getInstanceMethod(cls, NSSelectorFromString(@"sendC2CMessage:to:succ:fail:"));
+if (mC2C) {
+ac_origV2SendC2C = method_setImplementation(mC2C, (IMP)ac_hookV2SendC2C);
+any = YES;
+}
+installed = any;
+if (any) ACLog(@"[原生发送捕获] hook 安装完成 full=%d c2c=%d", mFull != NULL, mC2C != NULL);
+}
+
 %ctor {
 // 文件内含 %group 时 Logos 要求所有组显式初始化：默认组（_ungrouped）+ iOS17 会话组
 %init();
@@ -6752,6 +6854,7 @@ if (objc_getClass("__NSURLSessionLocal")) %init(ACiOS17SessionHooks);
 void (^install)(void) = ^{
 ACAttachTwoFingerDoubleTapToAllWindows(); // 冷启动已有窗口立即挂载双指双击手势
 ACInstallTIMHooks();
+ac_installNativeSendCapture();
 [[ACForwardHelperManager shared] setupIMGroupWelcomeListener];
 };
 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), install);
