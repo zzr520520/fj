@@ -520,6 +520,8 @@ static NSString *__currentChatPeerId = nil;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMemberMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, ACContactItem *> *groupMap;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupBanStatusMap;
+// 阶段2：目标关系状态预检缓存（friend / chatMeType，10 分钟有效，避免群发时重复请求）
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *recipientStateCache;
 @property (nonatomic, copy) NSString *selfUserId;
 @property (nonatomic, copy) NSString *capturedClientTypeV2;
 @property (nonatomic, strong) NSData *capturedCloudCustomData;
@@ -872,6 +874,7 @@ instance.friendMap = [NSMutableDictionary dictionary];
 instance.groupMemberMap = [NSMutableDictionary dictionary];
 instance.groupMap = [NSMutableDictionary dictionary];
 instance.groupBanStatusMap = [NSMutableDictionary dictionary];
+instance.recipientStateCache = [NSMutableDictionary dictionary];
 instance.latestHTTPHeaders = [NSMutableDictionary dictionary];
 instance.selfUserId = @""; // 修复：严禁硬编码写死某个账号 UID（旧代码写死 1980559125632786434，导致重启后被重置回"鸭梨"）
 instance.capturedClientTypeV2 = nil; // 防封雷区①：严禁写死旧版黑名单设备指纹——多账号同指纹=协议外挂秒封特征，仅复用真实捕获值
@@ -3976,6 +3979,95 @@ ACLog(@"[发送引擎] C2C 被服务端拒绝且无共同群，转好友申请�
 if (completion) completion(NO, @"(120001)对方仅好友可聊，已发好友申请，通过后可送达");
 }];
 }
+// 阶段2：发送前预检目标真实关系（GET /client/biz/v2/userinfo/getUserInfo?id=），10 分钟缓存
+// 目的：好友=false 且 chatMeType=1 的目标直接走群@/好友申请，不再发注定被 IM 服务端拒绝的 C2C
+- (void)ac_probeRecipientState:(ACContactItem *)item completion:(void(^)(BOOL isFriend, NSInteger chatMeType))completion {
+NSString *uid = item.targetId;
+if (!item || uid.length < 5) {
+if (completion) completion(NO, item.chatMeType);
+return;
+}
+NSDictionary *cached = self.recipientStateCache[uid];
+NSTimeInterval cachedAt = [ACSafeValue(cached, @"ts") doubleValue];
+if (cached && ([[NSDate date] timeIntervalSince1970] - cachedAt) < 600.0) {
+BOOL f = [ACSafeValue(cached, @"friend") boolValue];
+NSInteger t = [ACSafeStr(ACSafeValue(cached, @"chatMeType")) integerValue];
+if (completion) completion(f, t);
+return;
+}
+@try {
+NSString *host = [self ac_activeBusinessHost];
+NSString *urlStr = [NSString stringWithFormat:@"https://%@/client/biz/v2/userinfo/getUserInfo?id=%@", host, uid];
+NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+req.HTTPMethod = @"GET";
+req.timeoutInterval = 6.0;
+[self ac_applyCapturedHeadersToRequest:req];
+NSURLSession *session = ACDedicatedPluginSession() ?: [NSURLSession sharedSession];
+[[session dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+BOOL isFriend = NO;
+NSInteger chatType = item.chatMeType;
+NSDictionary *json = ACSafeDict([NSJSONSerialization JSONObjectWithData:d options:0 error:nil]);
+NSDictionary *data = ACSafeDict(json[@"data"]);
+if (data) {
+isFriend = [ACSafeValue(data, @"friend") boolValue];
+NSInteger t = [ACSafeStr(ACSafeValue(data, @"chatMeType")) integerValue];
+if (t == 0 || t == 1) chatType = t;
+NSMutableDictionary *c = [NSMutableDictionary dictionary];
+c[@"friend"] = @(isFriend);
+c[@"chatMeType"] = @(chatType);
+c[@"ts"] = @([[NSDate date] timeIntervalSince1970]);
+self.recipientStateCache[uid] = c;
+}
+ACLog(@"[发送预检] %@ friend=%d chatMeType=%ld", uid, isFriend, (long)chatType);
+dispatch_async(dispatch_get_main_queue(), ^{
+if (completion) completion(isFriend, chatType);
+});
+}] resume];
+} @catch (NSException *e) {
+if (completion) completion(NO, item.chatMeType);
+}
+}
+// 阶段2：直查腾讯云 IM 底层好友关系（relation: 0=非好友 1=好友），这是 120001/20003 的真正判定层
+- (void)ac_probeIMFriendRelation:(NSString *)userId completion:(void(^)(NSInteger relation))completion {
+if (userId.length < 5) {
+if (completion) completion(-1);
+return;
+}
+@try {
+Class v2MgrCls = NSClassFromString(@"V2TIMManager");
+id v2Mgr = [v2MgrCls respondsToSelector:@selector(sharedInstance)] ? ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance)) : nil;
+SEL fmSel = NSSelectorFromString(@"getFriendshipManager");
+Class fmCls = NSClassFromString(@"V2TIMFriendshipManager");
+id fm = nil;
+if (v2Mgr && [v2Mgr respondsToSelector:fmSel]) {
+fm = ((id (*)(id, SEL))objc_msgSend)(v2Mgr, fmSel);
+} else if (fmCls && [fmCls respondsToSelector:@selector(sharedInstance)]) {
+fm = ((id (*)(id, SEL))objc_msgSend)(fmCls, @selector(sharedInstance));
+}
+SEL checkSel = NSSelectorFromString(@"checkFriend:succ:fail:");
+if (fm && [fm respondsToSelector:checkSel]) {
+void (^succ)(NSArray *) = ^(NSArray *resultList) {
+NSInteger relation = -1;
+id first = [resultList isKindOfClass:[NSArray class]] && resultList.count > 0 ? resultList.firstObject : nil;
+id relObj = ACSafeValue(first, @"relation");
+if ([relObj isKindOfClass:[NSNumber class]]) relation = [(NSNumber *)relObj integerValue];
+ACLog(@"[IM关系预检] %@ relation=%ld", userId, (long)relation);
+dispatch_async(dispatch_get_main_queue(), ^{
+if (completion) completion(relation);
+});
+};
+void (^fail)(int, NSString *) = ^(int code, NSString *desc) {
+ACLog(@"[IM关系预检] %@ 查询失败 code=%d", userId, code);
+dispatch_async(dispatch_get_main_queue(), ^{
+if (completion) completion(-1);
+});
+};
+((void (*)(id, SEL, id, id, id))objc_msgSend)(fm, checkSel, @[userId], succ, fail);
+return;
+}
+} @catch (NSException *e) {}
+if (completion) completion(-1);
+}
 // 自动加好友申请：将真实推广文案写入 addWording（不再写死“你好”）
 - (void)autoAddIMFriend:(NSString *)userId wording:(NSString *)wording completion:(void(^)(void))completion {
 @try {
@@ -4188,8 +4280,24 @@ id fallbackMedia = buildMediaMsg();
 [self ac_fallbackAfterC2CRejected:item text:cleanText media:fallbackMedia completion:completion];
 }];
 };
-// 统一入口：先按原生 C2C 直发；失败后由 ac_fallbackAfterC2CRejected 决策群内@或好友申请
+// 阶段2：先预检目标真实关系状态，再决定 C2C / 群@ / 好友申请
+if (item.sourceType != 2) {
+[self ac_probeRecipientState:item completion:^(BOOL isFriend, NSInteger chatMeType) {
+item.chatMeType = chatMeType;
+[self ac_probeIMFriendRelation:item.targetId completion:^(NSInteger relation) {
+BOOL effectiveFriend = isFriend || (relation == 1);
+if (!effectiveFriend && chatMeType == 1) {
+// 双重预检命中（业务层 friend=false + IM 层非好友 + 仅联系人可聊）：C2C 必被服务端拒绝
+ACLog(@"[发送引擎] 双重预检命中仅好友可聊，跳过 C2C 直发 (friend=%d imRelation=%ld)", isFriend, (long)relation);
+[self ac_fallbackAfterC2CRejected:item text:cleanText media:buildMediaMsg() completion:completion];
+return;
+}
 doSendFlow();
+}];
+}];
+} else {
+doSendFlow();
+}
 } @catch (NSException *e) {
 if (completion) completion(NO, @"发送异常");
 }
