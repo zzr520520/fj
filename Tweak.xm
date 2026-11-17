@@ -4031,12 +4031,16 @@ if (completion) completion(NO, @"无可用签名");
 return;
 }
 j[@"fromGroupId"] = gid;
-j[@"source"] = @"group_member";
+j[@"groupId"] = gid;
+j[@"source"] = @"group_temp";
+j[@"sourceType"] = @"GROUP_TEMP";
+j[@"isStranger"] = @YES;
 NSData *merged = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
 if (merged.length <= 10) {
 if (completion) completion(NO, @"同群包构造失败");
 return;
 }
+void (^doSend)(void) = ^{
 Class v2MgrCls = NSClassFromString(@"V2TIMManager");
 id manager = [v2MgrCls respondsToSelector:@selector(sharedInstance)] ? ((id (*)(id, SEL))objc_msgSend)(v2MgrCls, @selector(sharedInstance)) : nil;
 if (!manager) {
@@ -4064,6 +4068,27 @@ return;
 ACLog(@"[群上下文试验] 仍被拒 code=%d desc=%@", code, desc ?: @"");
 if (completion) completion(NO, [NSString stringWithFormat:@"(%d)%@", code, desc ?: @""]);
 }];
+};
+// 先按官方群成员发起私聊的形态做一次业务层报备，再发 C2C（请求真实下发，不 mock）
+NSString *host = [self ac_activeBusinessHost];
+if (host.length > 0) {
+NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://%@/client/biz/chat/check", host]]];
+req.HTTPMethod = @"POST";
+req.timeoutInterval = 3.0;
+[self ac_applyCapturedHeadersToRequest:req];
+[req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+req.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"targetUserId": item.targetId, @"sourceType": @(1), @"groupId": gid} options:0 error:nil];
+ACLog(@"[群上下文试验] 预检 /client/biz/chat/check group=%@", gid);
+acInternalRequest = YES;
+NSURLSession *session = ACDedicatedPluginSession() ?: [NSURLSession sharedSession];
+[[session dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+ACLog(@"[群上下文试验] 预检返回 status=%ld err=%@", (long)[(NSHTTPURLResponse *)r statusCode], e.localizedDescription ?: @"");
+dispatch_async(dispatch_get_main_queue(), doSend);
+}] resume];
+acInternalRequest = NO;
+return;
+}
+doSend();
 } @catch (NSException *e) {
 if (completion) completion(NO, @"同群试验异常");
 }
@@ -6871,6 +6896,30 @@ ACLog(@"💡 候选类方法: [+%@ %@] (参数:%d)", clsName, selName, method_ge
 }
 }
 free(cMethods);
+}
+}
+ACLog(@"🔍 扫描官方 C2C 发送器符号...");
+for (unsigned int i = 0; i < numClasses; i++) {
+Class cls = classes[i];
+if (!cls) continue;
+const char *name = class_getName(cls);
+if (!name) continue;
+NSString *clsName = [NSString stringWithUTF8String:name];
+BOOL hit = ([clsName containsString:@"C2C"] || [clsName containsString:@"SendManager"] ||
+[clsName containsString:@"ChatSend"] || [clsName containsString:@"MessageSend"] ||
+[clsName containsString:@"SessionStrategy"]);
+if (!hit) continue;
+ACLog(@"💡 发送器候选类: %@", clsName);
+unsigned int mCount = 0;
+Method *mList = class_copyMethodList(cls, &mCount);
+if (mList) {
+for (unsigned int j = 0; j < mCount; j++) {
+NSString *selName = NSStringFromSelector(method_getName(mList[j]));
+if ([selName.lowercaseString containsString:@"send"]) {
+ACLog(@"💡 发送方法: [%@ %@] (参数:%d)", clsName, selName, method_getNumberOfArguments(mList[j]) - 2);
+}
+}
+free(mList);
 }
 }
 free(classes);
